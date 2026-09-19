@@ -418,7 +418,7 @@ pub async fn serve_udp(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transport::edge::{Route, APEXES};
+    use crate::edge::{Route, APEXES};
     use hickory_proto::op::Query;
 
     fn authority() -> ZoneAuthority {
@@ -436,7 +436,7 @@ mod tests {
         Route {
             tenant_id: tenant.to_string(),
             tunnel_id: tunnel.to_string(),
-            peer: crate::transport::dialkey::peer_id(tunnel),
+            peer: crate::dialkey::peer_id(tunnel),
             origin_port: 8080,
         }
     }

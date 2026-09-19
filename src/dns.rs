@@ -654,7 +654,7 @@ impl Message {
             pos = next + 4;
         }
 
-        let mut read_section = |count: u16, pos: &mut usize| -> Result<Vec<Record>, DnsError> {
+        let read_section = |count: u16, pos: &mut usize| -> Result<Vec<Record>, DnsError> {
             let mut out = Vec::new();
             for _ in 0..count {
                 let (name, next) = Name::decode(buf, *pos)?;

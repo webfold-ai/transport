@@ -7,14 +7,21 @@ description = "Transport kernel — TCP, TLS, DNS, signed dialkeys, gossip, edge
 publish = false
 
 [features]
-default = []
-native = ["dep:tokio", "dep:rustls", "dep:tokio-rustls"]
+# `pkarr::RelayClient` (the native pkarr-relay HTTP client) is "always available, no `pkarr`
+# [crate] dependency" per dialkey.rs's own doc comment — not an opt-in extra — so `native` is
+# on by default. `--no-default-features` still gets the wire-format-only zero-dep core.
+default = ["native"]
+native = ["dep:tokio", "dep:rustls", "dep:tokio-rustls", "dep:tracing"]
 
 [dependencies]
-tokio = { version = "1", features = ["net", "io-util"], optional = true }
-rustls = { version = "0.23", optional = true }
+tokio = { version = "1", features = ["net", "io-util", "time", "rt", "macros"], optional = true }
+rustls = { version = "0.23", features = ["ring"], optional = true }
 tokio-rustls = { version = "0.26", optional = true }
+tracing = { version = "0.1", default-features = false, features = ["std", "attributes"], optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
+hashtrinity = { git = "https://gitlab.tas.twn.network/twn/ptyktos/hashtrinity.git", branch = "main", features = ["base32"] }
+rustls-pki-types = "1"
+rustls-native-certs = "0.8"
 
 [workspace]

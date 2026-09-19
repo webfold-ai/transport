@@ -16,7 +16,6 @@
 use super::{PeerAddr, PeerId};
 use hashtrinity::Table;
 use hashtrinity::crypto::to_hex;
-use std::net::IpAddr;
 use std::time::Duration;
 
 #[cfg(feature = "bind-overlay")]

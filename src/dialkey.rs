@@ -24,7 +24,7 @@
 //! dependency at that point. The `federation` impl is the transition shim, not the destination —
 //! see `docs/rfcs/0019-native-p2p-pkarr-removal.md` for what is left to remove.
 
-use crate::transport::{PeerAddr, PeerId};
+use crate::{PeerAddr, PeerId};
 use hashtrinity::crypto::sha256;
 use std::collections::HashMap;
 use std::future::Future;

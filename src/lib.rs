@@ -45,6 +45,16 @@ pub mod edge_proxy;
 #[cfg(feature = "bind-overlay")]
 pub mod control;
 pub mod provision;
+/// HTTP types (`Method`, `Uri`, `HeaderMap`, `Request`/`Response`) — lifted verbatim from
+/// bedrock's `native_lib::http_types`, paired with [`http_client`].
+pub mod http_types;
+/// The plain/TLS stream, connection pool, and request/response wire I/O underneath
+/// [`http_client`]. Lifted verbatim from bedrock's `native_lib::wire`.
+pub(crate) mod wire;
+/// A minimal async HTTP client (GET/PUT + bytes), used by [`pkarr::RelayClient`] to talk to
+/// pkarr relays — "native, always available, no `pkarr` [crate] dependency" per
+/// `dialkey.rs`'s own doc comment, so this isn't behind an opt-in feature.
+pub mod http_client;
 
 use std::future::Future;
 use std::io;

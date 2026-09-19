@@ -79,7 +79,7 @@ pub async fn sweep(
 #[cfg(feature = "bind-edge-dns")]
 mod hickory_probe {
     use super::{Challenge, DnsProbe, Observed};
-    use crate::transport::BoxFuture;
+    use crate::BoxFuture;
 
     use hickory_proto::rr::{RData, RecordType};
     use hickory_resolver::config::{ResolverConfig, CLOUDFLARE, GOOGLE};
@@ -172,7 +172,7 @@ pub use hickory_probe::HickoryProbe;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transport::edge::{HostnameState, Route};
+    use crate::edge::{HostnameState, Route};
     use hashtrinity::Table;
 
     /// A probe answering from a fixed table — the customer's DNS as we would find it.
@@ -210,7 +210,7 @@ mod tests {
         Route {
             tenant_id: "acme".to_string(),
             tunnel_id: "tun-1".to_string(),
-            peer: crate::transport::dialkey::peer_id("tun-1"),
+            peer: crate::dialkey::peer_id("tun-1"),
             origin_port: 8080,
         }
     }

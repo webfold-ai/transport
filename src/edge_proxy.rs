@@ -621,7 +621,7 @@ pub mod flow_count {
 /// certificate" trains people to click through warnings.
 #[cfg(feature = "native")]
 pub mod sni {
-    use crate::transport::edge::{cert_name_for, CertMaterial, CertSource};
+    use crate::edge::{cert_name_for, CertMaterial, CertSource};
     use hashtrinity::Table;
     use std::sync::{Arc, Mutex};
 
@@ -708,8 +708,8 @@ pub use sni::{EdgeCertResolver, MemoryCertSource};
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transport::edge::{Route, APEXES};
-    use crate::transport::{BiStream, BoxFuture};
+    use crate::edge::{Route, APEXES};
+    use crate::{BiStream, BoxFuture};
     use std::io;
 
     /// A connection that does nothing — the pool stores and picks connections, it never
@@ -738,7 +738,7 @@ mod tests {
         Route {
             tenant_id: tenant.to_string(),
             tunnel_id: tunnel.to_string(),
-            peer: crate::transport::dialkey::peer_id(tunnel),
+            peer: crate::dialkey::peer_id(tunnel),
             origin_port: 8080,
         }
     }
@@ -857,7 +857,7 @@ mod tests {
     #[test]
     fn several_connectors_for_one_tunnel_are_all_held_and_rotated() {
         let (_, mut pool, _) = live();
-        let peer = crate::transport::dialkey::peer_id("tun-1");
+        let peer = crate::dialkey::peer_id("tun-1");
         pool.register(peer, Arc::new(StubConnection { peer, label: "b" }));
         assert_eq!(pool.connector_count(peer), 2, "a redundant connector must not evict the first");
 
@@ -876,7 +876,7 @@ mod tests {
     #[test]
     fn eviction_takes_effect_immediately() {
         let (reg, mut pool, fqdn) = live();
-        let peer = crate::transport::dialkey::peer_id("tun-1");
+        let peer = crate::dialkey::peer_id("tun-1");
         assert!(matches!(decide(&reg, &pool, Some(&fqdn), &fqdn, true), Decision::Serve(_)));
 
         // This is what makes token revocation immediate rather than effective-at-reconnect.
@@ -898,7 +898,7 @@ mod tests {
         // servable: presence in the pool is not authorization.
         let (reg, _, fqdn) = live();
         let mut pool = ConnectorPool::new();
-        let impostor = crate::transport::dialkey::peer_id("some-other-tunnel");
+        let impostor = crate::dialkey::peer_id("some-other-tunnel");
         pool.register(impostor, Arc::new(StubConnection { peer: impostor, label: "x" }));
 
         assert_eq!(decide(&reg, &pool, Some(&fqdn), &fqdn, true), Decision::NoConnector);

@@ -21,8 +21,16 @@
 use super::discovery::PeerCapability;
 use super::latency::{LatencyTracker, PeerAffinity};
 use super::PeerId;
-use crate::runtime::cluster::PipelineStage;
 use hashtrinity::crypto::to_hex;
+
+/// One stage of a pipelined plan — the nodes assigned to run it. Defined here (the producer
+/// side); bedrock's `runtime::cluster` consumes this same shape via `Cluster::pipelined_pmap`.
+/// Kept local rather than imported from bedrock to avoid a cycle (bedrock already depends on
+/// this crate for transport).
+#[derive(Clone, Debug)]
+pub struct PipelineStage {
+    pub node_ids: Vec<String>,
+}
 
 /// Constraints for workload placement — what the caller needs and what peers must have.
 #[derive(Clone, Debug)]

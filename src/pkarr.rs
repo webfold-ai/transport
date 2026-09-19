@@ -291,7 +291,7 @@ pub fn build_mesh_model_packet(
 // ── the relay client ────────────────────────────────────────────────────────────────────────
 
 /// Publishes and resolves signed records over the pkarr relay HTTP protocol, on this crate's own
-/// [`crate::Client`].
+/// [`crate::http_client::Client`].
 ///
 /// The protocol is two calls: `PUT <relay>/<z-base32 key>` with the record as the body, and
 /// `GET` the same URL to read it back. A relay is a cache, not an authority — every response is
@@ -299,7 +299,7 @@ pub fn build_mesh_model_packet(
 /// broken relay can withhold a record but cannot forge one.
 #[derive(Clone)]
 pub struct RelayClient {
-    http: crate::Client,
+    http: crate::http_client::Client,
     relays: Vec<String>,
 }
 
@@ -314,7 +314,7 @@ impl RelayClient {
     #[must_use]
     pub fn new() -> Self {
         RelayClient {
-            http: crate::Client::new(),
+            http: crate::http_client::Client::new(),
             relays: DEFAULT_RELAYS.iter().map(|s| (*s).to_string()).collect(),
         }
     }
@@ -322,7 +322,7 @@ impl RelayClient {
     /// A client against the given relay base URLs.
     #[must_use]
     pub fn with_relays(relays: Vec<String>) -> Self {
-        RelayClient { http: crate::Client::new(), relays }
+        RelayClient { http: crate::http_client::Client::new(), relays }
     }
 
     fn url(relay: &str, key: &PublicKey) -> String {
