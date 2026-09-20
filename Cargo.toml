@@ -11,7 +11,19 @@ publish = false
 # [crate] dependency" per dialkey.rs's own doc comment — not an opt-in extra — so `native` is
 # on by default. `--no-default-features` still gets the wire-format-only zero-dep core.
 default = ["native"]
-native = ["dep:tokio", "dep:rustls", "dep:tokio-rustls", "dep:tracing"]
+# `native.rs`, `gossip.rs` and `quic.rs` each open with `#![cfg(feature = "runtime-tokio")]`.
+# The rename from `bedrock-transport` to this crate rewrote this block and inlined
+# `runtime-tokio`'s `dep:tokio` into `native` without the name surviving, so those three
+# modules compiled to nothing in every configuration -- including the default one -- and
+# `use transport::gossip::...` failed with "could not find `gossip` in `transport`" while
+# pointing at a `pub mod gossip;` that is right there. Restored with its original definition
+# from bedrock-transport. None of the three reference rustls, so tokio alone is the gate.
+runtime-tokio = ["dep:tokio"]
+native = ["runtime-tokio", "dep:rustls", "dep:tokio-rustls", "dep:tracing"]
+# Still referenced by src/ but NOT defined here, because the rename also dropped the optional
+# deps they turn on (pkarr, hickory-proto, hickory-resolver, iroh): `federation` (5 cfg sites),
+# `bind-overlay` (8) and `bind-edge-dns` (3). That code remains unreachable. Re-adding those
+# dependency trees is a separate decision, not part of this fix.
 
 [dependencies]
 tokio = { version = "1", features = ["net", "io-util", "time", "rt", "macros"], optional = true }
