@@ -1,6 +1,6 @@
-# Harness — Port bedrock's native_lib::{client,http_types,wire} modules into transport standalone (fixing missing hashtrinity dep, self-referential crate::transport:: paths, and the bedrock-only Client/PipelineStage types) so ptyktos-transport compiles under --features native
+# Harness — add federation module extracted from bedrock's ops.rs, extending transport::dialkey
 
-repo: /home/ctown/projects/transport-fix · phase: Planning
+repo: /home/ctown/projects/transport · phase: Planning
 
 status: **FRESH**
 

@@ -20,10 +20,11 @@ default = ["native"]
 # from bedrock-transport. None of the three reference rustls, so tokio alone is the gate.
 runtime-tokio = ["dep:tokio"]
 native = ["runtime-tokio", "dep:rustls", "dep:tokio-rustls", "dep:tracing"]
-# Still referenced by src/ but NOT defined here, because the rename also dropped the optional
-# deps they turn on (pkarr, hickory-proto, hickory-resolver, iroh): `federation` (5 cfg sites),
-# `bind-overlay` (8) and `bind-edge-dns` (3). That code remains unreachable. Re-adding those
-# dependency trees is a separate decision, not part of this fix.
+federation = ["dep:pkarr"]
+# `bind-overlay` (8 cfg sites) and `bind-edge-dns` (3) still reference deps (hickory-proto,
+# hickory-resolver, iroh) that aren't defined here. That code remains unreachable. Re-adding
+# those dependency trees is a separate decision — federation.rs (2026-09-21, extracted from
+# bedrock's ops.rs) is what `federation`'s 5 cfg sites in dialkey.rs were waiting on.
 
 [dependencies]
 tokio = { version = "1", features = ["net", "io-util", "time", "rt", "rt-multi-thread", "macros", "sync"], optional = true }
@@ -40,5 +41,6 @@ hashtrinity = { git = "https://gitlab.tas.twn.network/twn/ptyktos/hashtrinity.gi
 rustls-pki-types = "1"
 rustls-native-certs = "0.8"
 bytes = "1"
+pkarr = { version = "8.0.1", optional = true }
 
 [workspace]

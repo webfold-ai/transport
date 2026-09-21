@@ -339,7 +339,7 @@ impl DialkeyTransport for pkarr::Client {
             IpAddr::V6(addr) => builder.aaaa(apex, addr, RECORD_TTL),
         };
         let packet = builder.sign(&kp).expect("signing succeeds");
-        async move { self.publish(&packet, None).await }
+        async move { self.publish(&packet).await.map(|_stored_node_count| ()) }
     }
 
     fn resolve_service(
@@ -352,7 +352,10 @@ impl DialkeyTransport for pkarr::Client {
         async move {
             use pkarr::dns::rdata::RData as PkRData;
             let kp = keypair(&dialkey);
-            let packet = self.resolve_most_recent(&kp.public_key()).await?;
+            let packet = self
+                .resolve(&kp.public_key(), pkarr::ResolvePolicy::CacheFirst)
+                .await
+                .ok()?;
             let key_str = kp.public_key().to_string();
             let want = service_name(&key_str, &service);
 

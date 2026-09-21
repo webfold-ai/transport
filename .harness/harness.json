@@ -1,6 +1,6 @@
 {
-  "task": "Port bedrock's native_lib::{client,http_types,wire} modules into transport standalone (fixing missing hashtrinity dep, self-referential crate::transport:: paths, and the bedrock-only Client/PipelineStage types) so ptyktos-transport compiles under --features native",
-  "repo_root": "/home/ctown/projects/transport-fix",
+  "task": "add federation module extracted from bedrock's ops.rs, extending transport::dialkey",
+  "repo_root": "/home/ctown/projects/transport",
   "created_by": "syndesi harness",
   "phase": "Planning",
   "constraints": [
@@ -186,8 +186,8 @@
       "blocking": true
     }
   ],
-  "created_unix": 1789817269,
-  "task_hash": "61df4613b03c011a",
+  "created_unix": 1789995633,
+  "task_hash": "6f7b56f47a0b66d8",
   "sources": [
     {
       "path": "/home/ctown/.config/opencode/AGENTS.md",

@@ -28,6 +28,8 @@ pub mod dns;
 pub mod signed_dns;
 pub mod pkarr;
 pub mod dialkey;
+#[cfg(feature = "federation")]
+pub mod federation;
 pub mod latency;
 pub mod discovery;
 /// tas-edge — the SaaS hostname layer (managed subdomains, BYO custom hostnames). Pure
