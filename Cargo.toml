@@ -26,14 +26,19 @@ native = ["runtime-tokio", "dep:rustls", "dep:tokio-rustls", "dep:tracing"]
 # dependency trees is a separate decision, not part of this fix.
 
 [dependencies]
-tokio = { version = "1", features = ["net", "io-util", "time", "rt", "macros"], optional = true }
+tokio = { version = "1", features = ["net", "io-util", "time", "rt", "rt-multi-thread", "macros", "sync"], optional = true }
 rustls = { version = "0.23", features = ["ring"], optional = true }
 tokio-rustls = { version = "0.26", optional = true }
 tracing = { version = "0.1", default-features = false, features = ["std", "attributes"], optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
-hashtrinity = { git = "https://gitlab.tas.twn.network/twn/ptyktos/hashtrinity.git", branch = "main", features = ["base32"] }
+# No `branch = "main"` — must resolve to the exact same Cargo SourceId as every other consumer
+# of hashtrinity in a build that also pulls in `transcode` (its resolved dependency omits
+# `branch`), or `hashtrinity::Table<K, V>` built here is a distinct type from one built there
+# (E0308 "there are multiple different versions of crate `hashtrinity`").
+hashtrinity = { git = "https://gitlab.tas.twn.network/twn/ptyktos/hashtrinity.git", features = ["base32"] }
 rustls-pki-types = "1"
 rustls-native-certs = "0.8"
+bytes = "1"
 
 [workspace]

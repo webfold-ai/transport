@@ -159,7 +159,7 @@ pub fn decode_message(buf: &[u8]) -> Option<GossipMessage> {
 // ── GossipTopic: the high-level broadcast/recv wrapper ───────────────────────────
 
 use super::native::NativeEndpoint;
-use crate::masq::Bytes;
+use bytes::Bytes;
 
 #[derive(Debug)]
 pub enum GossipError {
