@@ -1,5 +1,5 @@
 {
-  "task": "add federation module extracted from bedrock's ops.rs, extending transport::dialkey",
+  "task": "Fold transport's load_balance.rs into a re-export from relayfold",
   "repo_root": "/home/ctown/projects/transport",
   "created_by": "syndesi harness",
   "phase": "Planning",
@@ -186,8 +186,8 @@
       "blocking": true
     }
   ],
-  "created_unix": 1789995633,
-  "task_hash": "6f7b56f47a0b66d8",
+  "created_unix": 1790171725,
+  "task_hash": "5f249301a77ab466",
   "sources": [
     {
       "path": "/home/ctown/.config/opencode/AGENTS.md",

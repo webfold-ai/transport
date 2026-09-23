@@ -41,6 +41,14 @@ hashtrinity = { git = "https://gitlab.tas.twn.network/twn/ptyktos/hashtrinity.gi
 rustls-pki-types = "1"
 rustls-native-certs = "0.8"
 bytes = "1"
+# `Tuple`/`Relationships`/`Upstream`/`LoadBalance`/`HealthEstimator`/`Backends`/`pick_index`/
+# `coord_of`: `load_balance.rs` used to define these directly (its own independent extraction out
+# of `biota-http-server`'s `kernel::Proxy`, done without knowing `relayfold` already existed as
+# the same extraction out of `bedrock`). Reconciled 2026-09-23: `relayfold` is the superset (also
+# carries `Tuple`/`Relationships`/`Upstream`/`Backends`, which this crate's version didn't) and is
+# already what `bedrock` itself re-exports on both remotes, so it's canonical; `load_balance.rs`
+# is now a thin re-export.
+relayfold = { git = "https://github.com/Ptyktos/relayfold.git", branch = "main" }
 pkarr = { version = "8.0.1", optional = true }
 
 [workspace]

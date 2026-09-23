@@ -1,4 +1,4 @@
-# Harness — add federation module extracted from bedrock's ops.rs, extending transport::dialkey
+# Harness — Fold transport's load_balance.rs into a re-export from relayfold
 
 repo: /home/ctown/projects/transport · phase: Planning
 
