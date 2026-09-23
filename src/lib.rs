@@ -32,6 +32,11 @@ pub mod dialkey;
 pub mod federation;
 pub mod latency;
 pub mod discovery;
+/// The load-balancing algorithm set (`RoundRobin`/`Random`/`Weighted`/`Consistent`/`Healthiest`)
+/// shared between `biota-http-server`'s `kernel::Proxy` (HTTP upstreams) and this crate's own
+/// `edge_proxy::ConnectorPool` (tunnelled peer connections) — extracted out of `kernel::Backends`
+/// so the two proxies pick from one algorithm set, not two that could quietly drift apart.
+pub mod load_balance;
 /// tas-edge — the SaaS hostname layer (managed subdomains, BYO custom hostnames). Pure
 /// registry logic over hashtrinity, so it is always compiled; only the DNS halves need a dep.
 pub mod edge;

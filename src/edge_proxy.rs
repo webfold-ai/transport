@@ -29,11 +29,12 @@
 //! - **self** = the decision (the request inspected to decide whether to carry the request)
 
 use super::edge::{normalize, EdgeRegistry, HostnameState, Route};
+use super::load_balance::HealthEstimator;
 use super::{Connection, PeerId};
 use hashtrinity::Table;
 use hashtrinity::crypto::to_hex;
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 /// What the edge should do with one inbound request.
@@ -155,13 +156,14 @@ impl Decision {
 /// A tunnel may have several connectors online at once — a customer running `tas-overlayd` on
 /// two hosts for redundancy, or mid-deploy with old and new both up. They share one dialkey,
 /// therefore one [`PeerId`], so they land under one key and are picked between. That is the
-/// same shape a load balancer's backend set has, so it reuses
-/// [`crate::proxy::LoadBalance`]'s algorithms rather than adding a second, subtly different
-/// selection policy to the codebase.
+/// same shape a load balancer's backend set has, so it reuses [`crate::load_balance`]'s
+/// algorithms (the same ones `biota-http-server`'s `kernel::Proxy` picks HTTP upstreams with)
+/// rather than adding a second, subtly different selection policy to the codebase.
 pub struct ConnectorPool {
-    /// hex(PeerId) → its live connections. Hex rather than `[u8; 32]` because `Table`'s key
-    /// needs `Coord`, and the hostname registry already speaks in strings.
-    conns: Table<String, Vec<Arc<dyn Connection>>>,
+    /// hex(PeerId) → its live connections, each paired with its own passive latency estimator.
+    /// Hex rather than `[u8; 32]` because `Table`'s key needs `Coord`, and the hostname registry
+    /// already speaks in strings.
+    conns: Table<String, Vec<(Arc<dyn Connection>, Arc<HealthEstimator>)>>,
     cursor: AtomicUsize,
 }
 
@@ -185,7 +187,7 @@ impl ConnectorPool {
     pub fn register(&mut self, peer: PeerId, conn: Arc<dyn Connection>) {
         let key = to_hex(&peer);
         let mut list = self.conns.get(&key).cloned().unwrap_or_default();
-        list.push(conn);
+        list.push((conn, Arc::new(HealthEstimator::new())));
         self.conns.put(key, list);
     }
 
@@ -208,21 +210,37 @@ impl ConnectorPool {
         self.conns.get(&to_hex(&peer)).map_or(0, Vec::len)
     }
 
-    /// Pick one of `peer`'s connections, round-robin.
-    ///
-    /// Round-robin rather than `Healthiest` because the estimator that makes `Healthiest`
-    /// meaningful lives in `proxy::Proxy` and is fed by *its* forwarding path; wiring per-
-    /// connection latency into this pool is a real follow-on, and picking a policy whose
-    /// input is never populated would be a load balancer in name only — the exact thing
-    /// `proxy::LoadBalance`'s own doc calls out as previously broken there.
+    /// Pick one of `peer`'s connections, round-robin. Kept for existing callers; prefer
+    /// [`Self::pick_with`] for anything that can now feed real latency back via the returned
+    /// estimator.
     #[must_use]
     pub fn pick(&self, peer: PeerId) -> Option<Arc<dyn Connection>> {
+        self.pick_with(peer, crate::load_balance::LoadBalance::RoundRobin).map(|(conn, _)| conn)
+    }
+
+    /// Pick one of `peer`'s connections by `algo`, returning it along with its passive latency
+    /// estimator so the caller can `.observe()` a real round-trip time after forwarding through
+    /// it — the same shape `kernel::Backends::pick` returns, and the same
+    /// [`crate::load_balance`] algorithm set, so `Healthiest` here and `Healthiest` in
+    /// `kernel::Proxy` can never quietly mean two different things. This is the follow-on this
+    /// pool's own prior doc comment called out: `Healthiest` had no populated input before
+    /// `load_balance` existed to share the estimator type; now every connection gets one.
+    #[must_use]
+    pub fn pick_with(
+        &self,
+        peer: PeerId,
+        algo: crate::load_balance::LoadBalance,
+    ) -> Option<(Arc<dyn Connection>, Arc<HealthEstimator>)> {
         let list = self.conns.get(&to_hex(&peer))?;
         if list.is_empty() {
             return None;
         }
-        let n = self.cursor.fetch_add(1, Ordering::Relaxed);
-        list.get(n % list.len()).cloned()
+        let node_coords: Vec<u64> = (0..list.len() as u64).collect();
+        let weights = vec![1u32; list.len()];
+        let health: Vec<Arc<HealthEstimator>> = list.iter().map(|(_, h)| h.clone()).collect();
+        let active = vec![Arc::new(AtomicBool::new(true)); list.len()];
+        let idx = crate::load_balance::pick_index(algo, &node_coords, &weights, &health, &active, 0, &self.cursor)?;
+        list.get(idx).map(|(conn, h)| (conn.clone(), h.clone()))
     }
 
     /// Total connections held, across every peer.
