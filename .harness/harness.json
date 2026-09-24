@@ -1,5 +1,5 @@
 {
-  "task": "Fold transport's load_balance.rs into a re-export from relayfold",
+  "task": "wire transport::acme into biota-http-server: real Http01Responder over the router, a CertSource-backed cert store, and a renewal loop",
   "repo_root": "/home/ctown/projects/transport",
   "created_by": "syndesi harness",
   "phase": "Planning",
@@ -186,8 +186,8 @@
       "blocking": true
     }
   ],
-  "created_unix": 1790171725,
-  "task_hash": "5f249301a77ab466",
+  "created_unix": 1790209474,
+  "task_hash": "e73d20b436d3b9a6",
   "sources": [
     {
       "path": "/home/ctown/.config/opencode/AGENTS.md",

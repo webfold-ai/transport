@@ -62,6 +62,12 @@ pub(crate) mod wire;
 /// pkarr relays — "native, always available, no `pkarr` [crate] dependency" per
 /// `dialkey.rs`'s own doc comment, so this isn't behind an opt-in feature.
 pub mod http_client;
+/// ACME v2 (RFC 8555) automation for [`edge::CertSource`] — the issuance worker `edge.rs`'s own
+/// doc comment calls "eventually." Needs [`http_client`]'s real TLS+HTTP/1.1 client and JSON, so
+/// (unlike `http_client` itself) this one IS behind the `native` feature — matching `native.rs`/
+/// `gossip.rs`/`quic.rs`'s own `#![cfg(feature = "...")]` convention rather than `http_client`'s.
+#[cfg(feature = "native")]
+pub mod acme;
 
 use std::future::Future;
 use std::io;

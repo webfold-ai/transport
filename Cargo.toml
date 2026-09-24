@@ -19,7 +19,10 @@ default = ["native"]
 # pointing at a `pub mod gossip;` that is right there. Restored with its original definition
 # from bedrock-transport. None of the three reference rustls, so tokio alone is the gate.
 runtime-tokio = ["dep:tokio"]
-native = ["runtime-tokio", "dep:rustls", "dep:tokio-rustls", "dep:tracing"]
+# `dep:serde`/`dep:serde_json`: `acme.rs`'s JWS/ACME-response JSON — the two crates were already
+# declared below (optional, unused by anything until now), so this wires them in rather than
+# adding a new dependency.
+native = ["runtime-tokio", "dep:rustls", "dep:tokio-rustls", "dep:tracing", "dep:serde", "dep:serde_json"]
 federation = ["dep:pkarr"]
 # `bind-overlay` (8 cfg sites) and `bind-edge-dns` (3) still reference deps (hickory-proto,
 # hickory-resolver, iroh) that aren't defined here. That code remains unreachable. Re-adding

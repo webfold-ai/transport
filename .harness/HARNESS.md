@@ -1,4 +1,4 @@
-# Harness — Fold transport's load_balance.rs into a re-export from relayfold
+# Harness — wire transport::acme into biota-http-server: real Http01Responder over the router, a CertSource-backed cert store, and a renewal loop
 
 repo: /home/ctown/projects/transport · phase: Planning
 
