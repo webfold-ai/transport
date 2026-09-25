@@ -153,6 +153,19 @@ impl ZoneAuthority {
         self.acme.remove(&format!("{ACME_LABEL}.{}", normalize(name)));
     }
 
+    /// Remove only this authorization's value; another order may share the name.
+    pub fn clear_acme_token(&mut self, name: &str, token: &str) {
+        let challenge = format!("{ACME_LABEL}.{}", normalize(name));
+        if let Some(mut tokens) = self.acme.get(&challenge).cloned() {
+            tokens.retain(|value| value != token);
+            if tokens.is_empty() {
+                self.acme.remove(&challenge);
+            } else {
+                self.acme.put(challenge, tokens);
+            }
+        }
+    }
+
     /// The zone `fqdn` falls in — the apex itself or anything under it.
     fn zone_for(&self, fqdn: &str) -> Option<&ZoneConfig> {
         self.zones
@@ -342,6 +355,23 @@ impl ZoneAuthority {
                 .collect(),
             _ => Vec::new(),
         }
+    }
+}
+
+/// Share this handle with `serve_udp` and the ACME renewal loop so TXT updates
+/// reach the live authoritative server without a zone reload.
+pub struct Dns01Authority(pub std::sync::Arc<tokio::sync::Mutex<ZoneAuthority>>);
+
+impl crate::acme::Dns01Responder for Dns01Authority {
+    fn publish_txt<'a>(&'a self, name: &'a str, value: &'a str) -> crate::BoxFuture<'a, Result<(), crate::acme::AcmeError>> {
+        Box::pin(async move {
+            self.0.lock().await.set_acme_token(name, value);
+            Ok(())
+        })
+    }
+
+    fn remove_txt<'a>(&'a self, name: &'a str, value: &'a str) -> crate::BoxFuture<'a, ()> {
+        Box::pin(async move { self.0.lock().await.clear_acme_token(name, value); })
     }
 }
 
