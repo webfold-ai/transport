@@ -24,6 +24,7 @@ runtime-tokio = ["dep:tokio"]
 # adding a new dependency.
 native = ["runtime-tokio", "dep:rustls", "dep:tokio-rustls", "dep:tracing", "dep:serde", "dep:serde_json"]
 federation = ["dep:pkarr"]
+bind-edge-dns = ["native", "dep:hickory-proto"]
 # `bind-overlay` (8 cfg sites) and `bind-edge-dns` (3) still reference deps (hickory-proto,
 # hickory-resolver, iroh) that aren't defined here. That code remains unreachable. Re-adding
 # those dependency trees is a separate decision — federation.rs (2026-09-21, extracted from
@@ -53,5 +54,6 @@ bytes = "1"
 # is now a thin re-export.
 relayfold = { git = "https://github.com/Ptyktos/relayfold.git", branch = "main" }
 pkarr = { version = "8.0.1", optional = true }
+hickory-proto = { version = "0.24", optional = true }
 
 [workspace]
