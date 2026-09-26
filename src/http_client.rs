@@ -7,9 +7,14 @@
 // `Method`/`HeaderMap`/`Uri`/`header` types it was written against.
 
 use crate::http_types::*;
-use crate::wire::{connect, connect_fresh, send_request, send_request_streaming, StreamingResponse};
+use crate::wire::{connect, connect_fresh, send_request, send_request_streaming};
 use std::sync::Arc;
 use tracing::Instrument;
+
+/// Re-export the streaming response so platform callers (e.g. ai-gateway's
+/// `transport_ndjson` adapter) can construct / pass it without reaching into
+/// the `wire` module's internals.
+pub use crate::wire::StreamingResponse;
 
 /// Small non-cryptographic PRNG step for the multipart boundary — same as bedrock's
 /// `native_lib::splitmix64`, kept local since it's five lines and not worth a shared dep.
