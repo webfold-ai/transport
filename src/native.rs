@@ -44,6 +44,7 @@ use hashtrinity::crypto::chacha_poly::{chacha20poly1305_decrypt, chacha20poly130
 use hashtrinity::crypto::{ed25519_pubkey, ed25519_sign, ed25519_verify, x25519};
 use std::collections::HashMap;
 use std::io;
+
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -417,6 +418,8 @@ impl Connection for NativeConnection {
             Ok((send, recv))
         })
     }
+
+
 
     fn accept_bi<'a>(&'a self) -> BoxFuture<'a, io::Result<(Box<dyn BiStream>, Box<dyn BiStream>)>> {
         self.open_bi()

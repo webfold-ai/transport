@@ -72,6 +72,7 @@ pub mod acme;
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
+use std::sync::Arc;
 
 /// A peer's identity — an Ed25519 public key (32 bytes). Same as iroh's `EndpointId`.
 pub type PeerId = [u8; 32];

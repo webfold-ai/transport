@@ -479,6 +479,7 @@ pub mod flow_count {
             let inner = self.inner.clone();
             Box::pin(async move { inner.close().await })
         }
+
     }
 
     fn wrap(stream: Box<dyn BiStream>, counters: Arc<RouteCounters>, half: Half) -> Box<dyn BiStream> {
@@ -561,6 +562,15 @@ pub mod flow_count {
             fn close<'a>(&'a self) -> BoxFuture<'a, std::io::Result<()>> {
                 Box::pin(async { Ok(()) })
             }
+
+            fn raw_halves(
+                &self,
+            ) -> Option<(
+                Arc<tokio::sync::Mutex<tokio::net::tcp::OwnedReadHalf>>,
+                Arc<tokio::sync::Mutex<tokio::net::tcp::OwnedWriteHalf>>,
+            )> {
+                None
+            }
         }
 
         fn rt() -> tokio::runtime::Runtime {
@@ -622,7 +632,6 @@ pub mod flow_count {
         }
     }
 }
-
 
 // ── SNI certificate selection ─────────────────────────────────────────────────────────────
 
