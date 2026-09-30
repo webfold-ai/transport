@@ -37,11 +37,11 @@ tokio-rustls = { version = "0.26", optional = true }
 tracing = { version = "0.1", default-features = false, features = ["std", "attributes"], optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
-# No `branch = "main"` — must resolve to the exact same Cargo SourceId as every other consumer
-# of hashtrinity in a build that also pulls in `transcode` (its resolved dependency omits
-# `branch`), or `hashtrinity::Table<K, V>` built here is a distinct type from one built there
-# (E0308 "there are multiple different versions of crate `hashtrinity`").
-hashtrinity = { git = "https://gitlab.tas.twn.network/twn/ptyktos/hashtrinity.git", features = ["base32"] }
+# One hashtrinity for every Ptyktos crate: this GitHub URL at this revision. Cargo treats
+# different references to the same repo (rev vs branch vs none) as distinct SourceIds, and two
+# copies make `hashtrinity::Table<K, V>` two incompatible types (E0308 "multiple different
+# versions of crate `hashtrinity`"), so every consumer pins exactly this form.
+hashtrinity = { git = "https://github.com/Ptyktos/hashtrinity", rev = "2c36b995c82c073c71df7c28b14c62665d62cbf0", features = ["base32"] }
 rustls-pki-types = "1"
 rustls-native-certs = "0.8"
 bytes = "1"
@@ -52,7 +52,7 @@ bytes = "1"
 # carries `Tuple`/`Relationships`/`Upstream`/`Backends`, which this crate's version didn't) and is
 # already what `bedrock` itself re-exports on both remotes, so it's canonical; `load_balance.rs`
 # is now a thin re-export.
-relayfold = { git = "https://github.com/Ptyktos/relayfold.git", branch = "main" }
+relayfold = { git = "https://github.com/Ptyktos/relayfold" }
 pkarr = { version = "8.0.1", optional = true }
 hickory-proto = { version = "0.24", optional = true }
 
