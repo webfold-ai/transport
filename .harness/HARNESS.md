@@ -1,6 +1,6 @@
-# Harness — wire transport::acme into biota-http-server: real Http01Responder over the router, a CertSource-backed cert store, and a renewal loop
+# Harness — Add gzip content-encoding support to transport's http_client: opt-in Accept-Encoding gzip + transparent decode of gzip Content-Encoding responses via flate2, additive API only, tests with local TcpListener (no wiremock), cargo build && cargo test green, branch off main, push, open PR to Ptyktos/transport main
 
-repo: /home/ctown/projects/transport · phase: Planning
+repo: . · phase: Planning
 
 status: **FRESH**
 

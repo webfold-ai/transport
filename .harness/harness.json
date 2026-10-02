@@ -1,6 +1,6 @@
 {
-  "task": "wire transport::acme into biota-http-server: real Http01Responder over the router, a CertSource-backed cert store, and a renewal loop",
-  "repo_root": "/home/ctown/projects/transport",
+  "task": "Add gzip content-encoding support to transport's http_client: opt-in Accept-Encoding gzip + transparent decode of gzip Content-Encoding responses via flate2, additive API only, tests with local TcpListener (no wiremock), cargo build && cargo test green, branch off main, push, open PR to Ptyktos/transport main",
+  "repo_root": ".",
   "created_by": "syndesi harness",
   "phase": "Planning",
   "constraints": [
@@ -186,8 +186,8 @@
       "blocking": true
     }
   ],
-  "created_unix": 1790209474,
-  "task_hash": "e73d20b436d3b9a6",
+  "created_unix": 1790947042,
+  "task_hash": "a159675e913bd0af",
   "sources": [
     {
       "path": "/home/ctown/.config/opencode/AGENTS.md",

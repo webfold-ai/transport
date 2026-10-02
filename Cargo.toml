@@ -45,6 +45,10 @@ hashtrinity = { git = "https://github.com/Ptyktos/hashtrinity", rev = "2c36b995c
 rustls-pki-types = "1"
 rustls-native-certs = "0.8"
 bytes = "1"
+# `http_client`'s opt-in gzip decode (`ClientBuilder::gzip`/`RequestBuilder::gzip`) — plain,
+# always-available, same tier as `bytes` above rather than behind a feature: `http_client` itself
+# isn't gated (see its own doc comment in lib.rs), so neither is the dependency it needs.
+flate2 = "1"
 # `Tuple`/`Relationships`/`Upstream`/`LoadBalance`/`HealthEstimator`/`Backends`/`pick_index`/
 # `coord_of`: `load_balance.rs` used to define these directly (its own independent extraction out
 # of `biota-http-server`'s `kernel::Proxy`, done without knowing `relayfold` already existed as
