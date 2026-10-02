@@ -267,6 +267,7 @@ struct ClientInner {
     follow_redirects: bool,
     max_redirects: usize,
     retry: Option<RetryPolicy>,
+    gzip: bool,
 }
 
 impl Default for ClientInner {
@@ -277,6 +278,9 @@ impl Default for ClientInner {
             follow_redirects: true,
             max_redirects: 10,
             retry: None,
+            // `identity` stays the default: a caller that never opts in sees byte-for-byte the
+            // same wire behavior as before gzip support existed.
+            gzip: false,
         }
     }
 }
@@ -373,6 +377,7 @@ pub struct RequestBuilder {
     body: Option<Vec<u8>>,
     client: Client,
     retry_override: Option<RetryPolicy>,
+    gzip_override: Option<bool>,
 }
 
 impl RequestBuilder {
@@ -415,22 +420,36 @@ impl RequestBuilder {
         self
     }
 
+    /// Opt this request into `Accept-Encoding: gzip` plus transparent decoding of a gzipped
+    /// response body, overriding whatever `ClientBuilder::gzip` set for the client as a whole.
+    pub fn gzip(mut self, enabled: bool) -> Self {
+        self.gzip_override = Some(enabled);
+        self
+    }
+
     pub async fn send(self) -> Result<Response> {
         let uri = self.uri?;
         let span = tracing::debug_span!(target: "bedrock::client", "http.client_request", method = %self.method, uri = %uri, status = tracing::field::Empty);
         let client = self.client.clone();
         let method = self.method;
-        let headers = self.headers;
+        let mut headers = self.headers;
         let body = self.body;
         let policy = self.retry_override.or(client.inner.retry);
+        let gzip = self.gzip_override.unwrap_or(client.inner.gzip);
+        if gzip && !headers.contains_key(header::ACCEPT_ENCODING) {
+            headers.insert(header::ACCEPT_ENCODING, "gzip");
+        }
         async move {
             let attempts = policy.map(|r| r.max_attempts).unwrap_or(1);
             let backoff = policy.map(|r| r.backoff).unwrap_or_default();
             let mut last_err = None;
             for attempt in 0..attempts {
                 match send_with_redirects(&client, method.clone(), uri.clone(), headers.clone(), body.clone()).await {
-                    Ok(resp) => {
+                    Ok(mut resp) => {
                         tracing::Span::current().record("status", resp.status().as_u16());
+                        if gzip {
+                            decode_gzip_body(&mut resp)?;
+                        }
                         return Ok(resp);
                     }
                     Err(e) => {
@@ -518,6 +537,29 @@ async fn send_with_redirects(
     Err(Error::Http(format!("too many redirects (> {})", client.inner.max_redirects)))
 }
 
+/// Decode a gzipped response body in place, if `Content-Encoding: gzip` is present — only
+/// called when this request opted into gzip, so a caller who never set the flag never has its
+/// body touched regardless of what any server sends back. The `Content-Encoding` header is left
+/// as-is afterward (`HeaderMap` has no removal API, and the alternative — adding one just for
+/// this — is more surface than a cosmetic mismatch between header and already-decoded body
+/// warrants); `Response::bytes`/`text` return the decoded bytes either way.
+fn decode_gzip_body(resp: &mut Response) -> Result<()> {
+    let is_gzip = resp
+        .headers()
+        .get(header::CONTENT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.trim().eq_ignore_ascii_case("gzip"))
+        .unwrap_or(false);
+    if !is_gzip {
+        return Ok(());
+    }
+    use std::io::Read;
+    let mut decoded = Vec::new();
+    flate2::read::GzDecoder::new(&resp.body[..]).read_to_end(&mut decoded).map_err(Error::Io)?;
+    resp.body = decoded;
+    Ok(())
+}
+
 fn resolve_redirect_uri(base: &Uri, location: &str) -> Result<Uri> {
     if location.starts_with("http://") || location.starts_with("https://") {
         return parse_uri(location);
@@ -580,6 +622,7 @@ impl Client {
             body: None,
             client: self.clone(),
             retry_override: None,
+            gzip_override: None,
         }
     }
 }
@@ -622,6 +665,14 @@ impl ClientBuilder {
         self
     }
 
+    /// Opt every request from this client into `Accept-Encoding: gzip` plus transparent
+    /// decoding of a gzipped response body (`RequestBuilder::gzip` overrides this per request).
+    /// Off by default — identity stays what a caller who never opts in sees.
+    pub fn gzip(mut self, enabled: bool) -> Self {
+        self.0.gzip = enabled;
+        self
+    }
+
     pub fn build(self) -> Client {
         Client { inner: Arc::new(self.0) }
     }
@@ -633,5 +684,109 @@ pub async fn get(url: impl AsRef<str>) -> Result<Response> {
 
 pub async fn post(url: impl AsRef<str>) -> Result<Response> {
     Client::new().post(url).send().await
+}
+
+#[cfg(test)]
+mod gzip_tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    /// A minimal, single-request raw HTTP/1.1 server on a real loopback socket — `std`'s
+    /// blocking `TcpListener`, not an async mock library, matching what the gzip support here
+    /// actually needs to prove: real bytes, in the real `Content-Encoding: gzip` framing, off
+    /// the real wire. Responds once with `payload` (gzipped first iff `gzip_encode`), then the
+    /// accepting thread exits.
+    fn spawn_server(plain_body: &'static [u8], gzip_encode: bool) -> std::net::SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
+        let addr = listener.local_addr().expect("listener has a local addr");
+
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept one connection");
+
+            // Read until the blank line terminating the request head — exactly what's needed to
+            // know the client is done sending, nothing more (this test server never looks at the
+            // request itself, only that one arrived).
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 512];
+            loop {
+                let n = stream.read(&mut chunk).expect("read request");
+                buf.extend_from_slice(&chunk[..n]);
+                if n == 0 || buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+
+            let payload: Vec<u8> = if gzip_encode {
+                let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+                encoder.write_all(plain_body).expect("write into gzip encoder");
+                encoder.finish().expect("finish gzip stream")
+            } else {
+                plain_body.to_vec()
+            };
+
+            let mut head = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n", payload.len());
+            if gzip_encode {
+                head.push_str("Content-Encoding: gzip\r\n");
+            }
+            head.push_str("\r\n");
+
+            stream.write_all(head.as_bytes()).expect("write response head");
+            stream.write_all(&payload).expect("write response body");
+            let _ = stream.flush();
+        });
+
+        addr
+    }
+
+    #[tokio::test]
+    async fn gzip_response_is_transparently_decoded() {
+        let plain: &'static [u8] = b"hello from a gzip-encoded response body, decoded transparently";
+        let addr = spawn_server(plain, true);
+
+        let client = Client::builder().gzip(true).build();
+        let resp = client.get(format!("http://{addr}/")).send().await.expect("request succeeds");
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(header::CONTENT_ENCODING).and_then(|v| v.to_str().ok()),
+            Some("gzip"),
+        );
+        assert_eq!(resp.bytes().await, plain);
+    }
+
+    /// A non-compressed response must pass through byte-for-byte unchanged, whether or not the
+    /// caller opted into gzip — the server here never sets `Content-Encoding`, so there is
+    /// nothing to decode.
+    #[tokio::test]
+    async fn non_compressed_response_passes_through_unchanged() {
+        let plain: &'static [u8] = b"plain body, never touched by the gzip decoder";
+        let addr = spawn_server(plain, false);
+
+        let client = Client::builder().gzip(true).build();
+        let resp = client.get(format!("http://{addr}/")).send().await.expect("request succeeds");
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(resp.headers().get(header::CONTENT_ENCODING).is_none());
+        assert_eq!(resp.bytes().await, plain);
+    }
+
+    /// Without opting in, `Accept-Encoding: gzip` is never sent and a gzipped response (however
+    /// unusual, since a conformant server wouldn't send one unsolicited) is handed back as-is,
+    /// still compressed — proving the default stays byte-for-byte what it was before gzip
+    /// support existed.
+    #[tokio::test]
+    async fn gzip_opt_out_leaves_body_untouched() {
+        let plain: &'static [u8] = b"this body would decode to plain text, but gzip was never requested";
+        let addr = spawn_server(plain, true);
+
+        let client = Client::new();
+        let resp = client.get(format!("http://{addr}/")).send().await.expect("request succeeds");
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.bytes().await;
+        assert_ne!(body, plain);
+        assert_eq!(&body[..2], &[0x1f, 0x8b], "still gzip-magic-prefixed, i.e. undecoded");
+    }
 }
 
