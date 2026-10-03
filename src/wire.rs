@@ -5,6 +5,7 @@
 // Ported from bedrock's `native_lib::wire` (originally `include!`d into `native_lib.rs`,
 // sharing its flat scope); here it's a real module, paired with `crate::http_types`.
 
+use std::borrow::Cow;
 use std::io;
 use hashtrinity::{Coord, CoordMap};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -317,6 +318,29 @@ pub(crate) async fn connect_fresh(
 /// Write the request line, headers, and body — shared by the buffered (`send_request`) and
 /// streaming (`send_request_streaming`) paths; they only diverge on how the RESPONSE body gets
 /// read, never on how the request itself goes out.
+/// The `User-Agent` value to serialize, or `None` when the caller already supplied one.
+///
+/// Split out from [`write_request`] because it is the whole decision and the one
+/// thing here worth a test: the wire is a live socket, so a regression in this
+/// function is invisible to every other test in the crate. An empty caller value
+/// falls back to the transport default rather than serializing `User-Agent: `,
+/// which some servers reject and others read as a malformed request.
+fn effective_user_agent(headers: &HeaderMap) -> Option<Cow<'_, str>> {
+    let Some(supplied) = headers.get(crate::http_types::header::USER_AGENT) else {
+        return Some(Cow::Borrowed(DEFAULT_USER_AGENT));
+    };
+    let text = std::str::from_utf8(supplied.as_bytes()).unwrap_or_default().trim();
+    // An empty caller value falls back rather than serializing `User-Agent: `,
+    // which some servers reject outright.
+    if text.is_empty() {
+        return Some(Cow::Borrowed(DEFAULT_USER_AGENT));
+    }
+    Some(Cow::Owned(text.to_owned()))
+}
+
+/// The value written when the caller names no agent.
+const DEFAULT_USER_AGENT: &str = "bedrock/0.1.0";
+
 async fn write_request(
     stream: &mut Stream,
     method: &Method,
@@ -334,11 +358,30 @@ async fn write_request(
     stream
         .write_all(format!("{} {} HTTP/1.1\r\nHost: {}\r\n", method, path, authority).as_bytes())
         .await?;
-    stream
-        .write_all(b"User-Agent: bedrock/0.1.0\r\n")
-        .await?;
+    // A caller-supplied User-Agent wins.
+    //
+    // This used to be unconditional, so `RequestBuilder::header(USER_AGENT, …)` sent
+    // the transport's value AND the caller's — two `User-Agent:` lines, which a
+    // server is free to read as either or both. webfold's fetch adapter responded
+    // by refusing a caller User-Agent outright on the direct path, so a client
+    // could not identify itself at all; the practical effect was that every
+    // request left this crate claiming to be `bedrock/0.1.0`, whatever was actually
+    // making it, and origins that gate on the agent string (Google's asset CDN
+    // among them) served a sign-in page instead of the file.
+    if let Some(agent) = effective_user_agent(headers) {
+        stream
+            .write_all(format!("User-Agent: {agent}\r\n").as_bytes())
+            .await?;
+    }
 
     for (name, value) in headers.iter() {
+        // Skip the agent: it was written above, under its canonical casing. Leaving
+        // it in the loop is how the request ends up with two `User-Agent` lines —
+        // the transport's spelling and the caller's — which is the defect this
+        // whole change exists to remove, so it is skipped rather than duplicated.
+        if name.eq_ignore_ascii_case(crate::http_types::header::USER_AGENT) {
+            continue;
+        }
         stream.write_all(name.as_bytes()).await?;
         stream.write_all(b": ").await?;
         stream.write_all(value.as_bytes()).await?;
@@ -644,3 +687,190 @@ async fn read_chunked(reader: &mut StreamReader) -> Result<Vec<u8>> {
     Ok(body)
 }
 
+#[cfg(test)]
+mod wire_head_tests {
+    //! The request head as it reaches the socket.
+    //!
+    //! These are loopback tests on purpose. The decision function has unit tests,
+    //! but a unit test cannot catch `write_request` failing to *use* it — and that
+    //! was the entire defect: the decision existed nowhere, the wire wrote
+    //! `bedrock/0.1.0` unconditionally, and every client inherited it. Only a
+    //! request that actually lands on a socket proves what went out.
+    //!
+    //! A single `TcpListener` on an ephemeral port, one request, and the bytes the
+    //! server received. No network, no fixture, no DNS.
+
+    use crate::http_types::header::USER_AGENT;
+    use crate::http_types::{HeaderMap, Method};
+    use crate::http_types::Uri;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    async fn receive_once(listener: TcpListener) -> Vec<u8> {
+        let (mut socket, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+            .await
+            .expect("a client must connect")
+            .expect("accept");
+        let mut buf = vec![0u8; 4096];
+        let n = tokio::time::timeout(Duration::from_secs(5), socket.read(&mut buf))
+            .await
+            .expect("the client must send a head")
+            .expect("read");
+        buf.truncate(n);
+        let _ = socket
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+            .await;
+        buf
+    }
+
+    /// Every `User-Agent:` line in a raw request, in order.
+    fn user_agent_lines(raw: &[u8]) -> Vec<String> {
+        String::from_utf8_lossy(raw)
+            .lines()
+            .filter_map(|l| {
+                let (name, value) = l.split_once(':')?;
+                name.trim()
+                    .eq_ignore_ascii_case("user-agent")
+                    .then(|| value.trim().to_string())
+            })
+            .collect()
+    }
+
+    async fn head_over_loopback(headers: HeaderMap) -> Vec<u8> {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(async move { receive_once(listener).await });
+        let uri: Uri = format!("http://{addr}/x").parse().expect("uri");
+        let stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        crate::wire::send_request(crate::wire::Stream::Plain(stream), Method::GET, &uri, headers, None)
+            .await
+            .expect("send");
+        server.await.expect("the loopback server task must not panic")
+    }
+
+    #[tokio::test]
+    async fn a_caller_agent_is_the_only_agent_on_the_wire() {
+        let mut headers = HeaderMap::new();
+        headers.insert(USER_AGENT, "webfold/0.1 (+https://example.test)");
+        let raw = head_over_loopback(headers).await;
+        let lines = user_agent_lines(&raw);
+        assert_eq!(
+            lines,
+            vec!["webfold/0.1 (+https://example.test)".to_string()],
+            "expected exactly the caller's agent, got {lines:?} in:\n{}",
+            String::from_utf8_lossy(&raw)
+        );
+    }
+
+    #[tokio::test]
+    async fn no_caller_agent_sends_exactly_one_default_agent() {
+        let raw = head_over_loopback(HeaderMap::new()).await;
+        let lines = user_agent_lines(&raw);
+        assert_eq!(lines.len(), 1, "one agent, not two: {lines:?}");
+        assert_eq!(lines[0], super::DEFAULT_USER_AGENT);
+    }
+
+    /// The exact shape of the original bug: two `User-Agent` lines, the
+    /// transport's first and the caller's second, leaving the server to guess.
+    #[tokio::test]
+    async fn the_request_never_carries_two_agents() {
+        let mut headers = HeaderMap::new();
+        headers.insert("accept", "*/*");
+        headers.insert(USER_AGENT, "webfold/0.1");
+        let raw = head_over_loopback(headers).await;
+        assert!(
+            user_agent_lines(&raw).len() <= 1,
+            "duplicate User-Agent: {}",
+            String::from_utf8_lossy(&raw)
+        );
+    }
+
+    /// A regression guard on the sibling headers too: the caller's headers are
+    /// still serialized, so "the agent now wins" did not come from dropping them.
+    #[tokio::test]
+    async fn caller_headers_are_still_sent_alongside_the_agent() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-webfold-test", "present");
+        let raw = head_over_loopback(headers).await;
+        let text = String::from_utf8_lossy(&raw);
+        assert!(text.contains("x-webfold-test: present"), "{text}");
+    }
+}
+
+#[cfg(test)]
+mod user_agent_tests {
+    //! The caller-supplied `User-Agent` decision.
+    //!
+    //! A unit test rather than an integration one because this function's whole
+    //! job is to decide what goes on the wire, and the wire is a socket: a
+    //! regression here is invisible to every other test in the crate, and
+    //! invisible in production too — a duplicated `User-Agent` is not a crash, it
+    //! is a request that identifies as something it is not.
+
+    use super::effective_user_agent;
+    use crate::http_types::header::USER_AGENT;
+    use crate::http_types::HeaderMap;
+
+    fn with_agent(value: &str) -> HeaderMap {
+        let mut map = HeaderMap::new();
+        map.insert(USER_AGENT, value);
+        map
+    }
+
+    #[test]
+    fn a_caller_agent_is_the_one_that_goes_out() {
+        assert_eq!(
+            effective_user_agent(&with_agent("webfold/0.1 (+https://example.test)")).as_deref(),
+            Some("webfold/0.1 (+https://example.test)")
+        );
+    }
+
+    #[test]
+    fn no_caller_agent_keeps_the_transport_default() {
+        assert_eq!(
+            effective_user_agent(&HeaderMap::new()).as_deref(),
+            Some(super::DEFAULT_USER_AGENT)
+        );
+    }
+
+    /// The header map is case-insensitive, so `User-Agent` set through any
+    /// spelling must still win. Before this change it did not: the transport
+    /// wrote its own value first and the caller's followed it, giving a server
+    /// two `User-Agent` lines and no way to know which one webfold meant.
+    #[test]
+    fn the_caller_agent_wins_whatever_the_header_spelling() {
+        let mut map = HeaderMap::new();
+        map.insert("User-Agent", "spelled-camel");
+        assert_eq!(effective_user_agent(&map).as_deref(), Some("spelled-camel"));
+
+        let mut map = HeaderMap::new();
+        map.insert("USER-AGENT", "spelled-upper");
+        assert_eq!(effective_user_agent(&map).as_deref(), Some("spelled-upper"));
+    }
+
+    /// An empty value must not serialize as `User-Agent: `, which some servers
+    /// reject and others read as a malformed request. The default stands in.
+    #[test]
+    fn an_empty_agent_falls_back_instead_of_sending_a_bare_header() {
+        assert_eq!(
+            effective_user_agent(&with_agent("")).as_deref(),
+            Some(super::DEFAULT_USER_AGENT)
+        );
+        assert_eq!(
+            effective_user_agent(&with_agent("   ")).as_deref(),
+            Some(super::DEFAULT_USER_AGENT)
+        );
+    }
+
+    /// An unrelated header must not be mistaken for the agent.
+    #[test]
+    fn other_headers_are_not_mistaken_for_the_agent() {
+        let mut map = HeaderMap::new();
+        map.insert("accept", "text/html");
+        assert_eq!(
+            effective_user_agent(&map).as_deref(),
+            Some(super::DEFAULT_USER_AGENT)
+        );
+    }
+}
