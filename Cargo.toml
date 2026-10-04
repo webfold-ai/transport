@@ -56,7 +56,7 @@ flate2 = "1"
 # carries `Tuple`/`Relationships`/`Upstream`/`Backends`, which this crate's version didn't) and is
 # already what `bedrock` itself re-exports on both remotes, so it's canonical; `load_balance.rs`
 # is now a thin re-export.
-relayfold = { git = "https://github.com/Ptyktos/relayfold" }
+relayfold = { git = "https://github.com/Ptyktos/relayfold.git", branch = "main" }
 pkarr = { version = "8.0.1", optional = true }
 hickory-proto = { version = "0.24", optional = true }
 
