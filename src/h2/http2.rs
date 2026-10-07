@@ -1,7 +1,7 @@
 //! HTTP/2 framing (RFC 9113) — just enough to drive ONE gRPC unary call per
 //! connection: the connection preface, SETTINGS exchange, HEADERS+DATA on a
 //! single stream, and reading the response HEADERS/DATA/trailers back. Pure
-//! Rust, zero deps, over any [`crate::sync::hpack`]-paired byte stream (this
+//! Rust, zero deps, over any [`crate::h2::hpack`]-paired byte stream (this
 //! module doesn't care whether the underlying transport is plaintext, our own
 //! TLS client, or a Unix socket — it just needs `Read + Write`).
 //!
@@ -14,7 +14,7 @@
 
 use std::io::{self, Error, ErrorKind, Read, Write};
 
-use crate::sync::hpack::{encode_headers, HpackDecoder};
+use crate::h2::hpack::{encode_headers, HpackDecoder};
 
 const FRAME_DATA: u8 = 0x0;
 const FRAME_HEADERS: u8 = 0x1;
@@ -244,14 +244,14 @@ mod tests {
         write_frame(&mut out, FRAME_SETTINGS, FLAG_ACK, 0, &[]).unwrap();
         // Response HEADERS: :status 200 (indexed, static #8), content-type application/grpc (literal)
         let mut hdr_block = Vec::new();
-        crate::sync::hpack::encode_header(&mut hdr_block, ":status", "200");
-        crate::sync::hpack::encode_header(&mut hdr_block, "content-type", "application/grpc");
+        crate::h2::hpack::encode_header(&mut hdr_block, ":status", "200");
+        crate::h2::hpack::encode_header(&mut hdr_block, "content-type", "application/grpc");
         write_frame(&mut out, FRAME_HEADERS, FLAG_END_HEADERS, 1, &hdr_block).unwrap();
         // DATA: a fake gRPC-framed empty message (compressed=0, len=0)
         write_frame(&mut out, FRAME_DATA, 0, 1, &[0x00, 0x00, 0x00, 0x00, 0x00]).unwrap();
         // Trailers: grpc-status: 0
         let mut trailer_block = Vec::new();
-        crate::sync::hpack::encode_header(&mut trailer_block, "grpc-status", "0");
+        crate::h2::hpack::encode_header(&mut trailer_block, "grpc-status", "0");
         write_frame(
             &mut out,
             FRAME_HEADERS,

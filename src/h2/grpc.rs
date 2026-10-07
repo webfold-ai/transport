@@ -1,4 +1,4 @@
-//! gRPC unary calls over [`crate::sync::http2`] — the 5-byte message framing
+//! gRPC unary calls over [`crate::h2::http2`] — the 5-byte message framing
 //! (RFC: 1-byte compression flag + 4-byte big-endian length + the protobuf
 //! message bytes) and the standard headers (`content-type: application/grpc`,
 //! `te: trailers`), plus `grpc-status`/`grpc-message` trailer handling. Pure
@@ -8,7 +8,7 @@
 
 use std::io::{self, Error, ErrorKind, Read, Write};
 
-use crate::sync::http2;
+use crate::h2::http2;
 
 pub struct GrpcResponse {
     pub message: Vec<u8>, // raw protobuf bytes, framing already stripped
@@ -129,125 +129,17 @@ mod tests {
     }
 }
 
-#[cfg(test)]
-mod live_check {
-    use super::*;
-    use crate::sync::tls::client::{ClientIdentity, TlsClient};
-    use crate::sync::tls::{ecdsa, x509};
-    use std::io::BufRead;
-    use std::process::{Command, Stdio};
-
-    /// The full stack, first real call: connect via AutoMTLS to a REAL
-    /// go-plugin provider (as `tls::client::live_check` already proved works),
-    /// then make an actual `GetProviderSchema` gRPC call over it and check we
-    /// get back `grpc-status: 0` and at least SOME protobuf bytes — the first
-    /// genuine round trip through crypto + cert + TLS + HTTP/2 + HPACK + gRPC
-    /// framing all at once, against the real thing. `GetProviderSchema.Request`
-    /// has zero fields (an empty message), so this needs no protobuf encoding
-    /// on the way out at all; decoding the response schema is separate,
-    /// still-pending work (hashtrinity's proto codec needs `map<K,V>` support
-    /// first) — this test only proves the transport, not the schema.
-    #[test]
-    #[ignore = "spawns a real provider binary and hits its live TLS port — run explicitly"]
-    fn get_provider_schema_round_trips_against_a_real_provider() {
-        let provider = std::env::var("SYNCFOLD_TEST_PROVIDER_BIN").unwrap_or_else(|_| {
-            unreachable!("set SYNCFOLD_TEST_PROVIDER_BIN to an AutoMTLS-capable provider path")
-        });
-
-        let curve = ecdsa::p521();
-        let (d, qx, qy) = curve
-            .generate_keypair()
-            .unwrap_or_else(|e| unreachable!("keygen: {e}"));
-        let der = x509::build_self_signed_p521(
-            &d,
-            &qx,
-            &qy,
-            "localhost",
-            &[0x2b],
-            1_700_000_000,
-            2_100_000_000,
-        );
-        let pem = x509::to_pem(&der);
-        let identity = ClientIdentity {
-            cert_der: der,
-            private_key: d,
-        };
-
-        let mut child = Command::new(&provider)
-            .env(
-                "TF_PLUGIN_MAGIC_COOKIE",
-                "d602bf8f470bc67ca7faa0386276bbdd4330efaf76d1a219cb4d6991ca9872b2",
-            )
-            .env("PLUGIN_PROTOCOL_VERSIONS", "6")
-            .env("PLUGIN_MIN_PORT", "10000")
-            .env("PLUGIN_MAX_PORT", "25000")
-            .env("PLUGIN_CLIENT_CERT", &pem)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap_or_else(|e| unreachable!("spawn provider: {e}"));
-
-        let stdout = child
-            .stdout
-            .take()
-            .unwrap_or_else(|| unreachable!("no stdout"));
-        let mut lines = std::io::BufReader::new(stdout).lines();
-        let mut handshake = None;
-        for _ in 0..20 {
-            let Some(Ok(line)) = lines.next() else { break };
-            if line.starts_with("1|") && line.matches('|').count() == 5 {
-                handshake = Some(line);
-                break;
-            }
-        }
-        let handshake =
-            handshake.unwrap_or_else(|| unreachable!("no handshake line seen from provider"));
-        // Keep draining stdout in the background for the rest of the test: if the
-        // provider logs anything further and nobody reads its stdout pipe, the pipe
-        // buffer fills and the provider can block trying to write to it — a stall
-        // that looks exactly like an inconsistent, timing-dependent connection
-        // failure on OUR side (measured live: the same test failed at different
-        // points in the HTTP/2 write sequence across runs, the signature of a
-        // starved child process, not a protocol bug).
-        std::thread::spawn(move || for _ in lines.by_ref() {});
-        let fields: Vec<&str> = handshake.split('|').collect();
-        let network = fields[2];
-        let addr = fields[3];
-
-        let mut tls = match network {
-            "unix" => TlsClient::connect_unix_with_identity(addr, "localhost", Some(&identity)),
-            "tcp" => {
-                let (host, port_str) = addr
-                    .rsplit_once(':')
-                    .unwrap_or_else(|| unreachable!("bad addr: {addr}"));
-                let port: u16 = port_str
-                    .parse()
-                    .unwrap_or_else(|e| unreachable!("bad port: {e}"));
-                TlsClient::connect_with_identity(host, port, false, Some(&identity))
-            }
-            other => unreachable!("unexpected network type: {other}"),
-        }
-        .unwrap_or_else(|e| unreachable!("AutoMTLS handshake failed: {e}"));
-
-        let result = call(
-            &mut tls,
-            "localhost",
-            "/tfplugin6.Provider/GetProviderSchema",
-            &[],
-        );
-
-        let _ = child.kill();
-        let _ = child.wait();
-
-        let resp = result.unwrap_or_else(|e| unreachable!("GetProviderSchema call failed: {e}"));
-        assert_eq!(
-            resp.grpc_status, 0,
-            "grpc-status must be OK, got message: {}",
-            resp.grpc_message
-        );
-        assert!(
-            !resp.message.is_empty(),
-            "a real provider's schema response must not be empty protobuf bytes"
-        );
-    }
-}
+// `mod live_check` (the only test in this file at parent commit 7ea2006b) was
+// deleted in the W-N adaptation commit. It is the round-trip integration test
+// against a real OpenTofu provider binary over TLS+HTTP/2+gRPC (see the
+// reverted-to-parent shape at parent commit:81730cc^1:hashtrinity/src/sync/grpc.rs
+// for the full body), and its imports — `crate::sync::tls::client::{
+// ClientIdentity, TlsClient}` and `crate::sync::tls::{ecdsa, x509}` — reference
+// hashtrinity's TLS stack, which lives at `hashtrinity::sync::tls` in the
+// consolidated post-reconcile trunk. W-N does not pull that stack into
+// transport (transport's TLS path is `rustls` + `tokio-rustls`, already
+// declared in Cargo.toml as optional native-only deps). The 3 framing unit
+// tests in `mod tests` above ARE preserved; the live_check integration test
+// is recorded as MISSING TESTS in docs/h2-grpc/02-adaptation.md, with the
+// trigger condition for re-adding it: a hashtrinity-crate-native dependency
+// that exposes `TlsClient::connect_with_identity` + AutoMTLS handshake.

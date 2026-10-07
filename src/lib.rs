@@ -55,6 +55,13 @@ pub mod provision;
 /// HTTP types (`Method`, `Uri`, `HeaderMap`, `Request`/`Response`) — lifted verbatim from
 /// bedrock's `native_lib::http_types`, paired with [`http_client`].
 pub mod http_types;
+/// HTTP/2 + HPACK + gRPC framing (RFC 7541 / RFC 9113 / gRPC-over-HTTP/2), restored from
+/// `hashtrinity/src/sync/{hpack,http2,grpc}.rs` at commit `81730cc^1` for TASK W-N. Zero
+/// dependencies beyond `std`; no async runtime required. See `src/h2/mod.rs` for the
+/// provenance and `docs/h2-grpc/00-sweep-audit.md` for the audit of the merge that deleted
+/// the originals.
+#[cfg(feature = "h2")]
+pub mod h2;
 /// The plain/TLS stream, connection pool, and request/response wire I/O underneath
 /// [`http_client`]. Lifted verbatim from bedrock's `native_lib::wire`.
 pub(crate) mod wire;
