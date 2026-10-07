@@ -1,4 +1,4 @@
-# Harness — wire transport::acme into biota-http-server: real Http01Responder over the router, a CertSource-backed cert store, and a renewal loop
+# Harness — check transport signing primitives
 
 repo: /home/ctown/projects/transport · phase: Planning
 

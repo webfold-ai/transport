@@ -1,5 +1,5 @@
 {
-  "task": "wire transport::acme into biota-http-server: real Http01Responder over the router, a CertSource-backed cert store, and a renewal loop",
+  "task": "check transport signing primitives",
   "repo_root": "/home/ctown/projects/transport",
   "created_by": "syndesi harness",
   "phase": "Planning",
@@ -186,8 +186,8 @@
       "blocking": true
     }
   ],
-  "created_unix": 1790209474,
-  "task_hash": "e73d20b436d3b9a6",
+  "created_unix": 1790679529,
+  "task_hash": "2c25098ace9ac0d5",
   "sources": [
     {
       "path": "/home/ctown/.config/opencode/AGENTS.md",
