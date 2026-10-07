@@ -16,20 +16,51 @@ use std::io::{self, Error, ErrorKind, Read, Write};
 
 use crate::h2::hpack::{encode_headers, HpackDecoder};
 
-const FRAME_DATA: u8 = 0x0;
-const FRAME_HEADERS: u8 = 0x1;
-const FRAME_SETTINGS: u8 = 0x4;
-const FRAME_GOAWAY: u8 = 0x7;
-const FRAME_WINDOW_UPDATE: u8 = 0x8;
-const FRAME_CONTINUATION: u8 = 0x9;
+pub const FRAME_DATA: u8 = 0x0;
+pub const FRAME_HEADERS: u8 = 0x1;
+pub const FRAME_SETTINGS: u8 = 0x4;
+pub const FRAME_GOAWAY: u8 = 0x7;
+pub const FRAME_WINDOW_UPDATE: u8 = 0x8;
+pub const FRAME_CONTINUATION: u8 = 0x9;
 
-const FLAG_END_STREAM: u8 = 0x1;
-const FLAG_END_HEADERS: u8 = 0x4;
-const FLAG_ACK: u8 = 0x1;
+pub const FLAG_END_STREAM: u8 = 0x1;
+pub const FLAG_END_HEADERS: u8 = 0x4;
+pub const FLAG_ACK: u8 = 0x1;
 
-const PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+pub const PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
-struct FrameHeader {
+/// Read a single frame header (the 9-byte fixed prefix). Public so a server
+/// can build its own frame loop in lockstep with `unary_request`.
+pub fn read_frame_header_public(r: &mut impl Read) -> io::Result<FrameHeader> {
+    read_frame_header(r)
+}
+
+/// Write a single frame (header + payload). Public so a server can build its
+/// own response without a copy of the byte-layout code.
+pub fn write_frame_public(
+    w: &mut impl Write,
+    ty: u8,
+    flags: u8,
+    stream_id: u32,
+    payload: &[u8],
+) -> io::Result<()> {
+    write_frame(w, ty, flags, stream_id, payload)
+}
+
+/// Read one full frame (header + payload of the right length). Public so a
+/// server can parse client frames without re-implementing the length check.
+pub fn read_frame_public(r: &mut impl Read) -> io::Result<(FrameHeader, Vec<u8>)> {
+    read_frame(r)
+}
+
+/// Encode a SETTINGS payload as a sequence of (id, value) pairs, each 6 bytes
+/// (u16 id + u32 value). Empty `pairs` produces an empty payload (the SETTINGS
+/// ACK shape). Public so the server can advertise its own settings.
+pub fn encode_settings_public(pairs: &[(u16, u32)]) -> Vec<u8> {
+    encode_settings(pairs)
+}
+
+pub struct FrameHeader {
     len: usize,
     ty: u8,
     flags: u8,
