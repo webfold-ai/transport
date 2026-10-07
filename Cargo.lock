@@ -20,7 +20,7 @@ dependencies = [
 [[package]]
 name = "apeiron"
 version = "0.1.0"
-source = "git+https://gitlab.tas.twn.network/lucas/apeiron.git?rev=da01485#da01485d24be8900824750431a70f19100bee200"
+source = "git+https://github.com/Ptyktos/apeiron.git?rev=a2b50938679888cba22e5174e8dce92dfb6414cc#a2b50938679888cba22e5174e8dce92dfb6414cc"
 
 [[package]]
 name = "async-compat"
@@ -526,17 +526,7 @@ dependencies = [
 [[package]]
 name = "hashtrinity"
 version = "0.1.0"
-source = "git+https://gitlab.tas.twn.network/twn/ptyktos/hashtrinity.git?branch=main#0bcfe0e7bdc616dfe17c083c3a8fa7be242f3951"
-dependencies = [
- "apeiron",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "hashtrinity"
-version = "0.1.0"
-source = "git+https://gitlab.tas.twn.network/twn/ptyktos/hashtrinity.git#0bcfe0e7bdc616dfe17c083c3a8fa7be242f3951"
+source = "git+https://github.com/Ptyktos/hashtrinity?rev=2c36b995c82c073c71df7c28b14c62665d62cbf0#2c36b995c82c073c71df7c28b14c62665d62cbf0"
 dependencies = [
  "apeiron",
  "rustls",
@@ -1266,9 +1256,9 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 [[package]]
 name = "relayfold"
 version = "0.1.0"
-source = "git+https://github.com/Ptyktos/relayfold.git?branch=main#7071305d305bb3ba0eea1adbcea5f52eaf06662a"
+source = "git+https://github.com/Ptyktos/relayfold#39538daedeccd5933e022f9929ae5d9586d129f6"
 dependencies = [
- "hashtrinity 0.1.0 (git+https://gitlab.tas.twn.network/twn/ptyktos/hashtrinity.git?branch=main)",
+ "hashtrinity",
 ]
 
 [[package]]
@@ -1919,7 +1909,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "flate2",
- "hashtrinity 0.1.0 (git+https://gitlab.tas.twn.network/twn/ptyktos/hashtrinity.git)",
+ "hashtrinity",
  "hickory-proto",
  "pkarr",
  "relayfold",
@@ -2318,10 +2308,9 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
 
 [[patch.unused]]
-name = "sangdb"
+name = "guardfold"
 version = "0.1.0"
 
 [[patch.unused]]
-name = "ruler"
+name = "modelfold"
 version = "0.1.0"
-source = "git+https://gitlab.tas.twn.network/twn/ptyktos/ruler.git?branch=main#bb42d5e698d03cdea5f91f9a2a3e308ed7cb1673"

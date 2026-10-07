@@ -1,0 +1,1 @@
+//! Test file content without semicolons here.
