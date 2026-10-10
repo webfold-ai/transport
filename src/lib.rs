@@ -57,15 +57,18 @@ pub mod provision;
 pub mod http_types;
 /// The plain/TLS stream, connection pool, and request/response wire I/O underneath
 /// [`http_client`]. Lifted verbatim from bedrock's `native_lib::wire`.
+#[cfg(feature = "native")]
 pub(crate) mod wire;
 /// A minimal async HTTP client (GET/PUT + bytes), used by [`pkarr::RelayClient`] to talk to
-/// pkarr relays — "native, always available, no `pkarr` [crate] dependency" per
-/// `dialkey.rs`'s own doc comment, so this isn't behind an opt-in feature.
+/// pkarr relays — "native", i.e. no `pkarr` [crate] dependency. It is real TLS (`rustls`) on
+/// `tokio` with `tracing` spans, so it is behind the on-by-default `native` feature: without it
+/// the crate is the wire-format-only zero-dep core.
+#[cfg(feature = "native")]
 pub mod http_client;
 /// ACME v2 (RFC 8555) automation for [`edge::CertSource`] — the issuance worker `edge.rs`'s own
 /// doc comment calls "eventually." Needs [`http_client`]'s real TLS+HTTP/1.1 client and JSON, so
-/// (unlike `http_client` itself) this one IS behind the `native` feature — matching `native.rs`/
-/// `gossip.rs`/`quic.rs`'s own `#![cfg(feature = "...")]` convention rather than `http_client`'s.
+/// this is behind the `native` feature too, like `http_client` — matching `native.rs`/
+/// `gossip.rs`/`quic.rs`'s own `#![cfg(feature = "...")]` convention.
 #[cfg(feature = "native")]
 pub mod acme;
 

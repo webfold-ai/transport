@@ -27,7 +27,9 @@
 //! named gap, not an oversight.
 
 use super::dns::{Name, RData, Record};
-use super::signed_dns::{Keypair, PublicKey, SignedDnsError, SignedPacket};
+use super::signed_dns::{Keypair, SignedDnsError, SignedPacket};
+#[cfg(feature = "native")]
+use super::signed_dns::PublicKey;
 use hashtrinity::crypto::sha256;
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -162,6 +164,7 @@ fn build_packet(
     sign(keypair, &service_records(keypair, ip, port, service, metadata))
 }
 
+#[cfg_attr(not(feature = "native"), allow(dead_code))] // read back only by the relay-client resolvers (and tests)
 fn resolve_service_packet(packet: &SignedPacket, service: &str) -> Option<ServiceEndpoint> {
     let key_str = packet.public_key().to_z32();
     let want = Name::from_ascii(&service_name(&key_str, service)).ok()?;
@@ -297,18 +300,21 @@ pub fn build_mesh_model_packet(
 /// `GET` the same URL to read it back. A relay is a cache, not an authority — every response is
 /// verified against the key it was requested under before it is believed, so a malicious or
 /// broken relay can withhold a record but cannot forge one.
+#[cfg(feature = "native")]
 #[derive(Clone)]
 pub struct RelayClient {
     http: crate::http_client::Client,
     relays: Vec<String>,
 }
 
+#[cfg(feature = "native")]
 impl Default for RelayClient {
     fn default() -> Self {
         Self::new()
     }
 }
 
+#[cfg(feature = "native")]
 impl RelayClient {
     /// A client against [`DEFAULT_RELAYS`].
     #[must_use]
@@ -381,6 +387,7 @@ impl RelayClient {
 ///
 /// # Errors
 /// [`PublishError`] if no relay accepted the record.
+#[cfg(feature = "native")]
 pub async fn publish_combined(
     client: &RelayClient,
     keypair: &Keypair,
@@ -399,6 +406,7 @@ pub async fn publish_combined(
 ///
 /// # Errors
 /// [`PublishError`] if no relay accepted the record.
+#[cfg(feature = "native")]
 pub async fn publish_opsfold(
     client: &RelayClient,
     keypair: &Keypair,
@@ -413,6 +421,7 @@ pub async fn publish_opsfold(
 ///
 /// # Errors
 /// [`PublishError`] if no relay accepted the record.
+#[cfg(feature = "native")]
 pub async fn publish_billing(
     client: &RelayClient,
     keypair: &Keypair,
@@ -424,6 +433,7 @@ pub async fn publish_billing(
 }
 
 /// Resolve an opsfold endpoint from a published record.
+#[cfg(feature = "native")]
 pub async fn resolve_opsfold(
     client: &RelayClient,
     public_key: &PublicKey,
@@ -437,6 +447,7 @@ pub async fn resolve_opsfold(
 }
 
 /// Resolve a billing endpoint from a published record.
+#[cfg(feature = "native")]
 pub async fn resolve_billing(
     client: &RelayClient,
     public_key: &PublicKey,
@@ -446,6 +457,7 @@ pub async fn resolve_billing(
 }
 
 /// Resolve a mesh-model service endpoint from a published record.
+#[cfg(feature = "native")]
 pub async fn resolve_mesh_model(
     client: &RelayClient,
     public_key: &PublicKey,
@@ -539,6 +551,7 @@ mod tests {
         assert!(resolve_service_packet(&p, MESH_MODEL_SERVICE).is_none());
     }
 
+    #[cfg(feature = "native")]
     #[test]
     fn a_relay_url_is_the_key_under_the_relay_base() {
         let k = keypair_from_dialkey("d5");

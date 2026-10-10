@@ -283,6 +283,15 @@ impl NativeEndpoint {
         })
     }
 
+    /// Bind with the identity a dialkey implies, so [`Transport::id`] — and what a peer observes
+    /// in the handshake — is [`crate::dialkey::peer_id`]`(dialkey)`.
+    ///
+    /// The dialkey-derived secret stays inside this crate: callers that used to hand
+    /// `bind_with_key` the (then secret) result of `dialkey::peer_id` use this instead.
+    pub async fn bind_with_dialkey(addr: &str, dialkey: &str) -> io::Result<Self> {
+        Self::bind_with_key(addr, crate::dialkey::secret_seed_do_not_expose(dialkey)).await
+    }
+
     /// The secret key (for sealing/persistence via kleis).
     pub fn secret_key(&self) -> &[u8; 32] {
         &self.secret_key
@@ -594,6 +603,42 @@ mod tests {
 
         let observed_client_id = server_task.await.unwrap();
         assert_eq!(observed_client_id, client_id);
+    }
+
+    /// `dialkey::peer_id` must be the identity a dialkey-bound endpoint really presents on the
+    /// wire — in both directions — and must not be the secret the handshake keys are derived from.
+    /// Before the fix `peer_id` returned the seed, so the observed id (the public key of that seed)
+    /// never equalled it and a peer pinned by `peer_id(dialkey)` could never authenticate.
+    #[tokio::test]
+    async fn a_dialkey_bound_endpoint_presents_dialkey_peer_id_on_the_wire() {
+        let dialkey = "g17-test-dialkey";
+        let expected = crate::dialkey::peer_id(dialkey);
+        assert_ne!(expected, crate::dialkey::secret_seed_do_not_expose(dialkey));
+
+        // dialkey-bound server, anonymous client.
+        let server = NativeEndpoint::bind_with_dialkey("127.0.0.1:0", dialkey).await.unwrap();
+        assert_eq!(Transport::id(&server), expected);
+        let addr = server.local_addr().unwrap();
+        let server_task = tokio::spawn(async move {
+            let conn = Transport::accept(&server).await.unwrap();
+            Connection::peer_id(&conn)
+        });
+        let client = NativeEndpoint::bind("127.0.0.1:0").await.unwrap();
+        let client_id = Transport::id(&client);
+        let conn = Transport::connect(&client, &addr, b"test").await.unwrap();
+        assert_eq!(Connection::peer_id(&conn), expected, "client observes the server's dialkey peer_id");
+        assert_eq!(server_task.await.unwrap(), client_id);
+
+        // anonymous server, dialkey-bound client.
+        let server = NativeEndpoint::bind("127.0.0.1:0").await.unwrap();
+        let addr = server.local_addr().unwrap();
+        let server_task = tokio::spawn(async move {
+            let conn = Transport::accept(&server).await.unwrap();
+            Connection::peer_id(&conn)
+        });
+        let client = NativeEndpoint::bind_with_dialkey("127.0.0.1:0", dialkey).await.unwrap();
+        let _conn = Transport::connect(&client, &addr, b"test").await.unwrap();
+        assert_eq!(server_task.await.unwrap(), expected, "server observes the client's dialkey peer_id");
     }
 
     /// The data actually on the wire must not contain the plaintext — proves the frame is
