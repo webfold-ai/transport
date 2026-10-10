@@ -15,7 +15,7 @@
 //!
 //! [`publish`] and [`resolve`] are generic over [`DialkeyTransport`]. Two clients implement it:
 //!
-//! * [`super::pkarr::RelayClient`] — native, always available, no `pkarr` dependency.
+//! * `super::pkarr::RelayClient` — native, no `pkarr` dependency (under the on-by-default `native` feature).
 //! * `pkarr::Client` — only under the `federation` feature.
 //!
 //! The generic exists because callers outside this crate already hold one or the other. Making
@@ -31,6 +31,7 @@ use std::future::Future;
 use std::net::IpAddr;
 
 use super::dns::{Name, RData, Record};
+#[cfg(feature = "native")]
 use super::pkarr::{PublishError, RelayClient};
 use super::signed_dns::SignedPacket;
 
@@ -42,22 +43,37 @@ const BILLING_SERVICE: &str = "_billing._tcp";
 const OPSFOLD_PATH: &str = "/v1/ops/gateway";
 const BILLING_PATH: &str = "/v1/billing";
 
-/// The seed a dialkey implies.
+/// The **secret** Ed25519 seed a dialkey implies. Never log, store, publish or send it.
 ///
 /// The `:pkarr` suffix is load-bearing history, not a leftover: it is inside the SHA-256 that
 /// produces the identity, so changing it would silently rename every endpoint already published.
 /// It matches [`super::pkarr`]'s own derivation byte for byte.
-fn dialkey_seed(dialkey: &str) -> [u8; 32] {
+///
+/// Crate-private on purpose. `peer_id` used to return this value, which put the secret behind a
+/// name documented everywhere else as the public key; the long name is there so a call site reads
+/// as handling a secret.
+pub(crate) fn secret_seed_do_not_expose(dialkey: &str) -> [u8; 32] {
     let mut input = String::with_capacity(dialkey.len() + 7);
     input.push_str(dialkey);
     input.push_str(":pkarr");
     sha256(input.as_bytes())
 }
 
-/// Derive a `PeerId` from a dialkey.
+/// The `PeerId` a dialkey implies: the Ed25519 **public** key of [`native_keypair`]`(dialkey)`.
+///
+/// This is the identity a [`Transport`](super::Transport) bound with
+/// [`NativeEndpoint::bind_with_dialkey`](super::native::NativeEndpoint::bind_with_dialkey)
+/// presents in the handshake, and the key whose z-base32 form is the dialkey's published name.
+/// It is public: safe to log, pin, publish and gossip. The secret half never leaves this crate.
+///
+/// # Breaking change (0.2.0)
+/// Before 0.2.0 this returned the 32-byte *secret seed* (`SHA-256(dialkey ++ ":pkarr")`). A
+/// caller that fed the result back in as a secret (`bind_with_key(peer_id(k))`, or
+/// `ed25519_pubkey(peer_id(k))`) must switch to `NativeEndpoint::bind_with_dialkey` or
+/// `native_keypair(k).public_key()` — see CHANGELOG.md.
 #[must_use]
 pub fn peer_id(dialkey: &str) -> PeerId {
-    dialkey_seed(dialkey)
+    *native_keypair(dialkey).public_key().as_bytes()
 }
 
 /// Derive the native signing keypair from a dialkey.
@@ -66,7 +82,7 @@ pub fn peer_id(dialkey: &str) -> PeerId {
 /// endpoint.
 #[must_use]
 pub fn native_keypair(dialkey: &str) -> super::signed_dns::Keypair {
-    super::signed_dns::Keypair::from_secret_key(&dialkey_seed(dialkey))
+    super::signed_dns::Keypair::from_secret_key(&secret_seed_do_not_expose(dialkey))
 }
 
 /// Derive a signing keypair from a dialkey.
@@ -77,7 +93,7 @@ pub fn native_keypair(dialkey: &str) -> super::signed_dns::Keypair {
 #[cfg(feature = "federation")]
 #[must_use]
 pub fn keypair(dialkey: &str) -> pkarr::Keypair {
-    pkarr::Keypair::from_secret_key(&dialkey_seed(dialkey))
+    pkarr::Keypair::from_secret_key(&secret_seed_do_not_expose(dialkey))
 }
 
 /// Derive a signing keypair from a dialkey. See the `federation` variant above.
@@ -160,6 +176,7 @@ fn service_records(
 
 /// Microseconds since the epoch — BEP44's sequence number, so a later publish outranks an earlier
 /// one at the relay.
+#[cfg_attr(not(feature = "native"), allow(dead_code))] // the RelayClient publish path is its only caller
 fn now_micros() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -188,6 +205,7 @@ pub fn build_packet(
 /// `peer_id(dialkey)` while the record labels come from the packet, and nothing else in the type
 /// system ties those two together. Checking here means a mismatch cannot produce a
 /// `DialkeyService` whose identity and address came from different keys.
+#[cfg_attr(not(feature = "native"), allow(dead_code))] // read back only by the relay-client resolver (and tests)
 fn service_from_packet(packet: &SignedPacket, dialkey: &str, service: &str) -> Option<DialkeyService> {
     let key_str = native_keypair(dialkey).to_z32();
     if packet.public_key().to_z32() != key_str {
@@ -244,7 +262,7 @@ fn service_from_packet(packet: &SignedPacket, dialkey: &str, service: &str) -> O
 
 /// What [`publish`] and [`resolve`] need from a client.
 ///
-/// Implemented for [`RelayClient`] (native) and, under `federation`, for `pkarr::Client`. The
+/// Implemented for `RelayClient` (native, under the `native` feature) and, under `federation`, for `pkarr::Client`. The
 /// futures are explicitly `Send` so callers can spawn them; an `async fn` in a trait would leave
 /// that unbounded and break every `tokio::spawn` at the call site instead of here.
 pub trait DialkeyTransport {
@@ -267,6 +285,7 @@ pub trait DialkeyTransport {
     ) -> impl Future<Output = Option<DialkeyService>> + Send;
 }
 
+#[cfg(feature = "native")]
 impl DialkeyTransport for RelayClient {
     type Error = PublishError;
 
@@ -548,12 +567,205 @@ mod tests {
     #[test]
     fn the_native_keypair_matches_the_documented_derivation() {
         let expect = hashtrinity::crypto::sha256(b"meteroid:pkarr");
-        assert_eq!(peer_id("meteroid"), expect);
+        assert_eq!(secret_seed_do_not_expose("meteroid"), expect);
         assert_eq!(
             native_keypair("meteroid").to_z32(),
             super::super::pkarr::keypair_from_dialkey("meteroid").to_z32(),
             "dialkey and transport::pkarr must derive the same identity from one dialkey"
         );
+    }
+
+    // ── the `peer_id` contract, and the checker that guards it ───────────────────────────────
+    //
+    // `peer_id` once returned the secret seed. A test that says `assert_ne!(peer_id(k), seed)`
+    // next to a hand-written broken function proves nothing about the real module, so the
+    // contract is one checker, `check_peer_id_contract`, over a `Derivation` (the three functions
+    // that together define a dialkey's identity). It is run on the real module and on mutants
+    // built by wrapping or altering the real functions; the real one must be `Ok` and every
+    // mutant must be `Err` for the property the mutation breaks.
+
+    /// A literal TEST dialkey — not a real credential — and the values the pre-fix code derived
+    /// from it on main 30fdaf7 (captured before this change): the seed, its Ed25519 public key,
+    /// and that key's z-base32 form, which is the label `build_packet` publishes under.
+    const GOLDEN_DIALKEY: &str = "g17-test-dialkey";
+    const GOLDEN_SEED_HEX: &str = "f312899db1b911aad45adc946d31875a58e810242652eba4fac63966a3bad73e";
+    const GOLDEN_PUBLIC_HEX: &str = "30966ac5fa1bdd49aec9b9101bf63359704d01dc00597f934f7d7bca9bc5c47b";
+    const GOLDEN_Z32: &str = "gnmgitx4dxqwumsjzrebz7tumfar4yqhybcz9r4xxi7hig6fat7o";
+
+    fn hex(b: &[u8]) -> String {
+        b.iter().map(|x| format!("{x:02x}")).collect()
+    }
+
+    /// The three functions that define a dialkey's identity: the public id, the secret seed it
+    /// is derived from, and the name the dialkey publishes under.
+    struct Derivation<'a> {
+        peer_id: &'a dyn Fn(&str) -> PeerId,
+        seed: &'a dyn Fn(&str) -> [u8; 32],
+        published_label: &'a dyn Fn(&str) -> String,
+    }
+
+    /// Every violated property, by name. `Ok` only if none is.
+    fn check_peer_id_contract(d: &Derivation<'_>) -> Result<(), Vec<&'static str>> {
+        use hashtrinity::crypto::ed25519_pubkey;
+        let mut bad = Vec::new();
+        let keys = [GOLDEN_DIALKEY, "meteroid", "flexprice", "tas-edge", "k"];
+
+        // Golden vectors: the only checks a coordinated mutation of all three functions cannot pass.
+        if hex(&(d.seed)(GOLDEN_DIALKEY)) != GOLDEN_SEED_HEX {
+            bad.push("golden-seed");
+        }
+        if hex(&(d.peer_id)(GOLDEN_DIALKEY)) != GOLDEN_PUBLIC_HEX {
+            bad.push("golden-public-key");
+        }
+        if (d.published_label)(GOLDEN_DIALKEY) != GOLDEN_Z32 {
+            bad.push("golden-published-name");
+        }
+
+        for k in keys {
+            let (id, seed) = ((d.peer_id)(k), (d.seed)(k));
+            if id == seed {
+                bad.push("peer-id-is-the-secret-seed");
+            }
+            if id != ed25519_pubkey(&seed) {
+                bad.push("peer-id-is-not-the-public-key-of-the-seed");
+            }
+            let label_of_id = super::super::signed_dns::PublicKey::from_bytes(&id).map(|p| p.to_z32()).ok();
+            if label_of_id != Some((d.published_label)(k)) {
+                bad.push("peer-id-does-not-name-the-published-endpoint");
+            }
+        }
+        if (d.peer_id)("meteroid") == (d.peer_id)("flexprice") {
+            bad.push("different-dialkeys-share-an-id");
+        }
+        if (d.peer_id)("meteroid") != (d.peer_id)("meteroid") {
+            bad.push("not-deterministic");
+        }
+
+        bad.sort_unstable();
+        bad.dedup();
+        if bad.is_empty() { Ok(()) } else { Err(bad) }
+    }
+
+    /// The label `build_packet` really publishes under — not recomputed by the test.
+    fn real_published_label(dialkey: &str) -> String {
+        let ip: IpAddr = "10.0.0.1".parse().unwrap();
+        build_packet(dialkey, ip, &[opsfold_service(1, "r")], 1).unwrap().public_key().to_z32()
+    }
+
+    #[test]
+    fn the_real_dialkey_module_satisfies_the_peer_id_contract() {
+        let real = Derivation {
+            peer_id: &peer_id,
+            seed: &secret_seed_do_not_expose,
+            published_label: &real_published_label,
+        };
+        assert_eq!(check_peer_id_contract(&real), Ok(()));
+    }
+
+    /// Each mutant wraps or alters the real functions and goes through the SAME checker.
+    #[test]
+    fn the_checker_rejects_mutants_of_the_real_module() {
+        use hashtrinity::crypto::{ed25519_pubkey, sha256};
+        let z32 = |id: PeerId| super::super::signed_dns::PublicKey::from_bytes(&id).unwrap().to_z32();
+        // Run one mutant: replace some of the real functions, keep the rest real.
+        let run = |peer: &dyn Fn(&str) -> PeerId,
+                   seed: &dyn Fn(&str) -> [u8; 32],
+                   label: &dyn Fn(&str) -> String| {
+            check_peer_id_contract(&Derivation { peer_id: peer, seed, published_label: label })
+        };
+        let rejected = |r: Result<(), Vec<&'static str>>, must_flag: &str| {
+            let flagged = r.expect_err("mutant must be rejected");
+            assert!(flagged.iter().any(|f| *f == must_flag), "flagged {flagged:?}, expected {must_flag}");
+        };
+
+        // 1. The original bug: peer_id hands back the secret seed.
+        rejected(
+            run(&secret_seed_do_not_expose, &secret_seed_do_not_expose, &real_published_label),
+            "peer-id-is-the-secret-seed",
+        );
+        // 2. The public key of a DIFFERENT derivation (another suffix).
+        let other_suffix = |k: &str| ed25519_pubkey(&sha256(format!("{k}:other").as_bytes()));
+        rejected(
+            run(&other_suffix, &secret_seed_do_not_expose, &real_published_label),
+            "peer-id-is-not-the-public-key-of-the-seed",
+        );
+        // 3. The `:pkarr` suffix dropped from peer_id only.
+        let no_suffix_id = |k: &str| ed25519_pubkey(&sha256(k.as_bytes()));
+        rejected(
+            run(&no_suffix_id, &secret_seed_do_not_expose, &real_published_label),
+            "golden-public-key",
+        );
+        // 4. The suffix dropped EVERYWHERE, consistently — internally coherent, so only the golden
+        //    vectors can reject it, and they are what pins the already-published endpoint names.
+        let no_suffix_seed = |k: &str| sha256(k.as_bytes());
+        let no_suffix_label = |k: &str| z32(ed25519_pubkey(&sha256(k.as_bytes())));
+        let flagged = run(&no_suffix_id, &no_suffix_seed, &no_suffix_label).unwrap_err();
+        assert!(flagged.contains(&"golden-seed") && flagged.contains(&"golden-published-name"), "{flagged:?}");
+        // 5. peer_id right, but the endpoint is published under a different name.
+        rejected(
+            run(&peer_id, &secret_seed_do_not_expose, &no_suffix_label),
+            "peer-id-does-not-name-the-published-endpoint",
+        );
+        // 6. Every dialkey collapses to one id.
+        let constant = |_: &str| peer_id(GOLDEN_DIALKEY);
+        rejected(
+            run(&constant, &secret_seed_do_not_expose, &real_published_label),
+            "different-dialkeys-share-an-id",
+        );
+        // 7. The public key with one bit flipped (the right derivation, corrupted on the way out).
+        let flipped = |k: &str| {
+            let mut id = peer_id(k);
+            id[31] ^= 1;
+            id
+        };
+        rejected(
+            run(&flipped, &secret_seed_do_not_expose, &real_published_label),
+            "peer-id-is-not-the-public-key-of-the-seed",
+        );
+    }
+
+    /// The independent cross-check on the golden vectors: the secret seed is the documented
+    /// `SHA-256(dialkey ++ ":pkarr")` and its public key is `peer_id`.
+    #[test]
+    fn peer_id_is_the_public_key_not_the_secret_for_the_golden_dialkey() {
+        let seed = hashtrinity::crypto::sha256(format!("{GOLDEN_DIALKEY}:pkarr").as_bytes());
+        assert_eq!(hex(&seed), GOLDEN_SEED_HEX);
+        let id = peer_id(GOLDEN_DIALKEY);
+        assert_eq!(hex(&id), GOLDEN_PUBLIC_HEX);
+        assert_ne!(id, seed);
+        assert_eq!(id, *native_keypair(GOLDEN_DIALKEY).public_key().as_bytes());
+        assert_eq!(native_keypair(GOLDEN_DIALKEY).to_z32(), GOLDEN_Z32);
+    }
+
+    /// The names already published must not move: the packet's record labels are
+    /// `<service>.<z32 of the public key>` and the apex is the bare z32 label.
+    #[test]
+    fn the_published_endpoint_names_are_unchanged() {
+        let ip: IpAddr = "10.0.0.1".parse().unwrap();
+        let packet = build_packet(GOLDEN_DIALKEY, ip, &[opsfold_service(8081, "r")], 1).unwrap();
+        assert_eq!(packet.public_key().to_z32(), GOLDEN_Z32);
+        let names: Vec<String> = packet
+            .records()
+            .iter()
+            .map(|r| r.name.to_ascii())
+            .collect();
+        assert!(names.contains(&format!("{OPSFOLD_SERVICE}.{GOLDEN_Z32}.")), "{names:?}");
+        assert!(names.contains(&format!("{GOLDEN_Z32}.")), "{names:?}");
+    }
+
+    /// The leak path the bug opened: a resolved service stamps `peer_id(dialkey)` into its
+    /// `PeerAddr`, which consumers log, store and gossip (`PeerAddr::to_string` embeds the id).
+    /// Neither the string form nor `Debug` of what `resolve` returns may contain the seed.
+    #[test]
+    fn a_resolved_peer_addr_carries_the_public_id_and_never_the_seed() {
+        let ip: IpAddr = "10.0.0.1".parse().unwrap();
+        let packet = build_packet(GOLDEN_DIALKEY, ip, &[opsfold_service(8081, "r")], 1).unwrap();
+        let svc = service_from_packet(&packet, GOLDEN_DIALKEY, OPSFOLD_SERVICE).unwrap();
+        assert_eq!(hex(&svc.peer_addr.peer_id), GOLDEN_PUBLIC_HEX);
+        for rendered in [svc.peer_addr.to_string(), format!("{:?}", svc), format!("{:?}", svc.peer_addr)] {
+            assert!(!rendered.contains(GOLDEN_SEED_HEX), "seed leaked into {rendered}");
+        }
+        assert!(svc.peer_addr.to_string().contains(GOLDEN_PUBLIC_HEX));
     }
 
     /// The round trip the module exists for: publish-shaped records go in, a resolved
@@ -651,6 +863,10 @@ mod tests {
                 keypair(dk).public_key().to_string(),
                 "z-base32 label must match the pkarr crate's for dialkey {dk}"
             );
+            // Independent of this crate's own Ed25519: the real `pkarr` crate's public key bytes
+            // are `peer_id`, and are not the seed.
+            assert_eq!(&peer_id(dk), keypair(dk).public_key().as_bytes(), "peer_id for {dk}");
+            assert_ne!(peer_id(dk), secret_seed_do_not_expose(dk), "peer_id must not be the seed");
         }
     }
 

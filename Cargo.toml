@@ -1,15 +1,17 @@
 [package]
 name = "transport"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Transport kernel — TCP, TLS, DNS, signed dialkeys, gossip, edge (mesh) routing. Zero-dep core, opt-in tokio + rustls bindings. Unix-composable: every transport module is a small focused file with a single responsibility."
 publish = false
 
 [features]
-# `pkarr::RelayClient` (the native pkarr-relay HTTP client) is "always available, no `pkarr`
-# [crate] dependency" per dialkey.rs's own doc comment — not an opt-in extra — so `native` is
-# on by default. `--no-default-features` still gets the wire-format-only zero-dep core.
+# `pkarr::RelayClient` (the native pkarr-relay HTTP client, no `pkarr` [crate] dependency) and the
+# `http_client` under it need tokio + rustls + tracing, so they live behind `native`, which is on
+# by default. `--no-default-features` gets the wire-format-only core: dns, signed_dns, dialkey
+# derivation and packet building, edge registry logic, discovery (checked: `cargo check
+# --no-default-features`).
 default = ["native"]
 # `native.rs`, `gossip.rs` and `quic.rs` each open with `#![cfg(feature = "runtime-tokio")]`.
 # The rename from `bedrock-transport` to this crate rewrote this block and inlined
@@ -22,7 +24,7 @@ runtime-tokio = ["dep:tokio"]
 # `dep:serde`/`dep:serde_json`: `acme.rs`'s JWS/ACME-response JSON — the two crates were already
 # declared below (optional, unused by anything until now), so this wires them in rather than
 # adding a new dependency.
-native = ["runtime-tokio", "dep:rustls", "dep:tokio-rustls", "dep:tracing", "dep:serde", "dep:serde_json"]
+native = ["runtime-tokio", "dep:rustls", "dep:tokio-rustls", "dep:tracing", "dep:serde", "dep:serde_json", "dep:flate2"]
 federation = ["dep:pkarr"]
 bind-edge-dns = ["native", "dep:hickory-proto"]
 # `bind-overlay` (8 cfg sites) and `bind-edge-dns` (3) still reference deps (hickory-proto,
@@ -45,10 +47,10 @@ hashtrinity = { git = "https://github.com/Ptyktos/hashtrinity", rev = "2c36b995c
 rustls-pki-types = "1"
 rustls-native-certs = "0.8"
 bytes = "1"
-# `http_client`'s opt-in gzip decode (`ClientBuilder::gzip`/`RequestBuilder::gzip`) — plain,
-# always-available, same tier as `bytes` above rather than behind a feature: `http_client` itself
-# isn't gated (see its own doc comment in lib.rs), so neither is the dependency it needs.
-flate2 = "1"
+# `http_client`'s opt-in gzip decode (`ClientBuilder::gzip`/`RequestBuilder::gzip`). Optional and
+# pulled in by `native` with the module it serves: `http_client` is gated on `native` (it needs
+# tokio + rustls + tracing), so the wire-format-only zero-dep core does not build flate2.
+flate2 = { version = "1", optional = true }
 # `Tuple`/`Relationships`/`Upstream`/`LoadBalance`/`HealthEstimator`/`Backends`/`pick_index`/
 # `coord_of`: `load_balance.rs` used to define these directly (its own independent extraction out
 # of `biota-http-server`'s `kernel::Proxy`, done without knowing `relayfold` already existed as
@@ -59,5 +61,11 @@ flate2 = "1"
 relayfold = { git = "https://github.com/Ptyktos/relayfold" }
 pkarr = { version = "8.0.1", optional = true }
 hickory-proto = { version = "0.24", optional = true }
+
+# The unit tests of modules that are always compiled (`edge_verify`, `edge_proxy`) drive async code with
+# `#[tokio::test]`/`Builder::new_current_thread`; without this, `cargo test --no-default-features`
+# could not even compile them. Dev-only: the lib itself still builds with no tokio at all.
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros"] }
 
 [workspace]
