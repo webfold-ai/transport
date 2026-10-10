@@ -19,14 +19,16 @@ into their `PeerAddr`, and `PeerAddr::to_string()` embeds it as hex, so those le
 
 - `dialkey::peer_id(dialkey)` now returns the **public** key of `dialkey::native_keypair(dialkey)`.
   Safe to log, pin, publish and gossip.
-- The secret seed is `pub(crate)` (`dialkey::secret_seed_do_not_expose`) and is not reachable from
-  outside the crate. There is deliberately no public replacement for the old behaviour.
+- The seed function is `pub(crate)` (`dialkey::secret_seed_do_not_expose`): there is no public
+  dialkey→seed function and deliberately no replacement for the old behaviour. (An endpoint built
+  with `bind_with_dialkey`/`bind_with_key` still hands out its own secret through the pre-existing
+  `NativeEndpoint::secret_key()` persistence getter — that is by design, not a path from `peer_id`.)
 - **Unchanged, on purpose:** the derivation (`SHA-256(dialkey ++ ":pkarr")` → Ed25519), therefore the
   keypair, the z-base32 name a dialkey publishes under, and every record already published. Golden
   vectors in `dialkey.rs` pin this.
 - New `NativeEndpoint::bind_with_dialkey(addr, dialkey)`: binds an endpoint whose identity (and the
-  id a peer observes in the handshake) is exactly `dialkey::peer_id(dialkey)`, without the secret
-  leaving this crate.
+  id a peer observes in the handshake) is exactly `dialkey::peer_id(dialkey)`, without the caller
+  deriving the secret.
 - `http_client`, `wire`, `pkarr::RelayClient` (and its `DialkeyTransport` impl) and the
   `pkarr::publish_*/resolve_*` helpers are now gated on `native`; `--no-default-features` compiles
   (it did not: `http_client` used tokio/rustls/tracing ungated). `flate2` is optional under `native`.
@@ -44,7 +46,7 @@ key, which is what they wanted. Callers that used the result as a **secret** mus
 | `hashtrinity::crypto::ed25519_pubkey(&dialkey::peer_id(k))` (the identity the handshake reports) | `dialkey::peer_id(k)` |
 | `Keypair::from_secret_key(&dialkey::peer_id(k))` | `dialkey::native_keypair(k)` |
 
-Correctly migrated callers keep the same wire identity (`bind_with_dialkey(k)` presents the same
+Correctly migrated callers keep the same wire identity (tested: `bind_with_dialkey(k)` presents the same
 public key `bind_with_key(peer_id_0_1(k))` did), so a rolling upgrade across both sides is compatible.
-Callers that left the old value in a log, store or published record should treat the dialkey as
-exposed and rotate it.
+Callers that left the old value in a log, store or published record have exposed a secret derived
+from the dialkey; whether to rotate is the owner's decision, and this release does not rotate anything.

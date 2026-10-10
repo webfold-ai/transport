@@ -615,6 +615,16 @@ mod tests {
         let expected = crate::dialkey::peer_id(dialkey);
         assert_ne!(expected, crate::dialkey::secret_seed_do_not_expose(dialkey));
 
+        // Rolling-upgrade compatibility: a 0.1.x caller bound with `bind_with_key(peer_id_0_1(k))`,
+        // i.e. with the seed as the secret. Its wire identity is the one `bind_with_dialkey` now gives.
+        let legacy = NativeEndpoint::bind_with_key(
+            "127.0.0.1:0",
+            crate::dialkey::secret_seed_do_not_expose(dialkey),
+        )
+        .await
+        .unwrap();
+        assert_eq!(Transport::id(&legacy), expected, "migrating must not change the wire identity");
+
         // dialkey-bound server, anonymous client.
         let server = NativeEndpoint::bind_with_dialkey("127.0.0.1:0", dialkey).await.unwrap();
         assert_eq!(Transport::id(&server), expected);
