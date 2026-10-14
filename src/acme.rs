@@ -17,9 +17,10 @@
 //! provider (`hashtrinity::rustls`) loads Ed25519 and ECDSA-P256 PKCS#8 keys only.
 //!
 //! **The crypto is not reinvented here.** `hashtrinity::crypto::{jwt,acme,certgen}` already
-//! carries everything ACME needs at the primitive level — `jwt_sign_es256` (JWS signing),
+//! carries the non-secret primitives ACME needs — (the JWS signing and key generation are
+//! `aws-lc-rs`, see [`AccountKey`]),
 //! `b64url`/`jwk_thumbprint_ec_p256` (RFC 7638), `acme_key_authorization` (RFC 8555 §8.1), and
-//! `ecdsa_p256_sign` — down to a doc comment on the `acme`
+//! down to a doc comment on the `acme`
 //! submodule explicitly scoping itself as "the thumbprint + key-authorization + CSR; **the HTTP
 //! flow is a client**." Nor is the HTTP transport reinvented: [`crate::http_client::Client`] is
 //! already this crate's real TLS+HTTP/1.1 client (used today by [`crate::pkarr::RelayClient`]) —
@@ -48,8 +49,9 @@
 use std::sync::Mutex as StdMutex;
 
 use hashtrinity::crypto::acme::{acme_key_authorization, b64url, jwk_thumbprint_ec_p256};
-use hashtrinity::crypto::jwt::jwt_sign_es256;
-use hashtrinity::crypto::{ecdsa_p256_sign, p256_pubkey, sha256};
+use aws_lc_rs::rand::SystemRandom;
+use aws_lc_rs::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_FIXED_SIGNING};
+use hashtrinity::crypto::sha256;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -120,23 +122,68 @@ impl From<crate::http_types::Error> for AcmeError {
 /// The account signing key — P-256 ECDSA, the most broadly supported ACME account key type.
 /// Generate once per account and persist it; a lost account key just means re-registering (an
 /// ACME account carries no certificate state itself, only authorization history).
+///
+/// All key generation and signing is `aws-lc-rs` (FIPS-validated with the `fips` feature,
+/// constant-time scalar arithmetic). The previous implementation used a hand-written P-256 whose
+/// scalar multiplication branched on secret bits.
 #[derive(Clone)]
 pub struct AccountKey {
-    secret: [u8; 32],
+    pair: std::sync::Arc<EcdsaKeyPair>,
 }
 
 impl AccountKey {
-    /// Wrap an existing 32-byte P-256 private key (e.g. loaded from a sealed store).
-    #[must_use]
-    pub fn from_bytes(secret: [u8; 32]) -> Self {
-        AccountKey { secret }
+    /// A fresh random account key.
+    ///
+    /// # Errors
+    /// Only if the system RNG fails.
+    pub fn generate() -> Result<Self, AcmeError> {
+        Ok(AccountKey { pair: std::sync::Arc::new(generate_ec_key()?) })
+    }
+
+    /// Wrap an existing 32-byte P-256 private scalar (e.g. loaded from a sealed store).
+    ///
+    /// # Errors
+    /// If the scalar is zero or not below the curve order.
+    pub fn from_bytes(secret: [u8; 32]) -> Result<Self, AcmeError> {
+        // RFC 5915 ECPrivateKey { version 1, privateKey }; the public point is derived on parse.
+        let ec_private_key = der::seq(&[der::uint(&[1]), der::tlv(0x04, &secret)]);
+        let pair = EcdsaKeyPair::from_private_key_der(&ECDSA_P256_SHA256_FIXED_SIGNING, &ec_private_key)
+            .map_err(|e| AcmeError::BadResponse(format!("invalid P-256 account key: {e}")))?;
+        Ok(AccountKey { pair: std::sync::Arc::new(pair) })
+    }
+
+    /// The raw 32-byte private scalar, for sealing into a store. Handle as a secret.
+    ///
+    /// # Errors
+    /// Only on an internal aws-lc failure.
+    pub fn to_bytes(&self) -> Result<[u8; 32], AcmeError> {
+        use aws_lc_rs::encoding::{AsBigEndian, EcPrivateKeyBin};
+        let bin: EcPrivateKeyBin<'static> =
+            self.pair.private_key().as_be_bytes().map_err(|_| AcmeError::BadResponse("cannot export account key".into()))?;
+        bin.as_ref().try_into().map_err(|_| AcmeError::BadResponse("account key is not 32 bytes".into()))
+    }
+
+    /// `x‖y` of the public point.
+    fn xy(&self) -> [u8; 64] {
+        let mut xy = [0u8; 64];
+        // SEC1 uncompressed: 0x04 ‖ x ‖ y
+        xy.copy_from_slice(&self.pair.public_key().as_ref()[1..]);
+        xy
+    }
+
+    /// ES256 over `message` (SHA-256 is applied inside), raw `r‖s` as JWS requires.
+    fn sign(&self, message: &[u8]) -> Vec<u8> {
+        self.pair
+            .sign(&SystemRandom::new(), message)
+            .map(|sig| sig.as_ref().to_vec())
+            .expect("ECDSA signing fails only on RNG/internal failure")
     }
 
     /// The JWK this key presents in `newAccount`'s protected header (no `kid` yet — the CA
     /// hasn't assigned an account URL until that request succeeds).
     fn jwk(&self) -> Value {
-        let pk = p256_pubkey(&self.secret);
-        let (x, y) = pk.split_at(32);
+        let xy = self.xy();
+        let (x, y) = xy.split_at(32);
         json!({
             "kty": "EC",
             "crv": "P-256",
@@ -148,34 +195,30 @@ impl AccountKey {
     /// RFC 7638 thumbprint of this key's JWK — the key-authorization ingredient.
     #[must_use]
     pub fn thumbprint(&self) -> [u8; 32] {
-        let pk = p256_pubkey(&self.secret);
-        let (x, y) = pk.split_at(32);
+        let xy = self.xy();
         let mut xb = [0u8; 32];
         let mut yb = [0u8; 32];
-        xb.copy_from_slice(x);
-        yb.copy_from_slice(y);
+        xb.copy_from_slice(&xy[..32]);
+        yb.copy_from_slice(&xy[32..]);
         jwk_thumbprint_ec_p256(&xb, &yb)
     }
 }
 
 /// Build the flattened-JSON JWS body ACME's wire format requires: `{"protected","payload","signature"}`
-/// as JSON string members, not the compact `header.payload.sig` dot form `jwt_sign_es256` returns
-/// (that form is for tokens carried inside another envelope, e.g. an `Authorization:` header — ACME's
-/// own request bodies ARE the JWS, JSON-serialized).
+/// as JSON string members, not the compact `header.payload.sig` dot form (that form is for tokens
+/// carried inside another envelope, e.g. an `Authorization:` header — ACME's own request bodies
+/// ARE the JWS, JSON-serialized).
 ///
 /// `payload_json` is `""` for a POST-as-GET (RFC 8555 §6.3) — the empty string, not `"{}"` or
 /// `null`, per the spec's own worked examples.
 fn flattened_jws(account: &AccountKey, protected: &Value, payload_json: &str) -> String {
-    let protected_json = protected.to_string();
-    let compact = jwt_sign_es256(&account.secret, &protected_json, payload_json);
-    let mut parts = compact.split('.');
-    let protected_b64 = parts.next().expect("jwt_sign_es256 always emits two dots");
-    let payload_b64 = parts.next().expect("jwt_sign_es256 always emits two dots");
-    let sig_b64 = parts.next().expect("jwt_sign_es256 always emits two dots");
+    let protected_b64 = b64url(protected.to_string().as_bytes());
+    let payload_b64 = b64url(payload_json.as_bytes());
+    let sig = account.sign(format!("{protected_b64}.{payload_b64}").as_bytes());
     json!({
         "protected": protected_b64,
         "payload": payload_b64,
-        "signature": sig_b64,
+        "signature": b64url(&sig),
     })
     .to_string()
 }
@@ -417,8 +460,8 @@ impl AcmeClient {
             self.complete_authorization(authz_url, &responder).await?;
         }
 
-        let cert_sk_arr = random_p256_scalar();
-        let csr = csr_p256(&cert_sk_arr, domains);
+        let cert_key = generate_cert_key();
+        let csr = csr_p256(&cert_key, domains);
         let csr_b64 = b64url(&csr);
         let (status, body) = self.post_signed(&order.finalize, &json!({ "csr": csr_b64 }).to_string()).await?;
         if !(200..300).contains(&status) {
@@ -447,7 +490,7 @@ impl AcmeClient {
             return Err(AcmeError::Rejected { status, detail: chain_pem });
         }
 
-        Ok(CertMaterial { chain_pem, key_pem: p256_key_to_pkcs8_pem(&cert_sk_arr) })
+        Ok(CertMaterial { chain_pem, key_pem: p256_key_to_pkcs8_pem(&cert_key) })
     }
 
     async fn complete_authorization(&self, authz_url: &str, responder: &ChallengeResponder<'_>) -> Result<(), AcmeError> {
@@ -591,34 +634,20 @@ const OID_ECDSA_SHA256: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02
 const OID_EXTENSION_REQUEST: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x09, 0x0e]; // 1.2.840.113549.1.9.14
 const OID_SUBJECT_ALT_NAME: &[u8] = &[0x55, 0x1d, 0x11]; // 2.5.29.17
 
-/// The P-256 group order n, big-endian. A private scalar must be in `[1, n-1]`.
-const P256_ORDER: [u8; 32] = [
-    0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-    0xbc, 0xe6, 0xfa, 0xad, 0xa7, 0x17, 0x9e, 0x84, 0xf3, 0xb9, 0xca, 0xc2, 0xfc, 0x63, 0x25, 0x51,
-];
-
-fn is_valid_p256_scalar(s: &[u8; 32]) -> bool {
-    // Big-endian arrays of equal length compare lexicographically as integers.
-    s.iter().any(|b| *b != 0) && s.as_slice() < P256_ORDER.as_slice()
+fn generate_ec_key() -> Result<EcdsaKeyPair, AcmeError> {
+    EcdsaKeyPair::generate(&ECDSA_P256_SHA256_FIXED_SIGNING)
+        .map_err(|_| AcmeError::BadResponse("system RNG failed generating a P-256 key".into()))
 }
 
-/// A fresh certificate private key. Rejection-sampled: a uniformly random 32 bytes is outside
-/// `[1, n-1]` with probability ~2^-32, and `p256_pubkey` of an out-of-range scalar is not a key.
-pub(crate) fn random_p256_scalar() -> [u8; 32] {
-    loop {
-        let bytes = hashtrinity::crypto::rand_bytes(32);
-        let mut s = [0u8; 32];
-        s.copy_from_slice(&bytes);
-        if is_valid_p256_scalar(&s) {
-            return s;
-        }
-    }
+/// A fresh certificate private key (a new one per order: a renewal must not reuse the key of the
+/// certificate it replaces).
+pub(crate) fn generate_cert_key() -> EcdsaKeyPair {
+    generate_ec_key().expect("system RNG available")
 }
 
-fn p256_point(sk: &[u8; 32]) -> Vec<u8> {
-    let mut point = vec![0x04]; // uncompressed
-    point.extend_from_slice(&p256_pubkey(sk));
-    point
+/// SEC1 uncompressed point `04 ‖ x ‖ y`.
+fn p256_point(pair: &EcdsaKeyPair) -> Vec<u8> {
+    pair.public_key().as_ref().to_vec()
 }
 
 fn ec_algorithm_identifier() -> Vec<u8> {
@@ -632,30 +661,33 @@ fn ecdsa_sig_der(raw: &[u8; 64]) -> Vec<u8> {
 
 /// A PKCS#10 CSR (ECDSA P-256 / SHA-256) with `domains` as dNSName SANs and an empty subject —
 /// the ACME `finalize` request body. CAs take the identifiers from the SAN, not the subject.
-pub(crate) fn csr_p256(sk: &[u8; 32], domains: &[&str]) -> Vec<u8> {
+pub(crate) fn csr_p256(pair: &EcdsaKeyPair, domains: &[&str]) -> Vec<u8> {
     let names: Vec<Vec<u8>> = domains.iter().map(|d| der::tlv(0x82, d.as_bytes())).collect(); // [2] dNSName
     let san_ext = der::seq(&[der::tlv(0x06, OID_SUBJECT_ALT_NAME), der::tlv(0x04, &der::seq(&names))]);
     let ext_req = der::seq(&[der::tlv(0x06, OID_EXTENSION_REQUEST), der::tlv(0x31, &der::seq(&[san_ext]))]);
-    let spki = der::seq(&[ec_algorithm_identifier(), der::bit_string(&p256_point(sk))]);
+    let spki = der::seq(&[ec_algorithm_identifier(), der::bit_string(&p256_point(pair))]);
     let cri = der::seq(&[der::uint(&[0]), der::seq(&[]), spki, der::tlv(0xA0, &ext_req)]);
-    let sig = ecdsa_p256_sign(sk, &sha256(&cri));
-    der::seq(&[cri, der::seq(&[der::tlv(0x06, OID_ECDSA_SHA256)]), der::bit_string(&ecdsa_sig_der(&sig))])
+    let sig = pair.sign(&SystemRandom::new(), &cri).expect("ECDSA signing fails only on RNG/internal failure");
+    let raw: [u8; 64] = sig.as_ref().try_into().expect("fixed-format P-256 signature is 64 bytes");
+    der::seq(&[cri, der::seq(&[der::tlv(0x06, OID_ECDSA_SHA256)]), der::bit_string(&ecdsa_sig_der(&raw))])
 }
 
 /// PKCS#8 `PrivateKeyInfo` for a P-256 key, PEM-wrapped, in the shape `openssl genpkey` emits
 /// (the SEC1 `ECPrivateKey` carries the public point) — what `CertMaterial::key_pem` promises
 /// and what `servelet_tls::tls_server_config` / `hashtrinity::rustls` load.
-pub(crate) fn p256_key_to_pkcs8_pem(sk: &[u8; 32]) -> String {
+pub(crate) fn p256_key_to_pkcs8_pem(pair: &EcdsaKeyPair) -> String {
+    use aws_lc_rs::encoding::{AsBigEndian, EcPrivateKeyBin};
+    let sk: EcPrivateKeyBin<'static> = pair.private_key().as_be_bytes().expect("export P-256 scalar");
     let ec_private_key = der::seq(&[
         der::uint(&[1]),
-        der::tlv(0x04, sk),
-        der::tlv(0xA1, &der::bit_string(&p256_point(sk))), // [1] publicKey
+        der::tlv(0x04, sk.as_ref()),
+        der::tlv(0xA1, &der::bit_string(&p256_point(pair))), // [1] publicKey
     ]);
     let pkcs8 = der::seq(&[der::uint(&[0]), ec_algorithm_identifier(), der::tlv(0x04, &ec_private_key)]);
     pem_wrap("PRIVATE KEY", &pkcs8)
 }
 
-fn pem_wrap(label: &str, der: &[u8]) -> String {
+pub(crate) fn pem_wrap(label: &str, der: &[u8]) -> String {
     let b64 = base64_standard(der);
     let mut out = format!("-----BEGIN {label}-----\n");
     for chunk in b64.as_bytes().chunks(64) {
@@ -688,7 +720,7 @@ mod tests {
 
     fn test_account() -> AccountKey {
         // A fixed, arbitrary 32-byte scalar — deterministic tests, not a real account.
-        AccountKey::from_bytes([7u8; 32])
+        AccountKey::from_bytes([7u8; 32]).unwrap()
     }
 
     #[test]
@@ -727,8 +759,8 @@ mod tests {
 
     #[test]
     fn different_keys_have_different_thumbprints() {
-        let a = AccountKey::from_bytes([1u8; 32]);
-        let b = AccountKey::from_bytes([2u8; 32]);
+        let a = AccountKey::from_bytes([1u8; 32]).unwrap();
+        let b = AccountKey::from_bytes([2u8; 32]).unwrap();
         assert_ne!(a.thumbprint(), b.thumbprint());
     }
 
@@ -826,10 +858,10 @@ mod tests {
 
     #[test]
     fn csr_is_a_valid_self_signed_p256_pkcs10() {
-        let sk = [0x42u8; 32];
-        let csr = csr_p256(&sk, &["*.tascloud.app", "tascloud.app"]);
+        let key = generate_cert_key();
+        let csr = csr_p256(&key, &["*.tascloud.app", "tascloud.app"]);
         let (cri, pk, sig) = split_csr(&csr);
-        assert_eq!(pk, p256_pubkey(&sk));
+        assert_eq!(pk.as_slice(), &key.public_key().as_ref()[1..], "CSR carries the key's public point");
         assert!(hashtrinity::crypto::ecdsa_p256_verify(&pk, &sha256(&cri), &sig), "CSR proves possession of the key");
         for d in ["*.tascloud.app", "tascloud.app"] {
             assert!(cri.windows(d.len()).any(|w| w == d.as_bytes()), "{d} must be a SAN");
@@ -851,15 +883,22 @@ mod tests {
     }
 
     #[test]
-    fn scalar_validation_rejects_zero_and_values_at_or_above_the_order() {
-        assert!(!is_valid_p256_scalar(&[0u8; 32]));
-        assert!(!is_valid_p256_scalar(&P256_ORDER));
-        assert!(!is_valid_p256_scalar(&[0xff; 32]));
-        assert!(is_valid_p256_scalar(&[1u8; 32]));
-        let mut below = P256_ORDER;
-        below[31] -= 1;
-        assert!(is_valid_p256_scalar(&below));
-        assert!(is_valid_p256_scalar(&random_p256_scalar()));
+    fn account_keys_reject_invalid_scalars_round_trip_and_sign_verifiably() {
+        assert!(AccountKey::from_bytes([0u8; 32]).is_err(), "zero is not a key");
+        assert!(AccountKey::from_bytes([0xff; 32]).is_err(), "above the group order is not a key");
+
+        let fixed = AccountKey::from_bytes([7u8; 32]).unwrap();
+        assert_eq!(fixed.to_bytes().unwrap(), [7u8; 32], "sealed-store round trip");
+        let again = AccountKey::from_bytes(fixed.to_bytes().unwrap()).unwrap();
+        assert_eq!(again.thumbprint(), fixed.thumbprint());
+
+        let generated = AccountKey::generate().unwrap();
+        assert_ne!(generated.thumbprint(), fixed.thumbprint());
+        // What aws-lc signs, the (independent) verifier in hashtrinity accepts: r||s over SHA-256.
+        let msg = b"protected.payload";
+        let sig: [u8; 64] = generated.sign(msg).try_into().unwrap();
+        assert!(hashtrinity::crypto::ecdsa_p256_verify(&generated.xy(), &sha256(msg), &sig));
+        assert!(!hashtrinity::crypto::ecdsa_p256_verify(&fixed.xy(), &sha256(msg), &sig));
     }
 
     /// The key we hand back must load in the provider the edge actually serves with.
@@ -867,17 +906,20 @@ mod tests {
     fn issued_key_pem_loads_in_the_edge_serving_provider() {
         use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
         use rustls::{SignatureScheme};
-        let sk = random_p256_scalar();
+        let sk = generate_cert_key();
         let pem = p256_key_to_pkcs8_pem(&sk);
         assert!(pem.starts_with("-----BEGIN PRIVATE KEY-----\n"));
         let body: String = pem.lines().filter(|l| !l.starts_with("-----")).collect();
         let der_bytes = base64_decode_for_test(&body);
-        let provider = hashtrinity::rustls::provider();
-        let key = provider
-            .key_provider
-            .load_private_key(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(der_bytes.clone())))
-            .expect("serving provider loads our PKCS#8");
-        assert!(key.choose_scheme(&[SignatureScheme::ECDSA_NISTP256_SHA256]).is_some());
+        // Both providers: aws-lc-rs (what the edge serves with now) and the legacy hashtrinity one
+        // (what servelet_tls::tls_server_config still uses until edge-lb switches over).
+        for provider in [crate::edge_proxy::sni::provider(), hashtrinity::rustls::provider()] {
+            let key = provider
+                .key_provider
+                .load_private_key(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(der_bytes.clone())))
+                .expect("serving provider loads our PKCS#8");
+            assert!(key.choose_scheme(&[SignatureScheme::ECDSA_NISTP256_SHA256]).is_some());
+        }
         // Same layout as `openssl genpkey` emits for P-256: 138 bytes with the public point.
         assert_eq!(der_bytes.len(), 138);
     }

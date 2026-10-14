@@ -42,6 +42,8 @@ pub mod load_balance;
 pub mod edge;
 /// PEM / base64 plumbing for the certificate paths.
 pub mod pem;
+/// ClientHello SNI peeking for TLS passthrough routing.
+pub mod tls_hello;
 pub mod edge_dns;
 /// Proof-of-control checks for BYO hostnames. The sweep and its `DnsProbe` seam are always
 /// compiled (and unit-tested against a static probe); only the real resolver is gated.
@@ -72,6 +74,9 @@ pub mod http_client;
 /// `gossip.rs`/`quic.rs`'s own `#![cfg(feature = "...")]` convention.
 #[cfg(feature = "native")]
 pub mod acme;
+/// The certificate renewal engine: what to issue, when to renew, how to fail, how to persist.
+#[cfg(feature = "native")]
+pub mod acme_renew;
 
 use std::future::Future;
 use std::io;

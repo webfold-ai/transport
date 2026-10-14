@@ -1,5 +1,55 @@
 # Changelog
 
+## 0.3.0 — certificate lifecycle, edge admission, aws-lc-rs
+
+**BREAKING** (see "Migration" at the end).
+
+### Certificates and ACME
+- **`edge_dns` compiles.** It was written against `hickory-proto`, never a buildable dependency, so
+  the authoritative DNS and the DNS-01 responder did not build in any configuration. Ported to the
+  native `dns` module; compiled and tested by default. `HickoryProbe` (also unbuildable) is replaced
+  by `edge_verify::NativeProbe` (UDP + TCP fallback, CNAME-chain following, spoof-resistant reply
+  matching, resolver failover). The `bind-edge-dns` feature remains as an empty alias.
+- **ACME certificate keys are ECDSA P-256.** The finalize CSR was Ed25519, which public CAs do not
+  issue; every real order would have failed after spending validation rate limit.
+- `badNonce` is retried transparently; 429/`rateLimited` surfaces as `AcmeError::RateLimited` with
+  `Retry-After`; a failed authorization carries the CA's reason.
+- **New `acme_renew`**: the renewal engine nothing implemented. Renews at a percentage of each
+  certificate's own lifetime, exponential backoff with per-name jitter honouring `Retry-After`, keeps
+  last-known-good on failure, rejects junk/expired CA output, fails never-issued hostnames after N
+  attempts (never a baseline wildcard, never a hostname already serving), prunes unrequired certs after
+  a grace period, `FileCertStore` persists across restarts (atomic, 0600). Baseline = every apex wildcard.
+- CAA records can be bound to the ACME account and `dns-01` (`ZoneConfig::with_caa_account_uri`).
+
+### Crypto
+- **ACME account/certificate keys, JWS signing and CSR signing now use `aws-lc-rs`** instead of
+  hashtrinity's hand-written P-256 (variable-time scalar multiplication). The edge serves TLS
+  (`EdgeCertResolver::server_config`) and the HTTP client terminates/originates TLS on aws-lc-rs;
+  `ring` is no longer enabled. New `fips` feature builds the FIPS-validated module and restricts
+  providers to FIPS-approved suites (needs Go + CMake; if `bindgen` fails with a `syn` conflict run
+  `cargo update -p prettyplease --precise 0.2.37`).
+
+### Edge naming and admission
+- `APEXES` = tasmanian.cloud, tascloud.app, tascloud.dev, tasmaniancloud.{app,dev,com.au,au}.
+- A custom hostname's CNAME proof target must be an **active managed hostname of the same tenant**.
+- Released managed labels are **quarantined 30 days** against other tenants (dangling-CNAME takeover).
+- `cert_ready` only moves `PendingCert -> Active` (a certificate could previously lift a suspension);
+  new `activate_cert` / `cert_failed`.
+- Custom hostnames no public CA can certify (special-use TLDs, numeric TLD) are rejected; reserved
+  labels cover platform surfaces.
+- `EdgeCertResolver` is a real `ResolvesServerCert` with a digest-keyed cache (SNI -> certificate).
+- **TLS passthrough by SNI**: `tls_hello::peek_sni` (strict ClientHello parser), `TlsMode::Passthrough`,
+  `sni_route`, `decide_passthrough`. Passthrough names need no certificate and are never issued one.
+- `Decision::NoConnector.status()` is 502, matching its documentation (was 503).
+
+### Migration
+- `AccountKey::from_bytes` now returns `Result` (new: `generate`, `to_bytes`).
+- `EdgeRegistry::add_custom` returns `InvalidCnameTarget` unless the target is an active managed
+  hostname of the same tenant. `HostnameRecord` has a new `tls_mode` field.
+- `release` of a managed label no longer frees it immediately for other tenants.
+- Hostnames under `twnstack.*` / `twnbox.*` are no longer edge apexes.
+- `MemoryCertSource::install` unchanged; new `remove`, and `CertStore` for writable stores.
+
 ## 0.2.0 — BREAKING: `dialkey::peer_id` returns the public key
 
 ### The defect

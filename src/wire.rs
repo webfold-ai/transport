@@ -178,7 +178,7 @@ fn tls_config() -> std::sync::Arc<rustls::ClientConfig> {
             // it, so the first real HTTPS request from ANY consumer would otherwise panic here.
             // `install_default` errors only if a provider is already installed (by this crate or
             // a consumer) — harmless, the existing one wins either way.
-            let _ = rustls::crypto::ring::default_provider().install_default();
+            let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
             let mut roots = rustls::RootCertStore::empty();
             let loaded = rustls_native_certs::load_native_certs();
             for cert in loaded.certs {

@@ -18,7 +18,7 @@
 //!
 //! ## The `.app`/`.dev` constraint is real, not cosmetic
 //!
-//! `tascloud.app` and `tascloud.dev` sit under Google-operated
+//! `tascloud.app`, `tascloud.dev`, `tasmaniancloud.app` and `tasmaniancloud.dev` sit under Google-operated
 //! TLDs that are on the **HSTS preload list as whole TLDs**. Browsers refuse plaintext HTTP
 //! to any name under them — there is no "serves over http:// while the certificate is
 //! pending" grace period the way there is on `.cloud`. So for those apexes a hostname is
@@ -77,9 +77,13 @@ impl Apex {
 /// Every apex the edge answers for. `tasmanian.cloud` is the platform's own zone (the portal
 /// lives there); the rest are the customer-facing pool.
 pub const APEXES: &[Apex] = &[
-    Apex { zone: "tasmanian.cloud", hsts_preloaded: false },
-    Apex { zone: "tascloud.dev",    hsts_preloaded: true  },
-    Apex { zone: "tascloud.app",    hsts_preloaded: true  },
+    Apex { zone: "tasmanian.cloud",        hsts_preloaded: false },
+    Apex { zone: "tascloud.app",           hsts_preloaded: true  },
+    Apex { zone: "tascloud.dev",           hsts_preloaded: true  },
+    Apex { zone: "tasmaniancloud.app",      hsts_preloaded: true  },
+    Apex { zone: "tasmaniancloud.dev",      hsts_preloaded: true  },
+    Apex { zone: "tasmaniancloud.com.au",   hsts_preloaded: false },
+    Apex { zone: "tasmaniancloud.au",       hsts_preloaded: false },
 ];
 
 /// The apex a fully-qualified name sits directly under, if any.
@@ -246,6 +250,18 @@ pub enum HostnameKind {
     Custom,
 }
 
+/// Who terminates TLS for a hostname.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TlsMode {
+    /// The edge terminates TLS with a certificate for the name ([`CertSource`]).
+    #[default]
+    Terminate,
+    /// The edge reads only the ClientHello SNI ([`crate::tls_hello`]) and splices the raw bytes
+    /// to the tenant's connector: the customer's origin presents its own certificate and the
+    /// platform never holds a key or sees plaintext. No certificate is issued for these names.
+    Passthrough,
+}
+
 /// One admitted hostname.
 #[derive(Clone, Debug)]
 pub struct HostnameRecord {
@@ -256,6 +272,8 @@ pub struct HostnameRecord {
     /// The certificate name that covers this hostname: an apex wildcard for managed names,
     /// the fqdn itself for custom ones. This is what [`CertSource`] is asked for.
     pub cert_name: String,
+    /// Who terminates TLS for this name. Passthrough names need no certificate from us.
+    pub tls_mode: TlsMode,
     /// Set for custom hostnames until control is proven.
     pub challenge: Option<Challenge>,
 }
@@ -269,7 +287,9 @@ impl HostnameRecord {
     #[must_use]
     pub fn is_servable(&self, have_cert: bool) -> bool {
         match self.state {
-            HostnameState::Active => have_cert || !self.requires_tls(),
+            HostnameState::Active => {
+                have_cert || self.tls_mode == TlsMode::Passthrough || !self.requires_tls()
+            }
             _ => false,
         }
     }
@@ -481,6 +501,7 @@ impl EdgeRegistry {
                 route: route.clone(),
                 state: HostnameState::Active,
                 cert_name: apex.wildcard(),
+                tls_mode: TlsMode::Terminate,
                 challenge: None,
             };
             self.quarantine.remove(&fqdn);
@@ -517,6 +538,7 @@ impl EdgeRegistry {
             route: route.clone(),
             state: HostnameState::Active,
             cert_name: apex.wildcard(),
+            tls_mode: TlsMode::Terminate,
             challenge: None,
         };
         self.quarantine.remove(&fqdn);
@@ -557,6 +579,7 @@ impl EdgeRegistry {
             route: route.clone(),
             state: HostnameState::PendingDns,
             cert_name: fqdn.clone(),
+            tls_mode: TlsMode::Terminate,
             challenge: Some(challenge),
         };
         self.owner.put(fqdn.clone(), route.tenant_id.clone());
@@ -631,7 +654,12 @@ impl EdgeRegistry {
         };
         let mut record = record.clone();
         if proven {
-            record.state = HostnameState::PendingCert;
+            // Passthrough names have no certificate to wait for: proof of control is the last gate.
+            record.state = if record.tls_mode == TlsMode::Passthrough {
+                HostnameState::Active
+            } else {
+                HostnameState::PendingCert
+            };
         } else {
             self.probes.add(fqdn.clone(), 1);
             if self.probes.count(&fqdn) >= max_probes {
@@ -699,6 +727,24 @@ impl EdgeRegistry {
         waiting
     }
 
+    /// Choose who terminates TLS for one of the tenant's hostnames.
+    ///
+    /// Moving a custom hostname to `Terminate` makes it wait for a certificate again
+    /// (`Active -> PendingCert`), because on the way in nothing was issued for it; moving a
+    /// waiting one to `Passthrough` releases it, since nothing will ever be issued.
+    pub fn set_tls_mode(&mut self, tenant_id: &str, fqdn: &str, mode: TlsMode) -> Result<(), EdgeError> {
+        let fqdn = normalize(fqdn);
+        let mut record = self.get_for_tenant(tenant_id, &fqdn)?.clone();
+        record.tls_mode = mode;
+        match (mode, record.kind, &record.state) {
+            (TlsMode::Terminate, HostnameKind::Custom, HostnameState::Active) => record.state = HostnameState::PendingCert,
+            (TlsMode::Passthrough, _, HostnameState::PendingCert) => record.state = HostnameState::Active,
+            _ => {}
+        }
+        self.hosts.put(fqdn, record);
+        Ok(())
+    }
+
     /// Suspend a hostname — it keeps resolving (so the customer sees our page, not a dead
     /// name) but the edge refuses to proxy it.
     pub fn suspend(&mut self, tenant_id: &str, fqdn: &str) -> Result<(), EdgeError> {
@@ -747,7 +793,9 @@ impl EdgeRegistry {
         let mut seen: Table<String, bool> = Table::new();
         let mut out = Vec::new();
         for (_, record) in self.hosts.iter() {
-            if matches!(record.state, HostnameState::PendingDns | HostnameState::Failed(_)) {
+            if matches!(record.state, HostnameState::PendingDns | HostnameState::Failed(_))
+                || record.tls_mode == TlsMode::Passthrough
+            {
                 continue;
             }
             if !seen.has(&record.cert_name) {
@@ -842,11 +890,11 @@ mod tests {
 
     #[test]
     fn hsts_preloaded_apexes_are_flagged() {
-        for zone in ["tascloud.app", "tascloud.dev"] {
+        for zone in ["tascloud.app", "tascloud.dev", "tasmaniancloud.app", "tasmaniancloud.dev"] {
             let apex = APEXES.iter().find(|a| a.zone == zone).unwrap();
             assert!(apex.hsts_preloaded, "{zone} is under an HSTS-preloaded TLD");
         }
-        for zone in ["tasmanian.cloud"] {
+        for zone in ["tasmanian.cloud", "tasmaniancloud.com.au", "tasmaniancloud.au"] {
             let apex = APEXES.iter().find(|a| a.zone == zone).unwrap();
             assert!(!apex.hsts_preloaded);
         }
@@ -1172,6 +1220,27 @@ mod tests {
                 Err(EdgeError::ReservedLabel(_))
             ), "{label}");
         }
+    }
+
+    #[test]
+    fn passthrough_names_need_no_certificate_and_are_never_on_the_issuance_list() {
+        let mut reg = EdgeRegistry::new(b"s".to_vec());
+        claim_target(&mut reg, "acme", "x");
+        reg.add_custom("secure.acme.com.au", "x.tascloud.app", route("acme", "t")).unwrap();
+        reg.set_tls_mode("acme", "secure.acme.com.au", TlsMode::Passthrough).unwrap();
+        // Proof of control is the last gate: straight to Active, no PendingCert.
+        assert_eq!(reg.record_probe("secure.acme.com.au", true, 5).unwrap(), HostnameState::Active);
+        let rec = reg.lookup("secure.acme.com.au").unwrap();
+        assert!(rec.is_servable(false), "no certificate of ours is involved");
+        assert!(!reg.required_cert_names().contains(&"secure.acme.com.au".to_string()));
+
+        // Back to terminating: it must wait for a certificate again, and be on the work list.
+        reg.set_tls_mode("acme", "secure.acme.com.au", TlsMode::Terminate).unwrap();
+        assert_eq!(reg.lookup("secure.acme.com.au").unwrap().state, HostnameState::PendingCert);
+        assert!(reg.required_cert_names().contains(&"secure.acme.com.au".to_string()));
+        assert!(!reg.lookup("secure.acme.com.au").unwrap().is_servable(false));
+        // Only the owner may flip it.
+        assert!(matches!(reg.set_tls_mode("rival", "secure.acme.com.au", TlsMode::Passthrough), Err(EdgeError::Forbidden(_))));
     }
 
     #[test]

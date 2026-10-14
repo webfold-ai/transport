@@ -1,6 +1,6 @@
 [package]
 name = "transport"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Transport kernel — TCP, TLS, DNS, signed dialkeys, gossip, edge (mesh) routing. Zero-dep core, opt-in tokio + rustls bindings. Unix-composable: every transport module is a small focused file with a single responsibility."
@@ -24,7 +24,12 @@ runtime-tokio = ["dep:tokio"]
 # `dep:serde`/`dep:serde_json`: `acme.rs`'s JWS/ACME-response JSON — the two crates were already
 # declared below (optional, unused by anything until now), so this wires them in rather than
 # adding a new dependency.
-native = ["runtime-tokio", "dep:rustls", "dep:tokio-rustls", "dep:tracing", "dep:serde", "dep:serde_json", "dep:flate2"]
+native = ["runtime-tokio", "dep:rustls", "dep:tokio-rustls", "dep:tracing", "dep:serde", "dep:serde_json", "dep:flate2", "dep:aws-lc-rs"]
+# FIPS 140-3 validated cryptography for everything this crate signs or terminates with: the ACME
+# account key, certificate keys, the edge's TLS server provider and the HTTP client's TLS provider
+# all run on aws-lc-rs, and this switches that module to the validated build. Needs Go + CMake at
+# build time (aws-lc-fips-sys). `rustls/fips` makes the providers expose only FIPS-approved suites.
+fips = ["native", "aws-lc-rs/fips", "rustls/fips"]
 federation = ["dep:pkarr"]
 # Retained as an alias so existing `features = ["bind-edge-dns"]` consumers keep resolving: the
 # authoritative DNS and the resolver probe now run on this crate's own `dns` module, no extra deps.
@@ -36,7 +41,10 @@ bind-edge-dns = ["native"]
 
 [dependencies]
 tokio = { version = "1", features = ["net", "io-util", "time", "rt", "rt-multi-thread", "macros", "sync"], optional = true }
-rustls = { version = "0.23", features = ["ring"], optional = true }
+# aws-lc-rs is rustls' default provider (and what its `fips` feature builds on). `ring` is no longer
+# enabled: every provider this crate installs or builds is aws-lc-rs.
+rustls = { version = "0.23", optional = true }
+aws-lc-rs = { version = "1", optional = true }
 tokio-rustls = { version = "0.26", optional = true }
 tracing = { version = "0.1", default-features = false, features = ["std", "attributes"], optional = true }
 serde = { version = "1", features = ["derive"], optional = true }

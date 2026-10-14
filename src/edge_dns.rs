@@ -46,7 +46,7 @@ use hashtrinity::Table;
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 
-use crate::dns::{Message, Name, Question, RData, Record, RecordType, ResponseCode};
+use crate::dns::{Message, Name, RData, Record, RecordType, ResponseCode};
 
 /// TTL for hostname address records. Short: the edge address set is the failover unit.
 pub const ADDRESS_TTL: u32 = 60;
@@ -488,7 +488,7 @@ pub async fn serve_udp(
 mod tests {
     use super::*;
     use crate::edge::{Route, APEXES};
-    use crate::dns::Flags;
+    use crate::dns::{Flags, Question};
 
     fn authority() -> ZoneAuthority {
         let zones = APEXES
