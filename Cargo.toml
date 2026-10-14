@@ -26,7 +26,9 @@ runtime-tokio = ["dep:tokio"]
 # adding a new dependency.
 native = ["runtime-tokio", "dep:rustls", "dep:tokio-rustls", "dep:tracing", "dep:serde", "dep:serde_json", "dep:flate2"]
 federation = ["dep:pkarr"]
-bind-edge-dns = ["native", "dep:hickory-proto"]
+# Retained as an alias so existing `features = ["bind-edge-dns"]` consumers keep resolving: the
+# authoritative DNS and the resolver probe now run on this crate's own `dns` module, no extra deps.
+bind-edge-dns = ["native"]
 # `bind-overlay` (8 cfg sites) and `bind-edge-dns` (3) still reference deps (hickory-proto,
 # hickory-resolver, iroh) that aren't defined here. That code remains unreachable. Re-adding
 # those dependency trees is a separate decision — federation.rs (2026-09-21, extracted from
@@ -60,7 +62,6 @@ flate2 = { version = "1", optional = true }
 # is now a thin re-export.
 relayfold = { git = "https://github.com/Ptyktos/relayfold" }
 pkarr = { version = "8.0.1", optional = true }
-hickory-proto = { version = "0.24", optional = true }
 
 # The unit tests of modules that are always compiled (`edge_verify`, `edge_proxy`) drive async code with
 # `#[tokio::test]`/`Builder::new_current_thread`; without this, `cargo test --no-default-features`

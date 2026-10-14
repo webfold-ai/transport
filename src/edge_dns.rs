@@ -12,13 +12,13 @@
 //!
 //! ## Dependency stance
 //!
-//! `hickory-proto` — the wire format — is a real dependency: DNS message parsing is
-//! attacker-facing byte handling where an audited implementation beats a hand-rolled one,
-//! exactly the line `bindings::overlay` draws for iroh's QUIC and `bindings::wireguard` for
-//! boringtun's crypto. `hickory-server` is NOT a dependency: `Catalog`/`Authority`/handler
-//! plumbing is scaffolding, and scaffolding is the thing this crate subsumes (the same call
-//! `daemon.rs` makes against `daemonize`). [`ZoneAuthority::answer`] is a pure
-//! bytes-in/bytes-out function; [`serve_udp`] is a twenty-line socket loop around it.
+//! The wire format is this crate's own [`crate::dns`] module (compression-safe decoder,
+//! never-compressing encoder). This file used to be written against `hickory-proto`, which
+//! was never actually declared as a buildable dependency, so the module — and with it the
+//! DNS-01 responder every wildcard certificate depends on — did not compile in any
+//! configuration. It is now always compiled and exercised by the default `cargo test`.
+//! [`ZoneAuthority::answer`] is a pure bytes-in/bytes-out function; [`serve_udp`] is a
+//! twenty-line socket loop around it.
 //!
 //! ## Correctness details that are easy to get wrong, and are handled here
 //!
@@ -46,9 +46,7 @@ use hashtrinity::Table;
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 
-use hickory_proto::op::{Message, MessageType, OpCode, ResponseCode};
-use hickory_proto::rr::rdata::{A, AAAA, CAA, NS, SOA, TXT};
-use hickory_proto::rr::{DNSClass, Name, RData, Record, RecordType};
+use crate::dns::{Message, Name, Question, RData, Record, RecordType, ResponseCode};
 
 /// TTL for hostname address records. Short: the edge address set is the failover unit.
 pub const ADDRESS_TTL: u32 = 60;
@@ -78,6 +76,11 @@ pub struct ZoneConfig {
     /// CA domains permitted to issue for this zone, published as CAA `issue` records. Empty
     /// means no CAA is published — which permits any CA, so it should not stay empty.
     pub caa_issuers: Vec<String>,
+    /// ACME account URI (RFC 8657 `accounturi`) the CAA `issue` records bind issuance to. When
+    /// set, only *our* ACME account may obtain certificates for the zone — a second account
+    /// at the same CA (stolen DNS-validation capability, a rogue tenant) is refused by the CA
+    /// itself. Also pins `validationmethods=dns-01`. Ignored when `caa_issuers` is empty.
+    pub caa_account_uri: Option<String>,
 }
 
 impl ZoneConfig {
@@ -92,6 +95,7 @@ impl ZoneConfig {
             nameservers,
             serial: 1,
             caa_issuers: Vec::new(),
+            caa_account_uri: None,
             zone,
         }
     }
@@ -101,6 +105,27 @@ impl ZoneConfig {
     pub fn with_caa_issuers(mut self, issuers: Vec<String>) -> Self {
         self.caa_issuers = issuers;
         self
+    }
+
+    /// Bind issuance to one ACME account (RFC 8657) and to the DNS-01 method.
+    #[must_use]
+    pub fn with_caa_account_uri(mut self, account_uri: impl Into<String>) -> Self {
+        self.caa_account_uri = Some(account_uri.into());
+        self
+    }
+
+    /// The CAA `issue` property values this zone publishes, one per permitted issuer.
+    fn caa_values(&self) -> Vec<String> {
+        self.caa_issuers
+            .iter()
+            .map(|issuer| {
+                let issuer = normalize(issuer);
+                match &self.caa_account_uri {
+                    Some(uri) => format!("{issuer}; accounturi={uri}; validationmethods=dns-01"),
+                    None => issuer,
+                }
+            })
+            .collect()
     }
 }
 
@@ -190,63 +215,61 @@ impl ZoneAuthority {
     /// not read makes us a reflection amplifier.
     #[must_use]
     pub fn answer(&mut self, query_bytes: &[u8], registry: &EdgeRegistry) -> Option<Vec<u8>> {
-        let request = Message::from_vec(query_bytes).ok()?;
-        let id = request.metadata.id;
+        let request = Message::from_bytes(query_bytes).ok()?;
+        let id = request.id;
 
-        if request.metadata.message_type != MessageType::Query {
+        if request.flags.response {
             return None; // a response arriving at a server port is not ours to answer
         }
-        if request.metadata.op_code != OpCode::Query {
-            return encode(&Message::error_msg(id, request.metadata.op_code, ResponseCode::NotImp));
+        if request.flags.opcode != 0 {
+            return Some(Message::error(id, request.flags.opcode, ResponseCode::NotImp).to_bytes());
         }
 
-        let mut response = Message::response(id, OpCode::Query);
+        let mut response = Message::response(id);
         // Copy RD so the client can see we understood it; RA stays false — we are
         // authoritative, and an authoritative server that offers recursion is an open
         // resolver.
-        response.metadata.recursion_desired = request.metadata.recursion_desired;
-        response.metadata.recursion_available = false;
+        response.flags.recursion_desired = request.flags.recursion_desired;
+        response.flags.recursion_available = false;
 
-        let Some(query) = request.queries.first().cloned() else {
-            response.metadata.response_code = ResponseCode::FormErr;
+        let Some(query) = request.questions.first().cloned() else {
+            response.flags.response_code = ResponseCode::FormErr;
             return encode(&response);
         };
-        response.add_query(query.clone());
+        response.questions.push(query.clone());
 
-        if query.query_class() != DNSClass::IN {
-            response.metadata.response_code = ResponseCode::NotImp;
+        if query.qclass != 1 {
+            response.flags.response_code = ResponseCode::NotImp;
             return encode(&response);
         }
 
-        let qname = normalize(&query.name().to_ascii());
-        let qtype = query.query_type();
-        self.counters.add(format!("{qtype:?}"), 1);
+        let qname = normalize(&query.name.to_ascii());
+        let qtype = query.qtype;
+        self.counters.add(type_name(qtype), 1);
 
         let Some(zone) = self.zone_for(&qname).cloned() else {
             // Not ours. REFUSED, never a lookup on the client's behalf.
-            response.metadata.response_code = ResponseCode::Refused;
+            response.flags.response_code = ResponseCode::Refused;
             return encode(&response);
         };
-        response.metadata.authoritative = true;
+        response.flags.authoritative = true;
 
         let answers = self.records_for(&qname, qtype, &zone, registry);
         match answers {
             Resolution::Answers(records) if !records.is_empty() => {
-                for record in records {
-                    response.add_answer(record);
-                }
+                response.answers = records;
             }
             Resolution::Answers(_) | Resolution::NoData => {
                 // The name exists, this type does not. NOERROR + SOA, so the resolver caches
                 // the absence of the TYPE rather than the absence of the NAME.
                 if let Some(soa) = soa_record(&zone) {
-                    response.add_authority(soa);
+                    response.authorities.push(soa);
                 }
             }
             Resolution::NxDomain => {
-                response.metadata.response_code = ResponseCode::NXDomain;
+                response.flags.response_code = ResponseCode::NxDomain;
                 if let Some(soa) = soa_record(&zone) {
-                    response.add_authority(soa);
+                    response.authorities.push(soa);
                 }
             }
         }
@@ -263,27 +286,26 @@ impl ZoneAuthority {
     ) -> Resolution {
         // ── The apex itself ───────────────────────────────────────────────────────────────
         if qname == zone.zone {
-            let Ok(name) = Name::from_ascii(format!("{qname}.")) else {
+            let Ok(name) = Name::from_ascii(&format!("{qname}.")) else {
                 return Resolution::NxDomain;
             };
             return match qtype {
-                RecordType::SOA => soa_record(zone).map_or(Resolution::NoData, |r| Resolution::Answers(vec![r])),
-                RecordType::NS => Resolution::Answers(
+                RecordType::Soa => soa_record(zone).map_or(Resolution::NoData, |r| Resolution::Answers(vec![r])),
+                RecordType::Ns => Resolution::Answers(
                     zone.nameservers
                         .iter()
-                        .filter_map(|ns| Name::from_ascii(format!("{}.", normalize(ns))).ok())
-                        .map(|ns| Record::from_rdata(name.clone(), NS_TTL, RData::NS(NS(ns))))
+                        .filter_map(|ns| Name::from_ascii(&format!("{}.", normalize(ns))).ok())
+                        .map(|ns| Record::new(name.clone(), NS_TTL, RData::Ns(ns)))
                         .collect(),
                 ),
-                RecordType::CAA => Resolution::Answers(
-                    zone.caa_issuers
-                        .iter()
-                        .filter_map(|issuer| Name::from_ascii(normalize(issuer)).ok())
-                        .map(|issuer| {
-                            Record::from_rdata(
+                RecordType::Caa => Resolution::Answers(
+                    zone.caa_values()
+                        .into_iter()
+                        .map(|value| {
+                            Record::new(
                                 name.clone(),
                                 NS_TTL,
-                                RData::CAA(CAA::new_issue(false, Some(issuer), Vec::new())),
+                                RData::Caa { flags: 0, tag: "issue".to_string(), value: value.into_bytes() },
                             )
                         })
                         .collect(),
@@ -291,7 +313,7 @@ impl ZoneAuthority {
                 // The apex resolves to the edge too, so `https://twnstack.app` is not a dead
                 // name — but it is NOT a customer hostname and routes to the platform's own
                 // landing service, which is `transport::edge`'s call, not DNS's.
-                RecordType::A | RecordType::AAAA => Resolution::Answers(self.address_records(&name, qtype)),
+                RecordType::A | RecordType::Aaaa => Resolution::Answers(self.address_records(&name, qtype)),
                 _ => Resolution::NoData,
             };
         }
@@ -301,16 +323,16 @@ impl ZoneAuthority {
             let Some(tokens) = self.acme.get(&qname.to_string()) else {
                 return Resolution::NxDomain;
             };
-            if qtype != RecordType::TXT {
+            if qtype != RecordType::Txt {
                 return Resolution::NoData;
             }
-            let Ok(name) = Name::from_ascii(format!("{qname}.")) else {
+            let Ok(name) = Name::from_ascii(&format!("{qname}.")) else {
                 return Resolution::NxDomain;
             };
             return Resolution::Answers(
                 tokens
                     .iter()
-                    .map(|t| Record::from_rdata(name.clone(), ACME_TTL, RData::TXT(TXT::new(vec![t.clone()]))))
+                    .map(|t| Record::new(name.clone(), ACME_TTL, RData::Txt(vec![t.clone().into_bytes()])))
                     .collect(),
             );
         }
@@ -332,11 +354,11 @@ impl ZoneAuthority {
         if matches!(record.state, HostnameState::Failed(_)) {
             return Resolution::NxDomain;
         }
-        let Ok(name) = Name::from_ascii(format!("{qname}.")) else {
+        let Ok(name) = Name::from_ascii(&format!("{qname}.")) else {
             return Resolution::NxDomain;
         };
         match qtype {
-            RecordType::A | RecordType::AAAA => Resolution::Answers(self.address_records(&name, qtype)),
+            RecordType::A | RecordType::Aaaa => Resolution::Answers(self.address_records(&name, qtype)),
             _ => Resolution::NoData,
         }
     }
@@ -346,12 +368,12 @@ impl ZoneAuthority {
             RecordType::A => self
                 .edge_v4
                 .iter()
-                .map(|ip| Record::from_rdata(name.clone(), ADDRESS_TTL, RData::A(A(*ip))))
+                .map(|ip| Record::new(name.clone(), ADDRESS_TTL, RData::A(*ip)))
                 .collect(),
-            RecordType::AAAA => self
+            RecordType::Aaaa => self
                 .edge_v6
                 .iter()
-                .map(|ip| Record::from_rdata(name.clone(), ADDRESS_TTL, RData::AAAA(AAAA(*ip))))
+                .map(|ip| Record::new(name.clone(), ADDRESS_TTL, RData::Aaaa(*ip)))
                 .collect(),
             _ => Vec::new(),
         }
@@ -360,8 +382,10 @@ impl ZoneAuthority {
 
 /// Share this handle with `serve_udp` and the ACME renewal loop so TXT updates
 /// reach the live authoritative server without a zone reload.
+#[cfg(feature = "native")]
 pub struct Dns01Authority(pub std::sync::Arc<tokio::sync::Mutex<ZoneAuthority>>);
 
+#[cfg(feature = "native")]
 impl crate::acme::Dns01Responder for Dns01Authority {
     fn publish_txt<'a>(&'a self, name: &'a str, value: &'a str) -> crate::BoxFuture<'a, Result<(), crate::acme::AcmeError>> {
         Box::pin(async move {
@@ -384,26 +408,41 @@ enum Resolution {
 }
 
 fn soa_record(zone: &ZoneConfig) -> Option<Record> {
-    let name = Name::from_ascii(format!("{}.", zone.zone)).ok()?;
-    let mname = Name::from_ascii(format!("{}.", normalize(&zone.primary_ns))).ok()?;
-    let rname = Name::from_ascii(format!("{}.", normalize(&zone.hostmaster))).ok()?;
-    Some(Record::from_rdata(
+    let name = Name::from_ascii(&format!("{}.", zone.zone)).ok()?;
+    let mname = Name::from_ascii(&format!("{}.", normalize(&zone.primary_ns))).ok()?;
+    let rname = Name::from_ascii(&format!("{}.", normalize(&zone.hostmaster))).ok()?;
+    Some(Record::new(
         name,
         SOA_MINIMUM_TTL,
-        RData::SOA(SOA::new(
+        RData::Soa {
             mname,
             rname,
-            zone.serial,
-            7200,  // refresh
-            3600,  // retry
-            604_800, // expire
-            SOA_MINIMUM_TTL,
-        )),
+            serial: zone.serial,
+            refresh: 7200,
+            retry: 3600,
+            expire: 604_800,
+            minimum: SOA_MINIMUM_TTL,
+        },
     ))
 }
 
 fn encode(message: &Message) -> Option<Vec<u8>> {
-    message.to_vec().ok()
+    Some(message.to_bytes())
+}
+
+/// Presentation name of a record type, for the per-type query counters.
+fn type_name(t: RecordType) -> String {
+    match t {
+        RecordType::A => "A".to_string(),
+        RecordType::Aaaa => "AAAA".to_string(),
+        RecordType::Ns => "NS".to_string(),
+        RecordType::Cname => "CNAME".to_string(),
+        RecordType::Soa => "SOA".to_string(),
+        RecordType::Txt => "TXT".to_string(),
+        RecordType::Srv => "SRV".to_string(),
+        RecordType::Caa => "CAA".to_string(),
+        RecordType::Unknown(c) => format!("TYPE{c}"),
+    }
 }
 
 // ── The socket loop ───────────────────────────────────────────────────────────────────────
@@ -421,14 +460,14 @@ pub async fn serve_udp(
     registry: std::sync::Arc<tokio::sync::Mutex<EdgeRegistry>>,
 ) -> std::io::Result<()> {
     let socket = tokio::net::UdpSocket::bind(addr).await?;
-    eprintln!(target: "bedrock::edge_dns", addr = %addr, "authoritative DNS listening");
+    tracing::info!(target: "bedrock::edge_dns", addr = %addr, "authoritative DNS listening");
     // 4096 covers an EDNS0-advertised payload; anything larger is not a query we serve.
     let mut buf = vec![0u8; 4096];
     loop {
         let (len, peer) = match socket.recv_from(&mut buf).await {
             Ok(v) => v,
             Err(e) => {
-                eprintln!("DEBUG: target: "bedrock::edge_dns", error = %e, "recv failed");
+                tracing::debug!(target: "bedrock::edge_dns", error = %e, "recv failed");
                 continue;
             }
         };
@@ -439,7 +478,7 @@ pub async fn serve_udp(
         };
         if let Some(reply) = reply {
             if let Err(e) = socket.send_to(&reply, peer).await {
-                eprintln!("DEBUG: target: "bedrock::edge_dns", error = %e, %peer, "send failed");
+                tracing::debug!(target: "bedrock::edge_dns", error = %e, %peer, "send failed");
             }
         }
     }
@@ -449,7 +488,7 @@ pub async fn serve_udp(
 mod tests {
     use super::*;
     use crate::edge::{Route, APEXES};
-    use hickory_proto::op::Query;
+    use crate::dns::Flags;
 
     fn authority() -> ZoneAuthority {
         let zones = APEXES
@@ -473,16 +512,18 @@ mod tests {
 
     /// Build a real query packet — the tests go through the wire format, not around it.
     fn query_bytes(name: &str, qtype: RecordType) -> Vec<u8> {
-        let mut msg = Message::query();
-        msg.metadata.id = 0x1234;
-        msg.metadata.recursion_desired = true;
-        msg.add_query(Query::query(Name::from_ascii(format!("{name}.")).unwrap(), qtype));
-        msg.to_vec().unwrap()
+        Message {
+            id: 0x1234,
+            flags: Flags { recursion_desired: true, ..Flags::default() },
+            questions: vec![Question::new(Name::from_ascii(&format!("{name}.")).unwrap(), qtype)],
+            ..Message::default()
+        }
+        .to_bytes()
     }
 
     fn ask(auth: &mut ZoneAuthority, reg: &EdgeRegistry, name: &str, qtype: RecordType) -> Message {
         let bytes = auth.answer(&query_bytes(name, qtype), reg).expect("a reply");
-        Message::from_vec(&bytes).expect("reply parses as a DNS message")
+        Message::from_bytes(&bytes).expect("reply parses as a DNS message")
     }
 
     #[test]
@@ -493,13 +534,13 @@ mod tests {
         let rec = reg.claim_managed(apex, "dk-1", route("acme", "tun-1")).unwrap();
 
         let reply = ask(&mut auth, &reg, &rec.fqdn, RecordType::A);
-        assert_eq!(reply.metadata.id, 0x1234, "the response must echo the query id");
-        assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
-        assert!(reply.metadata.authoritative, "we are the authority for this zone");
-        assert!(!reply.metadata.recursion_available, "an authoritative server is not an open resolver");
+        assert_eq!(reply.id, 0x1234, "the response must echo the query id");
+        assert_eq!(reply.flags.response_code, ResponseCode::NoError);
+        assert!(reply.flags.authoritative, "we are the authority for this zone");
+        assert!(!reply.flags.recursion_available, "an authoritative server is not an open resolver");
         assert_eq!(reply.answers.len(), 1);
         match &reply.answers[0].data {
-            RData::A(a) => assert_eq!(a.0, Ipv4Addr::new(203, 0, 113, 10)),
+            RData::A(a) => assert_eq!(*a, Ipv4Addr::new(203, 0, 113, 10)),
             other => panic!("expected an A record, got {other:?}"),
         }
         assert_eq!(reply.answers[0].ttl, ADDRESS_TTL);
@@ -511,14 +552,14 @@ mod tests {
         let reg = EdgeRegistry::new(b"s".to_vec());
         let reply = ask(&mut auth, &reg, "never-claimed-abc123.twnstack.app", RecordType::A);
         assert_eq!(
-            reply.metadata.response_code,
-            ResponseCode::NXDomain,
+            reply.flags.response_code,
+            ResponseCode::NxDomain,
             "a catch-all wildcard would make every typo resolve to the edge"
         );
         assert!(reply.answers.is_empty());
         let soa = reply.authorities.first().expect("NXDOMAIN must carry a SOA for negative caching");
         match &soa.data {
-            RData::SOA(soa) => assert_eq!(soa.minimum, SOA_MINIMUM_TTL),
+            RData::Soa { minimum, .. } => assert_eq!(*minimum, SOA_MINIMUM_TTL),
             other => panic!("expected SOA in the authority section, got {other:?}"),
         }
     }
@@ -530,9 +571,9 @@ mod tests {
         let apex = APEXES.iter().find(|a| a.zone == "twnstack.app").unwrap();
         let rec = reg.claim_managed(apex, "dk-1", route("acme", "tun-1")).unwrap();
 
-        let reply = ask(&mut auth, &reg, &rec.fqdn, RecordType::MX);
+        let reply = ask(&mut auth, &reg, &rec.fqdn, RecordType::Unknown(15));
         assert_eq!(
-            reply.metadata.response_code,
+            reply.flags.response_code,
             ResponseCode::NoError,
             "the NAME exists — NXDOMAIN here would tell the resolver the whole name is gone"
         );
@@ -546,12 +587,12 @@ mod tests {
         let reg = EdgeRegistry::new(b"s".to_vec());
         let reply = ask(&mut auth, &reg, "www.google.com", RecordType::A);
         assert_eq!(
-            reply.metadata.response_code,
+            reply.flags.response_code,
             ResponseCode::Refused,
             "answering for other zones would make this an open resolver / amplifier"
         );
         assert!(reply.answers.is_empty());
-        assert!(!reply.metadata.authoritative);
+        assert!(!reply.flags.authoritative);
     }
 
     #[test]
@@ -561,7 +602,7 @@ mod tests {
         reg.add_custom("app.example.com.au", "x.twnstack.app", route("acme", "tun-1")).unwrap();
         // Their own DNS points at us; we are not authoritative for their domain.
         let reply = ask(&mut auth, &reg, "app.example.com.au", RecordType::A);
-        assert_eq!(reply.metadata.response_code, ResponseCode::Refused);
+        assert_eq!(reply.flags.response_code, ResponseCode::Refused);
     }
 
     #[test]
@@ -569,14 +610,14 @@ mod tests {
         let mut auth = authority();
         let reg = EdgeRegistry::new(b"s".to_vec());
 
-        let soa = ask(&mut auth, &reg, "twnstack.app", RecordType::SOA);
+        let soa = ask(&mut auth, &reg, "twnstack.app", RecordType::Soa);
         assert_eq!(soa.answers.len(), 1);
-        assert!(matches!(soa.answers[0].data, RData::SOA(_)));
+        assert!(matches!(soa.answers[0].data, RData::Soa { .. }));
 
-        let ns = ask(&mut auth, &reg, "twnstack.app", RecordType::NS);
+        let ns = ask(&mut auth, &reg, "twnstack.app", RecordType::Ns);
         assert_eq!(ns.answers.len(), 2, "both nameservers must be published");
 
-        let caa = ask(&mut auth, &reg, "twnstack.app", RecordType::CAA);
+        let caa = ask(&mut auth, &reg, "twnstack.app", RecordType::Caa);
         assert_eq!(caa.answers.len(), 1, "CAA pins which CA may issue for the zone");
     }
 
@@ -586,17 +627,17 @@ mod tests {
         let reg = EdgeRegistry::new(b"s".to_vec());
         auth.set_acme_token("twnstack.app", "token-one");
 
-        let reply = ask(&mut auth, &reg, "_acme-challenge.twnstack.app", RecordType::TXT);
-        assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
+        let reply = ask(&mut auth, &reg, "_acme-challenge.twnstack.app", RecordType::Txt);
+        assert_eq!(reply.flags.response_code, ResponseCode::NoError);
         assert_eq!(reply.answers.len(), 1);
         match &reply.answers[0].data {
-            RData::TXT(txt) => assert_eq!(txt.to_string(), "token-one"),
+            RData::Txt(txt) => assert_eq!(txt.concat(), b"token-one".to_vec()),
             other => panic!("expected TXT, got {other:?}"),
         }
 
         auth.clear_acme_tokens("twnstack.app");
-        let gone = ask(&mut auth, &reg, "_acme-challenge.twnstack.app", RecordType::TXT);
-        assert_eq!(gone.metadata.response_code, ResponseCode::NXDomain, "a spent challenge stops answering");
+        let gone = ask(&mut auth, &reg, "_acme-challenge.twnstack.app", RecordType::Txt);
+        assert_eq!(gone.flags.response_code, ResponseCode::NxDomain, "a spent challenge stops answering");
     }
 
     #[test]
@@ -608,7 +649,7 @@ mod tests {
         auth.set_acme_token("twnbox.dev", "token-base");
         auth.set_acme_token("twnbox.dev", "token-wildcard");
 
-        let reply = ask(&mut auth, &reg, "_acme-challenge.twnbox.dev", RecordType::TXT);
+        let reply = ask(&mut auth, &reg, "_acme-challenge.twnbox.dev", RecordType::Txt);
         assert_eq!(reply.answers.len(), 2, "both live tokens must be answered");
     }
 
@@ -622,8 +663,8 @@ mod tests {
 
         reg.release("acme", &rec.fqdn).unwrap();
         assert_eq!(
-            ask(&mut auth, &reg, &rec.fqdn, RecordType::A).metadata.response_code,
-            ResponseCode::NXDomain,
+            ask(&mut auth, &reg, &rec.fqdn, RecordType::A).flags.response_code,
+            ResponseCode::NxDomain,
             "the registry IS the zone — no reload step exists to forget"
         );
     }
@@ -666,21 +707,25 @@ mod tests {
     fn a_response_arriving_at_the_server_port_is_ignored() {
         let mut auth = authority();
         let reg = EdgeRegistry::new(b"s".to_vec());
-        let mut msg = Message::response(7, OpCode::Query);
-        msg.add_query(Query::query(Name::from_ascii("twnstack.app.").unwrap(), RecordType::A));
-        assert!(auth.answer(&msg.to_vec().unwrap(), &reg).is_none());
+        let mut msg = Message::response(7);
+        msg.questions.push(Question::new(Name::from_ascii("twnstack.app.").unwrap(), RecordType::A));
+        assert!(auth.answer(&msg.to_bytes(), &reg).is_none());
     }
 
     #[test]
     fn a_non_query_opcode_is_notimp_not_a_crash() {
         let mut auth = authority();
         let reg = EdgeRegistry::new(b"s".to_vec());
-        let mut msg = Message::new(9, MessageType::Query, OpCode::Update);
-        msg.add_query(Query::query(Name::from_ascii("twnstack.app.").unwrap(), RecordType::SOA));
-        let bytes = auth.answer(&msg.to_vec().unwrap(), &reg).expect("a reply");
-        let reply = Message::from_vec(&bytes).unwrap();
-        assert_eq!(reply.metadata.response_code, ResponseCode::NotImp);
-        assert_eq!(reply.metadata.id, 9);
+        let msg = Message {
+            id: 9,
+            flags: Flags { opcode: 5, ..Flags::default() }, // UPDATE
+            questions: vec![Question::new(Name::from_ascii("twnstack.app.").unwrap(), RecordType::Soa)],
+            ..Message::default()
+        };
+        let bytes = auth.answer(&msg.to_bytes(), &reg).expect("a reply");
+        let reply = Message::from_bytes(&bytes).unwrap();
+        assert_eq!(reply.flags.response_code, ResponseCode::NotImp);
+        assert_eq!(reply.id, 9);
     }
 
     #[test]
@@ -688,13 +733,67 @@ mod tests {
         let mut auth = authority();
         let reg = EdgeRegistry::new(b"s".to_vec());
         for apex in APEXES {
-            let reply = ask(&mut auth, &reg, apex.zone, RecordType::SOA);
+            let reply = ask(&mut auth, &reg, apex.zone, RecordType::Soa);
             assert_eq!(
-                reply.metadata.response_code,
+                reply.flags.response_code,
                 ResponseCode::NoError,
                 "{} must be served — it is in APEXES",
                 apex.zone
             );
         }
+    }
+
+    #[test]
+    fn caa_can_be_bound_to_our_acme_account_and_dns01() {
+        let zone = ZoneConfig::new("twnstack.app", vec!["ns1.twnstack.app".into()])
+            .with_caa_issuers(vec!["letsencrypt.org".to_string()])
+            .with_caa_account_uri("https://acme-v02.api.letsencrypt.org/acme/acct/42");
+        let mut auth = ZoneAuthority::new(vec![zone], vec![Ipv4Addr::LOCALHOST], vec![]);
+        let reg = EdgeRegistry::new(b"s".to_vec());
+        let reply = ask(&mut auth, &reg, "twnstack.app", RecordType::Caa);
+        match &reply.answers[0].data {
+            RData::Caa { tag, value, .. } => {
+                assert_eq!(tag, "issue");
+                let v = String::from_utf8(value.clone()).unwrap();
+                assert_eq!(
+                    v,
+                    "letsencrypt.org; accounturi=https://acme-v02.api.letsencrypt.org/acme/acct/42; validationmethods=dns-01"
+                );
+            }
+            other => panic!("expected CAA, got {other:?}"),
+        }
+    }
+
+    /// The real bridge, not a source-level assertion: publish through the trait the ACME
+    /// client uses, resolve through the wire, remove, confirm gone.
+    #[cfg(feature = "native")]
+    #[tokio::test]
+    async fn dns01_responder_round_trips_through_the_wire() {
+        use crate::acme::Dns01Responder;
+        let auth = std::sync::Arc::new(tokio::sync::Mutex::new(authority()));
+        let responder = Dns01Authority(auth.clone());
+        let reg = EdgeRegistry::new(b"s".to_vec());
+
+        // `*.twnstack.app` and `twnstack.app` in one order => two values at one name.
+        responder.publish_txt("twnstack.app", "val-a").await.unwrap();
+        responder.publish_txt("twnstack.app", "val-b").await.unwrap();
+        let reply = ask(&mut *auth.lock().await, &reg, "_acme-challenge.twnstack.app", RecordType::Txt);
+        assert_eq!(reply.answers.len(), 2);
+
+        // Removing one authorization's value must not disturb the other's.
+        responder.remove_txt("twnstack.app", "val-a").await;
+        let reply = ask(&mut *auth.lock().await, &reg, "_acme-challenge.twnstack.app", RecordType::Txt);
+        assert_eq!(reply.answers.len(), 1);
+        responder.remove_txt("twnstack.app", "val-b").await;
+        let reply = ask(&mut *auth.lock().await, &reg, "_acme-challenge.twnstack.app", RecordType::Txt);
+        assert_eq!(reply.flags.response_code, ResponseCode::NxDomain);
+    }
+
+    #[test]
+    fn query_counters_use_presentation_names() {
+        let mut auth = authority();
+        let reg = EdgeRegistry::new(b"s".to_vec());
+        ask(&mut auth, &reg, "twnstack.app", RecordType::Aaaa);
+        assert_eq!(auth.query_count("AAAA"), 1);
     }
 }

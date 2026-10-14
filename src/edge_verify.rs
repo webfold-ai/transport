@@ -11,10 +11,10 @@
 //! reached the way the public internet reaches them. Resolving through a split-horizon view,
 //! a local hosts file, or our own [`super::edge_dns::ZoneAuthority`] would let a name we
 //! already control satisfy a challenge about a name we do not — which is the entire
-//! vulnerability class this check exists to close. [`HickoryProbe::public`] therefore builds
-//! a resolver from an explicit public recursive configuration rather than the host's
-//! `/etc/resolv.conf`, and [`HickoryProbe::from_system`] exists only for operators who
-//! deliberately run their own trusted recursor.
+//! vulnerability class this check exists to close. [`NativeProbe::public`] therefore uses an
+//! explicit public recursive configuration rather than the host's `/etc/resolv.conf`, and
+//! [`NativeProbe::with_resolvers`] exists only for operators who deliberately run their own
+//! trusted recursor.
 //!
 //! ## The HashTrinity face
 //! - **NB/Set** = the observed record set (what the customer's DNS actually publishes)
@@ -74,100 +74,326 @@ pub async fn sweep(
     results
 }
 
-// ── The hickory-backed probe ──────────────────────────────────────────────────────────────
+// ── The native resolver probe ─────────────────────────────────────────────────────────
 
-#[cfg(feature = "bind-edge-dns")]
-mod hickory_probe {
+/// A real recursive-resolver probe on this crate's own [`crate::dns`] wire format (UDP, with
+/// TCP retry on truncation). Replaces the earlier hickory-resolver probe, which depended on a
+/// crate that was never declared and so never compiled.
+#[cfg(feature = "native")]
+mod native_probe {
     use super::{Challenge, DnsProbe, Observed};
+    use crate::dns::{Flags, Message, Name, Question, RData, RecordType, ResponseCode};
     use crate::BoxFuture;
+    use std::net::SocketAddr;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    use hickory_proto::rr::{RData, RecordType};
-    use hickory_resolver::config::{ResolverConfig, CLOUDFLARE, GOOGLE};
-    use hickory_resolver::net::runtime::TokioRuntimeProvider;
-    use hickory_resolver::{Resolver, TokioResolver};
+    /// How far a customer's CNAME chain is followed. Real chains are 1-3 hops; the cap exists
+    /// so a looping chain terminates.
+    const MAX_CNAME_HOPS: usize = 8;
 
-    /// A real recursive-resolver probe.
-    pub struct HickoryProbe {
-        resolver: TokioResolver,
+    pub struct NativeProbe {
+        resolvers: Vec<SocketAddr>,
+        timeout: Duration,
     }
 
-    impl HickoryProbe {
-        /// A probe that resolves through public recursive resolvers, deliberately ignoring
-        /// this host's own resolver configuration. See the module doc: a validation check
-        /// that can be satisfied through our own split-horizon view is not a check.
-        ///
-        /// Two independent operators (Cloudflare and Google), because a single one being
-        /// unreachable would fail every pending validation at once and look like every
-        /// customer suddenly misconfiguring their DNS.
-        pub fn public() -> Result<Self, crate::Error> {
-            let mut config = ResolverConfig::udp_and_tcp(&CLOUDFLARE);
-            for name_server in ResolverConfig::udp_and_tcp(&GOOGLE).into_parts().2 {
-                config.add_name_server(name_server);
+    impl NativeProbe {
+        /// Resolve through public recursive resolvers from two independent operators
+        /// (Cloudflare, Google), deliberately ignoring this host's own resolver configuration.
+        /// A validation check that can be satisfied through our own split-horizon view is not
+        /// a check. Two operators because one being unreachable would fail every pending
+        /// validation at once and look like every customer misconfiguring their DNS.
+        #[must_use]
+        pub fn public() -> Self {
+            Self::with_resolvers(
+                ["1.1.1.1:53", "8.8.8.8:53", "1.0.0.1:53", "8.8.4.4:53"]
+                    .iter()
+                    .filter_map(|a| a.parse().ok())
+                    .collect(),
+            )
+        }
+
+        /// A probe using exactly these recursors, tried in order until one answers. Only
+        /// correct where the operator runs a trusted recursor with no split-horizon view of
+        /// customer domains.
+        #[must_use]
+        pub fn with_resolvers(resolvers: Vec<SocketAddr>) -> Self {
+            NativeProbe { resolvers, timeout: Duration::from_secs(3) }
+        }
+
+        /// Ask each recursor in turn; the first usable (NOERROR / NXDOMAIN) answer wins.
+        async fn query(&self, name: &str, qtype: RecordType) -> Option<Message> {
+            let qname = Name::from_ascii(name).ok()?;
+            for resolver in &self.resolvers {
+                if let Some(m) = self.query_one(*resolver, &qname, qtype).await {
+                    return Some(m);
+                }
             }
-            let resolver = Resolver::builder_with_config(config, TokioRuntimeProvider::default())
-                .build()
-                .map_err(|e| crate::Error::Overlay(format!("resolver init: {e}")))?;
-            Ok(HickoryProbe { resolver })
+            None
         }
 
-        /// A probe using the host's `/etc/resolv.conf`. Only correct where the operator runs
-        /// a trusted recursor with no split-horizon view of customer domains.
-        pub fn from_system() -> Result<Self, crate::Error> {
-            let resolver = Resolver::builder_tokio()
-                .map_err(|e| crate::Error::Overlay(format!("resolver init: {e}")))?
-                .build()
-                .map_err(|e| crate::Error::Overlay(format!("resolver build: {e}")))?;
-            Ok(HickoryProbe { resolver })
+        async fn query_one(&self, resolver: SocketAddr, qname: &Name, qtype: RecordType) -> Option<Message> {
+            let id_bytes = hashtrinity::crypto::rand_bytes(2);
+            let id = u16::from_be_bytes([id_bytes[0], id_bytes[1]]);
+            let query = Message {
+                id,
+                flags: Flags { recursion_desired: true, ..Flags::default() },
+                questions: vec![Question::new(qname.clone(), qtype)],
+                ..Message::default()
+            };
+            let reply = match tokio::time::timeout(self.timeout, udp_exchange(resolver, &query)).await {
+                Ok(Some(m)) => m,
+                _ => return None,
+            };
+            let reply = if reply.flags.truncated {
+                tokio::time::timeout(self.timeout, tcp_exchange(resolver, &query)).await.ok()??
+            } else {
+                reply
+            };
+            acceptable(&query, &reply).then_some(reply)
         }
     }
 
-    impl DnsProbe for HickoryProbe {
+    /// A reply is usable only if it answers THIS question: id, QR bit and echoed question must
+    /// match, and the rcode must be a definitive one. Anything else is noise or an off-path
+    /// spoof attempt and is treated as no answer.
+    fn acceptable(query: &Message, reply: &Message) -> bool {
+        reply.flags.response
+            && reply.id == query.id
+            && reply.questions.first() == query.questions.first()
+            && matches!(reply.flags.response_code, ResponseCode::NoError | ResponseCode::NxDomain)
+    }
+
+    async fn udp_exchange(resolver: SocketAddr, query: &Message) -> Option<Message> {
+        let bind = if resolver.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
+        // A fresh socket per query: the OS picks a random source port, which is half of the
+        // off-path spoofing defence (the random id is the other half).
+        let socket = tokio::net::UdpSocket::bind(bind).await.ok()?;
+        socket.send_to(&query.to_bytes(), resolver).await.ok()?;
+        let mut buf = vec![0u8; 4096];
+        loop {
+            let (n, from) = socket.recv_from(&mut buf).await.ok()?;
+            if from != resolver {
+                continue;
+            }
+            if let Ok(m) = Message::from_bytes(&buf[..n]) {
+                if m.id == query.id {
+                    return Some(m);
+                }
+            }
+        }
+    }
+
+    async fn tcp_exchange(resolver: SocketAddr, query: &Message) -> Option<Message> {
+        let mut stream = tokio::net::TcpStream::connect(resolver).await.ok()?;
+        let bytes = query.to_bytes();
+        let len = u16::try_from(bytes.len()).ok()?;
+        stream.write_all(&len.to_be_bytes()).await.ok()?;
+        stream.write_all(&bytes).await.ok()?;
+        let mut len_buf = [0u8; 2];
+        stream.read_exact(&mut len_buf).await.ok()?;
+        let mut body = vec![0u8; usize::from(u16::from_be_bytes(len_buf))];
+        stream.read_exact(&mut body).await.ok()?;
+        Message::from_bytes(&body).ok()
+    }
+
+    impl DnsProbe for NativeProbe {
         fn observe<'a>(&'a self, challenge: &'a Challenge) -> BoxFuture<'a, Observed> {
             Box::pin(async move {
                 let mut observed = Observed::default();
 
                 // TXT at `_twn-challenge.<fqdn>`. A TXT record is a SEQUENCE of <=255-byte
-                // strings on the wire; a value longer than that arrives split, so the
-                // segments are joined before comparison rather than compared one by one.
-                if let Ok(lookup) = self
-                    .resolver
-                    .lookup(format!("{}.", challenge.txt_name), RecordType::TXT)
-                    .await
-                {
-                    for record in lookup.answers() {
-                        if let RData::TXT(txt) = &record.data {
-                            let joined: String = txt
-                                .txt_data
-                                .iter()
-                                .map(|seg| String::from_utf8_lossy(seg).into_owned())
-                                .collect();
-                            observed.txt.push(joined);
+                // strings on the wire; segments are joined before comparison.
+                if let Some(reply) = self.query(&challenge.txt_name, RecordType::Txt).await {
+                    for record in &reply.answers {
+                        if let RData::Txt(segments) = &record.data {
+                            observed.txt.push(String::from_utf8_lossy(&segments.concat()).into_owned());
                         }
                     }
                 }
 
-                // CNAME at the hostname itself. Asked for explicitly (rather than following
-                // an address lookup) so we see the alias, not what it eventually resolves to.
-                if let Ok(lookup) = self
-                    .resolver
-                    .lookup(format!("{}.", challenge.fqdn), RecordType::CNAME)
-                    .await
-                {
-                    for record in lookup.answers() {
-                        if let RData::CNAME(cname) = &record.data {
-                            observed.cname.push(cname.0.to_ascii());
+                // The CNAME chain from the hostname itself. Asked for explicitly (rather than
+                // following an address lookup) so we see the aliases, not what they resolve to.
+                let mut current = challenge.fqdn.clone();
+                for _ in 0..MAX_CNAME_HOPS {
+                    let Some(reply) = self.query(&current, RecordType::Cname).await else { break };
+                    let Ok(owner) = Name::from_ascii(&current) else { break };
+                    let next = reply.answers.iter().find_map(|r| match &r.data {
+                        RData::Cname(target) if r.name == owner => Some(target.to_ascii()),
+                        _ => None,
+                    });
+                    match next {
+                        Some(target) => {
+                            observed.cname.push(target.clone());
+                            current = target;
                         }
+                        None => break,
                     }
                 }
-
                 observed
             })
         }
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::dns::Record;
+        use tokio::net::{TcpListener, UdpSocket};
+
+        /// Serve canned answers: `answer(query) -> Message`. UDP only unless `tcp` is set.
+        async fn serve(
+            answer: impl Fn(&Message) -> Message + Send + Sync + 'static,
+            truncate_udp: bool,
+        ) -> SocketAddr {
+            let answer = std::sync::Arc::new(answer);
+            let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = tcp.local_addr().unwrap();
+            let udp = UdpSocket::bind(addr).await.unwrap();
+            let a = answer.clone();
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 4096];
+                loop {
+                    let Ok((n, peer)) = udp.recv_from(&mut buf).await else { return };
+                    let Ok(q) = Message::from_bytes(&buf[..n]) else { continue };
+                    let mut r = if truncate_udp {
+                        let mut r = Message::response(q.id);
+                        r.questions = q.questions.clone();
+                        r.flags.truncated = true;
+                        r
+                    } else {
+                        a(&q)
+                    };
+                    r.id = q.id;
+                    let _ = udp.send_to(&r.to_bytes(), peer).await;
+                }
+            });
+            let a = answer;
+            tokio::spawn(async move {
+                loop {
+                    let Ok((mut s, _)) = tcp.accept().await else { return };
+                    let a = a.clone();
+                    tokio::spawn(async move {
+                        let mut l = [0u8; 2];
+                        if s.read_exact(&mut l).await.is_err() { return }
+                        let mut body = vec![0u8; usize::from(u16::from_be_bytes(l))];
+                        if s.read_exact(&mut body).await.is_err() { return }
+                        let Ok(q) = Message::from_bytes(&body) else { return };
+                        let r = a(&q).to_bytes();
+                        let _ = s.write_all(&u16::try_from(r.len()).unwrap().to_be_bytes()).await;
+                        let _ = s.write_all(&r).await;
+                    });
+                }
+            });
+            addr
+        }
+
+        fn reply_to(q: &Message, answers: Vec<Record>) -> Message {
+            let mut r = Message::response(q.id);
+            r.questions = q.questions.clone();
+            r.answers = answers;
+            r
+        }
+
+        fn challenge() -> Challenge {
+            Challenge::derive("app.acme.com.au", "acme", "amber-wren-1a2b3c.twnstack.app", b"s")
+        }
+
+        #[tokio::test]
+        async fn follows_a_multi_hop_cname_chain_to_our_target() {
+            let ch = challenge();
+            let addr = serve(
+                |q| {
+                    let name = q.questions[0].name.to_ascii();
+                    let rec = |from: &str, to: &str| {
+                        Record::new(Name::from_ascii(from).unwrap(), 60, RData::Cname(Name::from_ascii(to).unwrap()))
+                    };
+                    match name.as_str() {
+                        "app.acme.com.au." => reply_to(q, vec![rec("app.acme.com.au", "edge.vendor.example")]),
+                        "edge.vendor.example." => reply_to(q, vec![rec("edge.vendor.example", "amber-wren-1a2b3c.twnstack.app")]),
+                        _ => reply_to(q, vec![]),
+                    }
+                },
+                false,
+            )
+            .await;
+            let observed = NativeProbe::with_resolvers(vec![addr]).observe(&ch).await;
+            assert!(observed.proves(&ch), "chain landed on the target: {observed:?}");
+        }
+
+        #[tokio::test]
+        async fn txt_proof_is_read_and_segments_are_joined() {
+            let ch = challenge();
+            let token = ch.token.clone();
+            let addr = serve(
+                move |q| {
+                    if q.questions[0].qtype == RecordType::Txt {
+                        let (a, b) = token.split_at(30);
+                        reply_to(q, vec![
+                            Record::new(q.questions[0].name.clone(), 60, RData::Txt(vec![b"v=spf1 ~all".to_vec()])),
+                            Record::new(q.questions[0].name.clone(), 60, RData::Txt(vec![a.as_bytes().to_vec(), b.as_bytes().to_vec()])),
+                        ])
+                    } else {
+                        reply_to(q, vec![])
+                    }
+                },
+                false,
+            )
+            .await;
+            assert!(NativeProbe::with_resolvers(vec![addr]).observe(&ch).await.proves(&ch));
+        }
+
+        #[tokio::test]
+        async fn truncated_udp_answers_are_retried_over_tcp() {
+            let ch = challenge();
+            let token = ch.token.clone();
+            let addr = serve(
+                move |q| {
+                    reply_to(q, vec![Record::new(q.questions[0].name.clone(), 60, RData::Txt(vec![token.clone().into_bytes()]))])
+                },
+                true,
+            )
+            .await;
+            assert!(NativeProbe::with_resolvers(vec![addr]).observe(&ch).await.proves(&ch));
+        }
+
+        #[tokio::test]
+        async fn a_dead_first_resolver_fails_over_to_the_next() {
+            let ch = challenge();
+            let token = ch.token.clone();
+            let live = serve(
+                move |q| reply_to(q, vec![Record::new(q.questions[0].name.clone(), 60, RData::Txt(vec![token.clone().into_bytes()]))]),
+                false,
+            )
+            .await;
+            // A bound-but-silent UDP socket: the first recursor never answers.
+            let dead = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let mut probe = NativeProbe::with_resolvers(vec![dead.local_addr().unwrap(), live]);
+            probe.timeout = Duration::from_millis(300);
+            assert!(probe.observe(&ch).await.proves(&ch));
+        }
+
+        #[tokio::test]
+        async fn a_reply_with_the_wrong_question_is_not_believed() {
+            let ch = challenge();
+            let token = ch.token.clone();
+            let addr = serve(
+                move |q| {
+                    // Spoof-shaped: right id, but the echoed question is for another name.
+                    let mut r = reply_to(q, vec![Record::new(q.questions[0].name.clone(), 60, RData::Txt(vec![token.clone().into_bytes()]))]);
+                    r.questions = vec![Question::new(Name::from_ascii("other.example").unwrap(), q.questions[0].qtype)];
+                    r
+                },
+                false,
+            )
+            .await;
+            assert!(!NativeProbe::with_resolvers(vec![addr]).observe(&ch).await.proves(&ch));
+        }
+    }
 }
 
-#[cfg(feature = "bind-edge-dns")]
-pub use hickory_probe::HickoryProbe;
+#[cfg(feature = "native")]
+pub use native_probe::NativeProbe;
 
 #[cfg(test)]
 mod tests {
