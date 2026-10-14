@@ -816,7 +816,7 @@ impl QuicEndpoint {
         let secret_key_bytes = hashtrinity::crypto::rand_bytes(32);
         let mut secret_key = [0u8; 32];
         secret_key.copy_from_slice(&secret_key_bytes);
-        let peer_id = hashtrinity::crypto::ed25519_pubkey(&secret_key);
+        let peer_id = crate::prim::ed25519_pubkey(&secret_key);
         Ok(QuicEndpoint { socket: Arc::new(socket), peer_id, secret_key })
     }
 
@@ -845,7 +845,7 @@ impl QuicEndpoint {
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "no CRYPTO frame in handshake response"))?;
         let peer_msg = HandshakeMsg::from_bytes(&peer_bytes)?;
 
-        let (peer_id, send_key, recv_key) = resolve_session_keys(&ephemeral_secret, &own_msg, &peer_msg, true);
+        let (peer_id, send_key, recv_key) = resolve_session_keys(&ephemeral_secret, &own_msg, &peer_msg, true)?;
         Ok(QuicConnection::spawn(self.socket.clone(), addr, peer_id, send_key, recv_key))
     }
 
@@ -867,7 +867,7 @@ impl QuicEndpoint {
             let sealed = seal_quic_packet(&initial_key, &initial_iv, 0, &[crypto_frame]);
             self.socket.send_to(&sealed, src).await?;
 
-            let (peer_id, send_key, recv_key) = resolve_session_keys(&ephemeral_secret, &own_msg, &peer_msg, false);
+            let (peer_id, send_key, recv_key) = resolve_session_keys(&ephemeral_secret, &own_msg, &peer_msg, false)?;
             return Ok(QuicConnection::spawn(self.socket.clone(), src, peer_id, send_key, recv_key));
         }
     }

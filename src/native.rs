@@ -40,8 +40,7 @@
 
 use super::{BiStream, BoxFuture, Connection, PeerId, Transport};
 use hashtrinity::crypto::blake3;
-use hashtrinity::crypto::chacha_poly::{chacha20poly1305_decrypt, chacha20poly1305_encrypt};
-use hashtrinity::crypto::{ed25519_pubkey, ed25519_sign, ed25519_verify, x25519};
+use crate::prim::{chacha20poly1305_decrypt, chacha20poly1305_encrypt, ed25519_pubkey, ed25519_sign, ed25519_verify, x25519_pubkey, x25519_shared};
 use std::collections::HashMap;
 use std::io;
 
@@ -127,7 +126,7 @@ pub(super) fn generate_ephemeral_x25519() -> ([u8; 32], [u8; 32]) {
     let ephemeral_secret_bytes = hashtrinity::crypto::rand_bytes(32);
     let mut ephemeral_secret = [0u8; 32];
     ephemeral_secret.copy_from_slice(&ephemeral_secret_bytes);
-    let ephemeral_pubkey = x25519(&ephemeral_secret, &X25519_BASEPOINT);
+    let ephemeral_pubkey = x25519_pubkey(&ephemeral_secret);
     (ephemeral_secret, ephemeral_pubkey)
 }
 
@@ -139,12 +138,15 @@ pub(super) fn resolve_session_keys(
     own_msg: &HandshakeMsg,
     peer_msg: &HandshakeMsg,
     is_client: bool,
-) -> (PeerId, [u8; 32], [u8; 32]) {
-    let shared_secret = x25519(ephemeral_secret, &peer_msg.ephemeral_pubkey);
+) -> io::Result<(PeerId, [u8; 32], [u8; 32])> {
+    // A low-order peer point forces an all-zero shared secret (a known contributory-behaviour
+    // attack: the "session key" would be computable by anyone). Refuse the handshake.
+    let shared_secret = x25519_shared(ephemeral_secret, &peer_msg.ephemeral_pubkey)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "peer ephemeral key is of low order"))?;
     let (client_msg, server_msg) = if is_client { (own_msg, peer_msg) } else { (peer_msg, own_msg) };
     let (c2s_key, s2c_key) = derive_session_keys(&shared_secret, client_msg, server_msg);
     let (send_key, recv_key) = if is_client { (c2s_key, s2c_key) } else { (s2c_key, c2s_key) };
-    (peer_msg.static_pubkey, send_key, recv_key)
+    Ok((peer_msg.static_pubkey, send_key, recv_key))
 }
 
 /// Run the handshake over a fresh TCP stream. `is_client` picks send-then-recv vs
@@ -173,7 +175,7 @@ async fn run_handshake(
         peer_msg
     };
 
-    Ok(resolve_session_keys(&ephemeral_secret, &own_msg, &peer_msg, is_client))
+    resolve_session_keys(&ephemeral_secret, &own_msg, &peer_msg, is_client)
 }
 
 /// Seal one frame: `[u32 stream_id][u64 len][payload]` sealed as a whole under
@@ -262,7 +264,7 @@ impl NativeEndpoint {
         let secret_key_bytes = hashtrinity::crypto::rand_bytes(32);
         let mut secret_key = [0u8; 32];
         secret_key.copy_from_slice(&secret_key_bytes);
-        let peer_id = hashtrinity::crypto::ed25519_pubkey(&secret_key);
+        let peer_id = crate::prim::ed25519_pubkey(&secret_key);
         Ok(NativeEndpoint {
             listener: Arc::new(listener),
             peer_id,
@@ -274,7 +276,7 @@ impl NativeEndpoint {
     /// Bind with a specific secret key (for identity recovery / persistence).
     pub async fn bind_with_key(addr: &str, secret_key: [u8; 32]) -> io::Result<Self> {
         let listener = TcpListener::bind(addr).await?;
-        let peer_id = hashtrinity::crypto::ed25519_pubkey(&secret_key);
+        let peer_id = crate::prim::ed25519_pubkey(&secret_key);
         Ok(NativeEndpoint {
             listener: Arc::new(listener),
             peer_id,

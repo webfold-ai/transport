@@ -377,6 +377,13 @@ impl AcmeClient {
         Ok(())
     }
 
+    /// The CA-assigned account URL (the ACME `kid`) once registered — the value to put in a CAA
+    /// `accounturi=` parameter (RFC 8657) so only this account can obtain certificates.
+    #[must_use]
+    pub fn account_url(&self) -> Option<String> {
+        self.kid.lock().ok().and_then(|k| k.clone())
+    }
+
     fn kid(&self) -> Result<String, AcmeError> {
         self.kid.lock().unwrap().clone().ok_or_else(|| AcmeError::BadResponse("no account kid yet".to_string()))
     }

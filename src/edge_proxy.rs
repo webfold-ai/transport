@@ -865,7 +865,11 @@ pub mod sni {
             .key_provider
             .load_private_key(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_der)))
             .ok()?;
-        Some(CertifiedKey::new(chain, key))
+        let certified = CertifiedKey::new(chain, key);
+        // A chain whose leaf does not belong to the private key can only ever fail handshakes
+        // (or, worse, mask a mixed-up install): refuse it here rather than serve it.
+        certified.keys_match().ok()?;
+        Some(certified)
     }
 }
 
@@ -1086,27 +1090,14 @@ mod sni_tests {
     use crate::edge::CertMaterial;
     use std::sync::Arc;
 
-    /// A syntactically valid chain block (rustls does not validate chain contents when
-    /// building a `CertifiedKey`) plus a real P-256 PKCS#8 key from the ACME module.
-    fn material(tag: &str) -> CertMaterial {
-        let sk = crate::acme::generate_cert_key();
-        let b64 = |s: &str| {
-            // standard base64 of `s`, via the same writer the ACME module uses for PEM
-            let mut out = String::new();
-            const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-            for c in s.as_bytes().chunks(3) {
-                let n = (u32::from(c[0]) << 16) | (u32::from(*c.get(1).unwrap_or(&0)) << 8) | u32::from(*c.get(2).unwrap_or(&0));
-                out.push(A[(n >> 18 & 63) as usize] as char);
-                out.push(A[(n >> 12 & 63) as usize] as char);
-                out.push(if c.len() > 1 { A[(n >> 6 & 63) as usize] as char } else { '=' });
-                out.push(if c.len() > 2 { A[(n & 63) as usize] as char } else { '=' });
-            }
-            out
-        };
-        CertMaterial {
-            chain_pem: format!("-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n", b64(tag)),
-            key_pem: crate::acme::p256_key_to_pkcs8_pem(&sk),
-        }
+    /// A real self-signed P-256 certificate + PKCS#8 key for `name` (a wildcard name becomes a
+    /// wildcard SAN). Real material matters: the resolver refuses chains whose leaf does not
+    /// belong to the key.
+    fn material(name: &str) -> CertMaterial {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let params = rcgen::CertificateParams::new(vec![name.to_string()]).unwrap();
+        let cert = params.self_signed(&key).unwrap();
+        CertMaterial { chain_pem: cert.pem(), key_pem: key.serialize_pem() }
     }
 
     fn resolver() -> (Arc<MemoryCertSource>, Arc<EdgeCertResolver>) {
@@ -1117,8 +1108,8 @@ mod sni_tests {
     #[test]
     fn managed_names_get_the_apex_wildcard_and_custom_names_their_own_cert() {
         let (src, r) = resolver();
-        src.install("*.tascloud.app", material("wild"));
-        src.install("app.acme.com.au", material("custom"));
+        src.install("*.tascloud.app", material("*.tascloud.app"));
+        src.install("app.acme.com.au", material("app.acme.com.au"));
         assert!(r.certified_key_for("amber-wren-1a2b3c.tascloud.app").is_some());
         assert!(r.certified_key_for("app.acme.com.au").is_some());
         assert!(r.certified_key_for("AMBER-wren-1a2b3c.TASCLOUD.app.").is_some(), "SNI is case-insensitive");
@@ -1127,7 +1118,7 @@ mod sni_tests {
     #[test]
     fn names_the_wildcard_does_not_cover_are_refused_not_served_a_wrong_cert() {
         let (src, r) = resolver();
-        src.install("*.tascloud.app", material("wild"));
+        src.install("*.tascloud.app", material("*.tascloud.app"));
         assert!(r.certified_key_for("deep.nested.tascloud.app").is_none(), "wildcard covers one label");
         assert!(r.certified_key_for("tascloud.app").is_none(), "the bare apex is not covered");
         assert!(r.certified_key_for("other.example.org").is_none());
@@ -1137,11 +1128,11 @@ mod sni_tests {
     #[test]
     fn a_renewal_installed_into_the_source_is_served_by_the_next_handshake() {
         let (src, r) = resolver();
-        src.install("app.acme.com.au", material("v1"));
+        src.install("app.acme.com.au", material("app.acme.com.au"));
         let a = r.certified_key_for("app.acme.com.au").unwrap();
         let again = r.certified_key_for("app.acme.com.au").unwrap();
         assert!(Arc::ptr_eq(&a, &again), "unchanged material is parsed once, not per handshake");
-        src.install("app.acme.com.au", material("v2"));
+        src.install("app.acme.com.au", material("app.acme.com.au"));
         let b = r.certified_key_for("app.acme.com.au").unwrap();
         assert!(!Arc::ptr_eq(&a, &b), "renewed material replaces the cached key");
     }
@@ -1149,9 +1140,9 @@ mod sni_tests {
     #[test]
     fn corrupt_material_resolves_to_no_certificate_without_poisoning_other_names() {
         let (src, r) = resolver();
-        src.install("good.example.com", material("g"));
+        src.install("good.example.com", material("good.example.com"));
         src.install("bad.example.com", CertMaterial { chain_pem: "garbage".into(), key_pem: "garbage".into() });
-        src.install("nokey.example.com", CertMaterial { chain_pem: material("x").chain_pem, key_pem: String::new() });
+        src.install("nokey.example.com", CertMaterial { chain_pem: material("nokey.example.com").chain_pem, key_pem: String::new() });
         assert!(r.certified_key_for("bad.example.com").is_none());
         assert!(r.certified_key_for("nokey.example.com").is_none());
         assert!(r.certified_key_for("good.example.com").is_some());
@@ -1162,6 +1153,77 @@ mod sni_tests {
         let (_src, r) = resolver();
         let cfg = r.server_config().expect("server config");
         assert_eq!(cfg.fips(), cfg!(feature = "fips"), "FIPS status must match the build");
+    }
+
+    #[test]
+    fn a_chain_whose_leaf_does_not_belong_to_the_key_is_refused() {
+        let (src, r) = resolver();
+        let a = material("a.example.com");
+        let b = material("a.example.com");
+        src.install("a.example.com", CertMaterial { chain_pem: a.chain_pem, key_pem: b.key_pem });
+        assert!(r.certified_key_for("a.example.com").is_none(), "mismatched cert/key must never be served");
+    }
+
+    /// The real thing: a TLS handshake through the resolver, one listener, two names, two certificates.
+    #[tokio::test]
+    async fn one_listener_presents_the_right_certificate_per_sni_and_refuses_the_rest() {
+        use rustls::pki_types::{CertificateDer, ServerName};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (src, r) = resolver();
+        let wild = material("*.tascloud.app");
+        let custom = material("app.acme.com.au");
+        src.install("*.tascloud.app", wild.clone());
+        src.install("app.acme.com.au", custom.clone());
+        let acceptor = tokio_rustls::TlsAcceptor::from(r.server_config().unwrap());
+
+        let client_for = |trust: &CertMaterial| {
+            let mut roots = rustls::RootCertStore::empty();
+            for der in crate::pem::blocks(&trust.chain_pem, "CERTIFICATE") {
+                roots.add(CertificateDer::from(der)).unwrap();
+            }
+            let cfg = rustls::ClientConfig::builder_with_provider(Arc::new(super::sni::provider()))
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_root_certificates(roots)
+                .with_no_client_auth();
+            tokio_rustls::TlsConnector::from(Arc::new(cfg))
+        };
+
+        // (trust anchor the client holds, SNI it sends, expect success)
+        let cases = [
+            (&wild, "amber-wren-1a2b3c.tascloud.app", true),
+            (&custom, "app.acme.com.au", true),
+            (&wild, "deep.nested.tascloud.app", false), // wildcard covers one label
+            (&custom, "unknown.example.org", false),    // no certificate => handshake refused
+            (&custom, "amber-wren-1a2b3c.tascloud.app", false), // right name, wrong trust anchor
+        ];
+        for (trust, sni, expect_ok) in cases {
+            let (client_io, server_io) = tokio::io::duplex(16 * 1024);
+            let acceptor = acceptor.clone();
+            let server = tokio::spawn(async move {
+                let mut tls = acceptor.accept(server_io).await?;
+                tls.write_all(b"hello").await?;
+                tls.shutdown().await?;
+                Ok::<_, std::io::Error>(())
+            });
+            let connector = client_for(trust);
+            let name = ServerName::try_from(sni.to_string()).unwrap();
+            let outcome = connector.connect(name, client_io).await;
+            match (expect_ok, outcome) {
+                (true, Ok(mut tls)) => {
+                    let mut buf = Vec::new();
+                    tls.read_to_end(&mut buf).await.ok();
+                    assert_eq!(buf, b"hello", "{sni}");
+                    assert!(server.await.unwrap().is_ok(), "{sni}: server side");
+                }
+                (false, Err(_)) => {
+                    let _ = server.await;
+                }
+                (true, Err(e)) => panic!("{sni}: expected a handshake, got {e}"),
+                (false, Ok(_)) => panic!("{sni}: expected the handshake to be refused"),
+            }
+        }
     }
 }
 
@@ -1234,4 +1296,3 @@ mod passthrough_tests {
         assert!(matches!(decide_passthrough(&reg, &pool, Some("secure.acme.com.au")), Decision::Serve(_)));
     }
 }
-

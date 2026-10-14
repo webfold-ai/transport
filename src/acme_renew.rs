@@ -446,8 +446,9 @@ impl<S: CertStore, I: CertIssuer> RenewalEngine<S, I> {
         let exp = failures.saturating_sub(1).min(20);
         let base = self.policy.retry_base_secs.saturating_mul(1u64 << exp).min(self.policy.retry_max_secs);
         let d = sha256(format!("{name}:{failures}").as_bytes());
-        let per_mille = i64::from(u16::from_be_bytes([d[0], d[1]]) % 201) - 100; // -100..=100
-        let base_i = i64::try_from(base).unwrap_or(i64::MAX / 2);
+        let per_mille = i128::from(u16::from_be_bytes([d[0], d[1]]) % 201) - 100; // -100..=100
+        // i128 so a very large configured `retry_max_secs` cannot overflow the multiplication.
+        let base_i = i128::from(base);
         let jittered = u64::try_from(base_i + base_i * per_mille / 1000).unwrap_or(base);
         jittered.max(retry_after.unwrap_or(0).min(7 * 24 * 3600))
     }
@@ -863,6 +864,19 @@ PfFwXFUdKr72euUqW9E4wdcMVA==\n\
         assert!(eng.backoff_secs("x", 1, Some(5 * 3600)) >= 5 * 3600, "Retry-After wins over a short backoff");
         assert!(eng.backoff_secs("x", 1, Some(90 * DAY as u64)) <= 7 * 24 * 3600, "a silly Retry-After is capped");
         assert_ne!(eng.backoff_secs("a", 3, None), eng.backoff_secs("b", 3, None), "per-name jitter de-synchronises retries");
+    }
+
+    #[tokio::test]
+    async fn an_absurdly_large_retry_cap_does_not_overflow_the_jitter() {
+        let (iss, _) = issuer(|_, _| Ok(ninety_days(T0)));
+        let eng = RenewalEngine::new(
+            Arc::new(MemoryCertSource::new()),
+            iss,
+            RenewalPolicy { retry_max_secs: u64::MAX, retry_base_secs: u64::MAX / 2, ..RenewalPolicy::default() },
+        );
+        for failures in [1, 2, 30, u32::MAX] {
+            let _ = eng.backoff_secs("x", failures, None); // must not panic in debug builds
+        }
     }
 
     #[tokio::test]

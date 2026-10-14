@@ -372,6 +372,9 @@ pub enum EdgeError {
     NotFound(String),
     /// The caller's tenant does not own this hostname.
     Forbidden(String),
+    /// The operation is not valid in the hostname's current state (e.g. resuming one that is
+    /// not suspended, or suspending a failed one).
+    BadState(String),
     /// The CNAME proof target is not an active managed hostname owned by this tenant.
     InvalidCnameTarget(String),
     /// Every generation attempt collided — the label space for this dialkey is exhausted,
@@ -387,6 +390,7 @@ impl std::fmt::Display for EdgeError {
             EdgeError::Taken(h) => write!(f, "hostname already taken: {h}"),
             EdgeError::NotFound(h) => write!(f, "no such hostname: {h}"),
             EdgeError::Forbidden(h) => write!(f, "hostname belongs to another tenant: {h}"),
+            EdgeError::BadState(h) => write!(f, "operation not valid in the current state of: {h}"),
             EdgeError::InvalidCnameTarget(t) => {
                 write!(f, "CNAME target must be an active managed hostname of this tenant: {t}")
             }
@@ -433,6 +437,10 @@ pub struct EdgeRegistry {
     secret: Vec<u8>,
     /// Released managed label -> (releasing tenant, quarantined until unix seconds).
     quarantine: Table<String, (String, u64)>,
+    /// Hostname -> the state it was in when suspended, so `resume` restores exactly that. Without
+    /// it `resume` had to pick a state, and picking `Active` lifted proof-of-control and
+    /// certificate gates for names that had never passed them.
+    held: Table<String, HostnameState>,
     clock: Clock,
 }
 
@@ -454,6 +462,7 @@ impl EdgeRegistry {
             probes: Table::new(),
             secret: secret.into(),
             quarantine: Table::new(),
+            held: Table::new(),
             clock,
         }
     }
@@ -746,25 +755,34 @@ impl EdgeRegistry {
     }
 
     /// Suspend a hostname — it keeps resolving (so the customer sees our page, not a dead
-    /// name) but the edge refuses to proxy it.
+    /// name) but the edge refuses to proxy it. Valid from any live state (`PendingDns`,
+    /// `PendingCert`, `Active`); the prior state is remembered for [`Self::resume`].
     pub fn suspend(&mut self, tenant_id: &str, fqdn: &str) -> Result<(), EdgeError> {
-        self.set_state_checked(tenant_id, fqdn, HostnameState::Suspended)
-    }
-
-    /// Un-suspend back to `Active`.
-    pub fn resume(&mut self, tenant_id: &str, fqdn: &str) -> Result<(), EdgeError> {
-        self.set_state_checked(tenant_id, fqdn, HostnameState::Active)
-    }
-
-    fn set_state_checked(
-        &mut self,
-        tenant_id: &str,
-        fqdn: &str,
-        state: HostnameState,
-    ) -> Result<(), EdgeError> {
         let fqdn = normalize(fqdn);
         let mut record = self.get_for_tenant(tenant_id, &fqdn)?.clone();
-        record.state = state;
+        match &record.state {
+            HostnameState::Suspended => return Ok(()), // idempotent: keep the original prior state
+            HostnameState::Failed(_) => return Err(EdgeError::BadState(fqdn)),
+            prior => {
+                self.held.put(fqdn.clone(), prior.clone());
+            }
+        }
+        record.state = HostnameState::Suspended;
+        self.hosts.put(fqdn, record);
+        Ok(())
+    }
+
+    /// Lift a suspension, restoring the state the hostname was suspended from. Only a
+    /// `Suspended` hostname can be resumed: this is not a way to skip validation, to revive a
+    /// failed hostname, or to mark anything `Active`.
+    pub fn resume(&mut self, tenant_id: &str, fqdn: &str) -> Result<(), EdgeError> {
+        let fqdn = normalize(fqdn);
+        let mut record = self.get_for_tenant(tenant_id, &fqdn)?.clone();
+        if record.state != HostnameState::Suspended {
+            return Err(EdgeError::BadState(fqdn));
+        }
+        record.state = self.held.get(&fqdn).cloned().unwrap_or(HostnameState::PendingDns);
+        self.held.remove(&fqdn);
         self.hosts.put(fqdn, record);
         Ok(())
     }
@@ -778,6 +796,7 @@ impl EdgeRegistry {
         self.hosts.remove(&fqdn);
         self.owner.remove(&fqdn);
         self.probes.remove(&fqdn);
+        self.held.remove(&fqdn);
         if kind == HostnameKind::Managed {
             let until = (self.clock)().saturating_add(RELEASE_QUARANTINE_SECS);
             self.quarantine.put(fqdn, (tenant_id.to_string(), until));
@@ -1156,6 +1175,39 @@ mod tests {
         ));
         reg.resume("acme", "mine.tascloud.app").unwrap();
         assert!(reg.add_custom("app.acme.com.au", "MINE.tascloud.app.", route("acme", "t")).is_ok());
+    }
+
+    #[test]
+    fn resume_restores_the_prior_state_and_cannot_skip_validation() {
+        let mut reg = EdgeRegistry::new(b"s".to_vec());
+        claim_target(&mut reg, "acme", "x");
+        reg.add_custom("a.acme.com.au", "x.tascloud.app", route("acme", "t1")).unwrap();
+        assert_eq!(reg.lookup("a.acme.com.au").unwrap().state, HostnameState::PendingDns);
+
+        // The bypass: suspend + resume used to turn an UNPROVEN name Active.
+        reg.suspend("acme", "a.acme.com.au").unwrap();
+        reg.resume("acme", "a.acme.com.au").unwrap();
+        assert_eq!(reg.lookup("a.acme.com.au").unwrap().state, HostnameState::PendingDns, "still has to prove control");
+        assert_eq!(reg.pending_validation().len(), 1);
+
+        // Resuming something that is not suspended is an error, not a promotion.
+        assert!(matches!(reg.resume("acme", "a.acme.com.au"), Err(EdgeError::BadState(_))));
+        reg.record_probe("a.acme.com.au", true, 5).unwrap();
+        assert!(matches!(reg.resume("acme", "a.acme.com.au"), Err(EdgeError::BadState(_))));
+        assert_eq!(reg.lookup("a.acme.com.au").unwrap().state, HostnameState::PendingCert, "no cert yet, so not Active");
+
+        // Suspend is idempotent and does not overwrite the remembered state.
+        reg.suspend("acme", "a.acme.com.au").unwrap();
+        reg.suspend("acme", "a.acme.com.au").unwrap();
+        reg.resume("acme", "a.acme.com.au").unwrap();
+        assert_eq!(reg.lookup("a.acme.com.au").unwrap().state, HostnameState::PendingCert);
+
+        // A failed hostname can be neither suspended nor resumed into service.
+        reg.cert_failed("a.acme.com.au", "nope");
+        assert!(matches!(reg.suspend("acme", "a.acme.com.au"), Err(EdgeError::BadState(_))));
+        assert!(matches!(reg.resume("acme", "a.acme.com.au"), Err(EdgeError::BadState(_))));
+        // Tenancy still applies.
+        assert!(matches!(reg.resume("rival", "a.acme.com.au"), Err(EdgeError::Forbidden(_))));
     }
 
     #[test]

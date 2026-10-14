@@ -76,5 +76,7 @@ pkarr = { version = "8.0.1", optional = true }
 # could not even compile them. Dev-only: the lib itself still builds with no tokio at all.
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros"] }
+# Real certificates for the SNI-resolver and handshake tests (keys_match rejects fabricated pairs).
+rcgen = "0.13"
 
 [workspace]

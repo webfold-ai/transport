@@ -42,6 +42,9 @@ pub mod load_balance;
 pub mod edge;
 /// PEM / base64 plumbing for the certificate paths.
 pub mod pem;
+/// The primitives the secure channel and signed records use: aws-lc-rs (FIPS-capable), with a
+/// hashtrinity fallback for the dependency-free core.
+pub mod prim;
 /// ClientHello SNI peeking for TLS passthrough routing.
 pub mod tls_hello;
 pub mod edge_dns;
