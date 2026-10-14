@@ -4,7 +4,7 @@
 //! types: HTTP-01 ([`AcmeClient::issue`] — the default, no DNS provider API dependency, and
 //! the edge already terminates plain HTTP for exactly this purpose per
 //! [`crate::edge::HostnameRecord::requires_tls`]) and DNS-01 ([`AcmeClient::issue_dns01`] —
-//! required for wildcard names, the only way to validate `*.twnstack.app` because no HTTP
+//! required for wildcard names, the only way to validate `*.tascloud.app` because no HTTP
 //! request can be made to a wildcard, and the natural choice for any apex under an HSTS-
 //! preloaded TLD where the browser refuses plaintext before the cert exists).
 //!
@@ -604,7 +604,7 @@ fn is_valid_p256_scalar(s: &[u8; 32]) -> bool {
 
 /// A fresh certificate private key. Rejection-sampled: a uniformly random 32 bytes is outside
 /// `[1, n-1]` with probability ~2^-32, and `p256_pubkey` of an out-of-range scalar is not a key.
-fn random_p256_scalar() -> [u8; 32] {
+pub(crate) fn random_p256_scalar() -> [u8; 32] {
     loop {
         let bytes = hashtrinity::crypto::rand_bytes(32);
         let mut s = [0u8; 32];
@@ -645,7 +645,7 @@ pub(crate) fn csr_p256(sk: &[u8; 32], domains: &[&str]) -> Vec<u8> {
 /// PKCS#8 `PrivateKeyInfo` for a P-256 key, PEM-wrapped, in the shape `openssl genpkey` emits
 /// (the SEC1 `ECPrivateKey` carries the public point) — what `CertMaterial::key_pem` promises
 /// and what `servelet_tls::tls_server_config` / `hashtrinity::rustls` load.
-fn p256_key_to_pkcs8_pem(sk: &[u8; 32]) -> String {
+pub(crate) fn p256_key_to_pkcs8_pem(sk: &[u8; 32]) -> String {
     let ec_private_key = der::seq(&[
         der::uint(&[1]),
         der::tlv(0x04, sk),
@@ -827,11 +827,11 @@ mod tests {
     #[test]
     fn csr_is_a_valid_self_signed_p256_pkcs10() {
         let sk = [0x42u8; 32];
-        let csr = csr_p256(&sk, &["*.twnstack.app", "twnstack.app"]);
+        let csr = csr_p256(&sk, &["*.tascloud.app", "tascloud.app"]);
         let (cri, pk, sig) = split_csr(&csr);
         assert_eq!(pk, p256_pubkey(&sk));
         assert!(hashtrinity::crypto::ecdsa_p256_verify(&pk, &sha256(&cri), &sig), "CSR proves possession of the key");
-        for d in ["*.twnstack.app", "twnstack.app"] {
+        for d in ["*.tascloud.app", "tascloud.app"] {
             assert!(cri.windows(d.len()).any(|w| w == d.as_bytes()), "{d} must be a SAN");
         }
         // Tampering with the request info invalidates the signature.
@@ -989,11 +989,11 @@ mod tests {
                 // Validate like a CA: the expected TXT value must be live in DNS right now.
                 let token = format!("tok{n}");
                 let expect = b64url(&sha256(acme_key_authorization(&token, &st.thumbprint).as_bytes()));
-                st.dns.as_ref().unwrap().published.lock().unwrap().iter().any(|(name, v)| name == "twnstack.app" && *v == expect)
+                st.dns.as_ref().unwrap().published.lock().unwrap().iter().any(|(name, v)| name == "tascloud.app" && *v == expect)
             };
             let status = if done { "valid" } else { "pending" };
             format!(
-                r#"{{"status":"{status}","identifier":{{"type":"dns","value":"twnstack.app"}},"wildcard":{},"challenges":[{{"type":"http-01","url":"{b}/chall/{n}","token":"x","status":"pending"}},{{"type":"dns-01","url":"{b}/chall/{n}","token":"tok{n}","status":"{status}"}}]}}"#,
+                r#"{{"status":"{status}","identifier":{{"type":"dns","value":"tascloud.app"}},"wildcard":{},"challenges":[{{"type":"http-01","url":"{b}/chall/{n}","token":"x","status":"pending"}},{{"type":"dns-01","url":"{b}/chall/{n}","token":"tok{n}","status":"{status}"}}]}}"#,
                 n == 1,
                 b = st.base
             )
@@ -1061,7 +1061,7 @@ mod tests {
                             let csr = b64url_decode_for_test(v["csr"].as_str().unwrap());
                             let (cri, pk, sig) = split_csr(&csr);
                             st.finalized_csr_ok = hashtrinity::crypto::ecdsa_p256_verify(&pk, &sha256(&cri), &sig)
-                                && cri.windows(14).any(|w| w == b"*.twnstack.app");
+                                && cri.windows(14).any(|w| w == b"*.tascloud.app");
                             let b = st.base.clone();
                             ok(st, 200, vec![], format!(r#"{{"status":"valid","authorizations":[],"finalize":"{b}/finalize/1","certificate":"{b}/cert/1"}}"#))
                         }
@@ -1142,7 +1142,7 @@ mod tests {
         state.lock().unwrap().inject_bad_nonce_once = true;
 
         let client = AcmeClient::new(&dir, account, Some("ops@example.test")).await.expect("account registers");
-        let cert = client.issue_dns01(&["*.twnstack.app", "twnstack.app"], dns.as_ref()).await.expect("order completes");
+        let cert = client.issue_dns01(&["*.tascloud.app", "tascloud.app"], dns.as_ref()).await.expect("order completes");
 
         assert!(cert.chain_pem.contains("BEGIN CERTIFICATE"));
         assert!(cert.key_pem.starts_with("-----BEGIN PRIVATE KEY-----"));
@@ -1151,7 +1151,7 @@ mod tests {
         assert_eq!(st.bad_nonce_seen, 0, "the injected badNonce was retried transparently, not a client bug");
         let published = dns.published.lock().unwrap();
         assert_eq!(published.len(), 2, "wildcard + apex both need a TXT value at the same name");
-        assert!(published.iter().all(|(n, _)| n == "twnstack.app"));
+        assert!(published.iter().all(|(n, _)| n == "tascloud.app"));
         assert_eq!(dns.removed.lock().unwrap().len(), 2, "every challenge value is cleaned up afterwards");
     }
 
@@ -1161,7 +1161,7 @@ mod tests {
         let (dir, state, dns) = mock_ca::start(&account).await;
         state.lock().unwrap().rate_limit_new_order = true;
         let client = AcmeClient::new(&dir, account, None).await.unwrap();
-        let err = client.issue_dns01(&["*.twnstack.app", "twnstack.app"], dns.as_ref()).await.unwrap_err();
+        let err = client.issue_dns01(&["*.tascloud.app", "tascloud.app"], dns.as_ref()).await.unwrap_err();
         assert!(matches!(err, AcmeError::RateLimited { retry_after_secs: Some(3600), .. }), "{err}");
         assert_eq!(err.retry_after_secs(), Some(3600));
         assert!(dns.published.lock().unwrap().is_empty(), "no challenge was published for a refused order");

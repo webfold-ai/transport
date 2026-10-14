@@ -5,7 +5,7 @@
 //! resolving the moment it is released, with no zone reload in between. That is the whole
 //! reason to run our own authority rather than script an external DNS provider's API.
 //!
-//! It also makes ACME **DNS-01** trivial for the apex wildcards (`*.twnstack.app` cannot be
+//! It also makes ACME **DNS-01** trivial for the apex wildcards (`*.tascloud.app` cannot be
 //! validated any other way — there is no HTTP request you can make to a wildcard): the
 //! issuance worker calls [`ZoneAuthority::set_acme_token`] and the challenge is live on the
 //! next query.
@@ -62,11 +62,11 @@ pub const ACME_LABEL: &str = "_acme-challenge";
 /// One apex zone's authority parameters.
 #[derive(Clone, Debug)]
 pub struct ZoneConfig {
-    /// The apex, e.g. `"twnstack.app"`.
+    /// The apex, e.g. `"tascloud.app"`.
     pub zone: String,
     /// Primary nameserver name for the SOA `mname`.
     pub primary_ns: String,
-    /// Hostmaster address, in DNS form (`hostmaster.twnstack.app`).
+    /// Hostmaster address, in DNS form (`hostmaster.tascloud.app`).
     pub hostmaster: String,
     /// Authoritative nameservers to publish as NS records.
     pub nameservers: Vec<String>,
@@ -310,7 +310,7 @@ impl ZoneAuthority {
                         })
                         .collect(),
                 ),
-                // The apex resolves to the edge too, so `https://twnstack.app` is not a dead
+                // The apex resolves to the edge too, so `https://tascloud.app` is not a dead
                 // name — but it is NOT a customer hostname and routes to the platform's own
                 // landing service, which is `transport::edge`'s call, not DNS's.
                 RecordType::A | RecordType::Aaaa => Resolution::Answers(self.address_records(&name, qtype)),
@@ -530,7 +530,7 @@ mod tests {
     fn a_claimed_hostname_resolves_to_the_edge() {
         let mut auth = authority();
         let mut reg = EdgeRegistry::new(b"s".to_vec());
-        let apex = APEXES.iter().find(|a| a.zone == "twnstack.app").unwrap();
+        let apex = APEXES.iter().find(|a| a.zone == "tascloud.app").unwrap();
         let rec = reg.claim_managed(apex, "dk-1", route("acme", "tun-1")).unwrap();
 
         let reply = ask(&mut auth, &reg, &rec.fqdn, RecordType::A);
@@ -550,7 +550,7 @@ mod tests {
     fn an_unclaimed_label_is_nxdomain_with_a_soa_not_a_wildcard() {
         let mut auth = authority();
         let reg = EdgeRegistry::new(b"s".to_vec());
-        let reply = ask(&mut auth, &reg, "never-claimed-abc123.twnstack.app", RecordType::A);
+        let reply = ask(&mut auth, &reg, "never-claimed-abc123.tascloud.app", RecordType::A);
         assert_eq!(
             reply.flags.response_code,
             ResponseCode::NxDomain,
@@ -568,7 +568,7 @@ mod tests {
     fn an_existing_name_with_no_such_type_is_nodata_not_nxdomain() {
         let mut auth = authority();
         let mut reg = EdgeRegistry::new(b"s".to_vec());
-        let apex = APEXES.iter().find(|a| a.zone == "twnstack.app").unwrap();
+        let apex = APEXES.iter().find(|a| a.zone == "tascloud.app").unwrap();
         let rec = reg.claim_managed(apex, "dk-1", route("acme", "tun-1")).unwrap();
 
         let reply = ask(&mut auth, &reg, &rec.fqdn, RecordType::Unknown(15));
@@ -599,7 +599,9 @@ mod tests {
     fn custom_hostnames_are_never_answered_from_our_zones() {
         let mut auth = authority();
         let mut reg = EdgeRegistry::new(b"s".to_vec());
-        reg.add_custom("app.example.com.au", "x.twnstack.app", route("acme", "tun-1")).unwrap();
+        let apex = APEXES.iter().find(|a| a.zone == "tascloud.app").unwrap();
+        let target = reg.claim_managed(apex, "dk-t", route("acme", "tun-1")).unwrap();
+        reg.add_custom("app.example.com.au", &target.fqdn, route("acme", "tun-1")).unwrap();
         // Their own DNS points at us; we are not authoritative for their domain.
         let reply = ask(&mut auth, &reg, "app.example.com.au", RecordType::A);
         assert_eq!(reply.flags.response_code, ResponseCode::Refused);
@@ -610,14 +612,14 @@ mod tests {
         let mut auth = authority();
         let reg = EdgeRegistry::new(b"s".to_vec());
 
-        let soa = ask(&mut auth, &reg, "twnstack.app", RecordType::Soa);
+        let soa = ask(&mut auth, &reg, "tascloud.app", RecordType::Soa);
         assert_eq!(soa.answers.len(), 1);
         assert!(matches!(soa.answers[0].data, RData::Soa { .. }));
 
-        let ns = ask(&mut auth, &reg, "twnstack.app", RecordType::Ns);
+        let ns = ask(&mut auth, &reg, "tascloud.app", RecordType::Ns);
         assert_eq!(ns.answers.len(), 2, "both nameservers must be published");
 
-        let caa = ask(&mut auth, &reg, "twnstack.app", RecordType::Caa);
+        let caa = ask(&mut auth, &reg, "tascloud.app", RecordType::Caa);
         assert_eq!(caa.answers.len(), 1, "CAA pins which CA may issue for the zone");
     }
 
@@ -625,9 +627,9 @@ mod tests {
     fn acme_dns01_tokens_are_served_and_can_be_cleared() {
         let mut auth = authority();
         let reg = EdgeRegistry::new(b"s".to_vec());
-        auth.set_acme_token("twnstack.app", "token-one");
+        auth.set_acme_token("tascloud.app", "token-one");
 
-        let reply = ask(&mut auth, &reg, "_acme-challenge.twnstack.app", RecordType::Txt);
+        let reply = ask(&mut auth, &reg, "_acme-challenge.tascloud.app", RecordType::Txt);
         assert_eq!(reply.flags.response_code, ResponseCode::NoError);
         assert_eq!(reply.answers.len(), 1);
         match &reply.answers[0].data {
@@ -635,8 +637,8 @@ mod tests {
             other => panic!("expected TXT, got {other:?}"),
         }
 
-        auth.clear_acme_tokens("twnstack.app");
-        let gone = ask(&mut auth, &reg, "_acme-challenge.twnstack.app", RecordType::Txt);
+        auth.clear_acme_tokens("tascloud.app");
+        let gone = ask(&mut auth, &reg, "_acme-challenge.tascloud.app", RecordType::Txt);
         assert_eq!(gone.flags.response_code, ResponseCode::NxDomain, "a spent challenge stops answering");
     }
 
@@ -646,10 +648,10 @@ mod tests {
         // Answering with only the newest fails the other order.
         let mut auth = authority();
         let reg = EdgeRegistry::new(b"s".to_vec());
-        auth.set_acme_token("twnbox.dev", "token-base");
-        auth.set_acme_token("twnbox.dev", "token-wildcard");
+        auth.set_acme_token("tascloud.dev", "token-base");
+        auth.set_acme_token("tascloud.dev", "token-wildcard");
 
-        let reply = ask(&mut auth, &reg, "_acme-challenge.twnbox.dev", RecordType::Txt);
+        let reply = ask(&mut auth, &reg, "_acme-challenge.tascloud.dev", RecordType::Txt);
         assert_eq!(reply.answers.len(), 2, "both live tokens must be answered");
     }
 
@@ -657,7 +659,7 @@ mod tests {
     fn a_released_hostname_stops_resolving_with_no_zone_reload() {
         let mut auth = authority();
         let mut reg = EdgeRegistry::new(b"s".to_vec());
-        let apex = APEXES.iter().find(|a| a.zone == "twnstack.cloud").unwrap();
+        let apex = APEXES.iter().find(|a| a.zone == "tasmanian.cloud").unwrap();
         let rec = reg.claim_managed(apex, "dk-1", route("acme", "tun-1")).unwrap();
         assert_eq!(ask(&mut auth, &reg, &rec.fqdn, RecordType::A).answers.len(), 1);
 
@@ -673,7 +675,7 @@ mod tests {
     fn a_suspended_hostname_still_resolves_so_the_edge_can_explain() {
         let mut auth = authority();
         let mut reg = EdgeRegistry::new(b"s".to_vec());
-        let apex = APEXES.iter().find(|a| a.zone == "twnstack.cloud").unwrap();
+        let apex = APEXES.iter().find(|a| a.zone == "tasmanian.cloud").unwrap();
         let rec = reg.claim_managed(apex, "dk-1", route("acme", "tun-1")).unwrap();
         reg.suspend("acme", &rec.fqdn).unwrap();
         assert_eq!(
@@ -687,7 +689,7 @@ mod tests {
     fn case_and_trailing_dot_do_not_change_the_answer() {
         let mut auth = authority();
         let mut reg = EdgeRegistry::new(b"s".to_vec());
-        let apex = APEXES.iter().find(|a| a.zone == "twnstack.app").unwrap();
+        let apex = APEXES.iter().find(|a| a.zone == "tascloud.app").unwrap();
         let rec = reg.claim_managed(apex, "dk-1", route("acme", "tun-1")).unwrap();
         let upper = rec.fqdn.to_uppercase();
         assert_eq!(ask(&mut auth, &reg, &upper, RecordType::A).answers.len(), 1);
@@ -708,7 +710,7 @@ mod tests {
         let mut auth = authority();
         let reg = EdgeRegistry::new(b"s".to_vec());
         let mut msg = Message::response(7);
-        msg.questions.push(Question::new(Name::from_ascii("twnstack.app.").unwrap(), RecordType::A));
+        msg.questions.push(Question::new(Name::from_ascii("tascloud.app.").unwrap(), RecordType::A));
         assert!(auth.answer(&msg.to_bytes(), &reg).is_none());
     }
 
@@ -719,7 +721,7 @@ mod tests {
         let msg = Message {
             id: 9,
             flags: Flags { opcode: 5, ..Flags::default() }, // UPDATE
-            questions: vec![Question::new(Name::from_ascii("twnstack.app.").unwrap(), RecordType::Soa)],
+            questions: vec![Question::new(Name::from_ascii("tascloud.app.").unwrap(), RecordType::Soa)],
             ..Message::default()
         };
         let bytes = auth.answer(&msg.to_bytes(), &reg).expect("a reply");
@@ -745,12 +747,12 @@ mod tests {
 
     #[test]
     fn caa_can_be_bound_to_our_acme_account_and_dns01() {
-        let zone = ZoneConfig::new("twnstack.app", vec!["ns1.twnstack.app".into()])
+        let zone = ZoneConfig::new("tascloud.app", vec!["ns1.tascloud.app".into()])
             .with_caa_issuers(vec!["letsencrypt.org".to_string()])
             .with_caa_account_uri("https://acme-v02.api.letsencrypt.org/acme/acct/42");
         let mut auth = ZoneAuthority::new(vec![zone], vec![Ipv4Addr::LOCALHOST], vec![]);
         let reg = EdgeRegistry::new(b"s".to_vec());
-        let reply = ask(&mut auth, &reg, "twnstack.app", RecordType::Caa);
+        let reply = ask(&mut auth, &reg, "tascloud.app", RecordType::Caa);
         match &reply.answers[0].data {
             RData::Caa { tag, value, .. } => {
                 assert_eq!(tag, "issue");
@@ -774,18 +776,18 @@ mod tests {
         let responder = Dns01Authority(auth.clone());
         let reg = EdgeRegistry::new(b"s".to_vec());
 
-        // `*.twnstack.app` and `twnstack.app` in one order => two values at one name.
-        responder.publish_txt("twnstack.app", "val-a").await.unwrap();
-        responder.publish_txt("twnstack.app", "val-b").await.unwrap();
-        let reply = ask(&mut *auth.lock().await, &reg, "_acme-challenge.twnstack.app", RecordType::Txt);
+        // `*.tascloud.app` and `tascloud.app` in one order => two values at one name.
+        responder.publish_txt("tascloud.app", "val-a").await.unwrap();
+        responder.publish_txt("tascloud.app", "val-b").await.unwrap();
+        let reply = ask(&mut *auth.lock().await, &reg, "_acme-challenge.tascloud.app", RecordType::Txt);
         assert_eq!(reply.answers.len(), 2);
 
         // Removing one authorization's value must not disturb the other's.
-        responder.remove_txt("twnstack.app", "val-a").await;
-        let reply = ask(&mut *auth.lock().await, &reg, "_acme-challenge.twnstack.app", RecordType::Txt);
+        responder.remove_txt("tascloud.app", "val-a").await;
+        let reply = ask(&mut *auth.lock().await, &reg, "_acme-challenge.tascloud.app", RecordType::Txt);
         assert_eq!(reply.answers.len(), 1);
-        responder.remove_txt("twnstack.app", "val-b").await;
-        let reply = ask(&mut *auth.lock().await, &reg, "_acme-challenge.twnstack.app", RecordType::Txt);
+        responder.remove_txt("tascloud.app", "val-b").await;
+        let reply = ask(&mut *auth.lock().await, &reg, "_acme-challenge.tascloud.app", RecordType::Txt);
         assert_eq!(reply.flags.response_code, ResponseCode::NxDomain);
     }
 
@@ -793,7 +795,7 @@ mod tests {
     fn query_counters_use_presentation_names() {
         let mut auth = authority();
         let reg = EdgeRegistry::new(b"s".to_vec());
-        ask(&mut auth, &reg, "twnstack.app", RecordType::Aaaa);
+        ask(&mut auth, &reg, "tascloud.app", RecordType::Aaaa);
         assert_eq!(auth.query_count("AAAA"), 1);
     }
 }

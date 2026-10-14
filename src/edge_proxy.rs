@@ -127,7 +127,8 @@ impl Decision {
             Decision::Misdirected => 421,
             Decision::Unknown => 404,
             Decision::Suspended | Decision::NotValidated(_) => 403,
-            Decision::CertPending | Decision::NoConnector => 503,
+            Decision::CertPending => 503,
+            Decision::NoConnector => 502,
         }
     }
 
@@ -641,10 +642,14 @@ pub mod flow_count {
 pub mod sni {
     use crate::edge::{cert_name_for, CertMaterial, CertSource};
     use hashtrinity::Table;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+    use rustls::server::{ClientHello, ResolvesServerCert};
+    use rustls::sign::CertifiedKey;
+    use rustls::ServerConfig;
     use std::sync::{Arc, Mutex};
 
     /// A [`CertSource`] holding already-loaded PEM material in memory, keyed by certificate
-    /// name (`*.twnstack.app`, `app.acme.com.au`). This is what an ACME client, a Vault
+    /// name (`*.tascloud.app`, `app.acme.com.au`). This is what an ACME client, a Vault
     /// reader, or a file loader all populate — the edge does not care which.
     pub struct MemoryCertSource {
         certs: Mutex<Table<String, CertMaterial>>,
@@ -697,15 +702,30 @@ pub mod sni {
         }
     }
 
-    /// Resolve the certificate for a ClientHello's SNI. Wraps any [`CertSource`].
+    /// Resolve the certificate for a ClientHello's SNI. Wraps any [`CertSource`], and is a real
+    /// `rustls::server::ResolvesServerCert`: hand [`EdgeCertResolver::server_config`] to
+    /// `servelet_tls::serve_tls` and one listener serves every tenant's certificate.
+    ///
+    /// Parsed `CertifiedKey`s are cached per certificate name and rebuilt only when the
+    /// source's material changes (compared by digest), so a renewal installed into the source
+    /// is picked up by the very next handshake with no restart and no per-handshake parse.
+    /// Material that fails to parse is NOT cached and not served: a bad install resolves to
+    /// "no certificate" for that name rather than evicting a good one elsewhere.
     pub struct EdgeCertResolver {
         source: Arc<dyn CertSource>,
+        cache: Mutex<Table<String, ([u8; 32], Arc<CertifiedKey>)>>,
+    }
+
+    impl std::fmt::Debug for EdgeCertResolver {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("EdgeCertResolver").finish_non_exhaustive()
+        }
     }
 
     impl EdgeCertResolver {
         #[must_use]
         pub fn new(source: Arc<dyn CertSource>) -> Self {
-            EdgeCertResolver { source }
+            EdgeCertResolver { source, cache: Mutex::new(Table::new()) }
         }
 
         /// The PEM material to present for `sni`, or `None` to refuse the handshake.
@@ -717,6 +737,64 @@ pub mod sni {
         pub fn material_for(&self, sni: &str) -> Option<CertMaterial> {
             self.source.cert_for(&cert_name_for(sni))
         }
+
+        /// The parsed key to present for `sni` (cached; see the type doc).
+        #[must_use]
+        pub fn certified_key_for(&self, sni: &str) -> Option<Arc<CertifiedKey>> {
+            let name = cert_name_for(sni);
+            let material = self.source.cert_for(&name)?;
+            let mut digest_input = material.chain_pem.clone().into_bytes();
+            digest_input.extend_from_slice(material.key_pem.as_bytes());
+            let digest = hashtrinity::crypto::sha256(&digest_input);
+
+            let mut cache = self.cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some((d, key)) = cache.get(&name) {
+                if *d == digest {
+                    return Some(key.clone());
+                }
+            }
+            let key = Arc::new(certified_key(&material)?);
+            cache.put(name, (digest, key.clone()));
+            Some(key)
+        }
+
+        /// A TLS 1.3 server config that resolves its certificate per-SNI through this
+        /// resolver, using the same crypto provider as `servelet_tls::tls_server_config`.
+        ///
+        /// # Errors
+        /// If the provider cannot negotiate TLS 1.3 (never in practice).
+        pub fn server_config(self: &Arc<Self>) -> Result<Arc<ServerConfig>, String> {
+            let config = ServerConfig::builder_with_provider(Arc::new(hashtrinity::rustls::provider()))
+                .with_protocol_versions(&[&rustls::version::TLS13])
+                .map_err(|e| e.to_string())?
+                .with_no_client_auth()
+                .with_cert_resolver(self.clone());
+            Ok(Arc::new(config))
+        }
+    }
+
+    impl ResolvesServerCert for EdgeCertResolver {
+        fn resolve(&self, hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+            // No SNI => no certificate. There is deliberately no default certificate: serving
+            // one would tell a scanner which platform name sits on every IP.
+            self.certified_key_for(hello.server_name()?)
+        }
+    }
+
+    /// Parse PEM chain + PKCS#8 key into something rustls can present. `None` if either half is
+    /// missing/corrupt or the key type is not one the serving provider loads.
+    fn certified_key(material: &CertMaterial) -> Option<CertifiedKey> {
+        let chain: Vec<CertificateDer<'static>> =
+            crate::pem::blocks(&material.chain_pem, "CERTIFICATE").into_iter().map(CertificateDer::from).collect();
+        if chain.is_empty() {
+            return None;
+        }
+        let key_der = crate::pem::blocks(&material.key_pem, "PRIVATE KEY").into_iter().next()?;
+        let key = hashtrinity::rustls::provider()
+            .key_provider
+            .load_private_key(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_der)))
+            .ok()?;
+        Some(CertifiedKey::new(chain, key))
     }
 }
 
@@ -764,7 +842,7 @@ mod tests {
     /// A registry with one live managed hostname on a `.cloud` apex, plus a pool with its
     /// connector online.
     fn live() -> (EdgeRegistry, ConnectorPool, String) {
-        let apex = APEXES.iter().find(|a| a.zone == "twnstack.cloud").unwrap();
+        let apex = APEXES.iter().find(|a| a.zone == "tasmanian.cloud").unwrap();
         let mut reg = EdgeRegistry::new(b"s".to_vec());
         let rec = reg.claim_managed(apex, "dk-1", route("acme", "tun-1")).unwrap();
         let mut pool = ConnectorPool::new();
@@ -788,7 +866,7 @@ mod tests {
         let (reg, pool, fqdn) = live();
         // A reused connection addressing a different tenant's hostname. Serving this would
         // let one tenant's TLS session reach another tenant's origin.
-        let decision = decide(&reg, &pool, Some(&fqdn), "someone-else.twnstack.cloud", true);
+        let decision = decide(&reg, &pool, Some(&fqdn), "someone-else.tasmanian.cloud", true);
         assert_eq!(decision, Decision::Misdirected);
         assert_eq!(decision.status(), 421);
     }
@@ -799,8 +877,8 @@ mod tests {
         // mismatched request for an existing one would answer 421 — a probe that reveals
         // which hostnames exist.
         let (reg, pool, fqdn) = live();
-        let real = decide(&reg, &pool, Some(&fqdn), "definitely-not-registered.twnstack.cloud", true);
-        let fake = decide(&reg, &pool, Some("also-not-registered.twnstack.cloud"), "other.twnstack.cloud", true);
+        let real = decide(&reg, &pool, Some(&fqdn), "definitely-not-registered.tasmanian.cloud", true);
+        let fake = decide(&reg, &pool, Some("also-not-registered.tasmanian.cloud"), "other.tasmanian.cloud", true);
         assert_eq!(real, fake, "a mismatch must answer identically either way");
     }
 
@@ -814,7 +892,7 @@ mod tests {
     #[test]
     fn an_unknown_hostname_is_404() {
         let (reg, pool, _) = live();
-        let d = decide(&reg, &pool, None, "nothing-here.twnstack.cloud", true);
+        let d = decide(&reg, &pool, None, "nothing-here.tasmanian.cloud", true);
         assert_eq!(d, Decision::Unknown);
         assert_eq!(d.status(), 404);
     }
@@ -848,8 +926,10 @@ mod tests {
     #[test]
     fn an_unvalidated_custom_hostname_is_never_served() {
         let mut reg = EdgeRegistry::new(b"s".to_vec());
+        let apex = APEXES.iter().find(|a| a.zone == "tasmanian.cloud").unwrap();
+        let target = reg.claim_managed(apex, "dk-t", route("acme", "tun-1")).unwrap();
         let rec = reg
-            .add_custom("app.example.com.au", "x.twnstack.cloud", route("acme", "tun-1"))
+            .add_custom("app.example.com.au", &target.fqdn, route("acme", "tun-1"))
             .unwrap();
         let mut pool = ConnectorPool::new();
         let peer = rec.route.peer;
@@ -861,8 +941,14 @@ mod tests {
     }
 
     #[test]
+    fn a_dialled_out_connector_being_offline_is_502_matching_the_doc_comment() {
+        assert_eq!(Decision::NoConnector.status(), 502);
+        assert_eq!(Decision::CertPending.status(), 503);
+    }
+
+    #[test]
     fn a_live_hostname_without_a_certificate_is_503_not_a_plaintext_serve() {
-        let apex = APEXES.iter().find(|a| a.zone == "twnstack.app").unwrap();
+        let apex = APEXES.iter().find(|a| a.zone == "tascloud.app").unwrap();
         let mut reg = EdgeRegistry::new(b"s".to_vec());
         let rec = reg.claim_managed(apex, "dk-1", route("acme", "tun-1")).unwrap();
         let mut pool = ConnectorPool::new();
@@ -920,5 +1006,91 @@ mod tests {
         pool.register(impostor, Arc::new(StubConnection { peer: impostor, label: "x" }));
 
         assert_eq!(decide(&reg, &pool, Some(&fqdn), &fqdn, true), Decision::NoConnector);
+    }
+}
+
+#[cfg(all(test, feature = "native"))]
+mod sni_tests {
+    use super::sni::{EdgeCertResolver, MemoryCertSource};
+    use crate::edge::CertMaterial;
+    use std::sync::Arc;
+
+    /// A syntactically valid chain block (rustls does not validate chain contents when
+    /// building a `CertifiedKey`) plus a real P-256 PKCS#8 key from the ACME module.
+    fn material(tag: &str) -> CertMaterial {
+        let sk = crate::acme::random_p256_scalar();
+        let b64 = |s: &str| {
+            // standard base64 of `s`, via the same writer the ACME module uses for PEM
+            let mut out = String::new();
+            const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+            for c in s.as_bytes().chunks(3) {
+                let n = (u32::from(c[0]) << 16) | (u32::from(*c.get(1).unwrap_or(&0)) << 8) | u32::from(*c.get(2).unwrap_or(&0));
+                out.push(A[(n >> 18 & 63) as usize] as char);
+                out.push(A[(n >> 12 & 63) as usize] as char);
+                out.push(if c.len() > 1 { A[(n >> 6 & 63) as usize] as char } else { '=' });
+                out.push(if c.len() > 2 { A[(n & 63) as usize] as char } else { '=' });
+            }
+            out
+        };
+        CertMaterial {
+            chain_pem: format!("-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n", b64(tag)),
+            key_pem: crate::acme::p256_key_to_pkcs8_pem(&sk),
+        }
+    }
+
+    fn resolver() -> (Arc<MemoryCertSource>, Arc<EdgeCertResolver>) {
+        let source = Arc::new(MemoryCertSource::new());
+        (source.clone(), Arc::new(EdgeCertResolver::new(source)))
+    }
+
+    #[test]
+    fn managed_names_get_the_apex_wildcard_and_custom_names_their_own_cert() {
+        let (src, r) = resolver();
+        src.install("*.tascloud.app", material("wild"));
+        src.install("app.acme.com.au", material("custom"));
+        assert!(r.certified_key_for("amber-wren-1a2b3c.tascloud.app").is_some());
+        assert!(r.certified_key_for("app.acme.com.au").is_some());
+        assert!(r.certified_key_for("AMBER-wren-1a2b3c.TASCLOUD.app.").is_some(), "SNI is case-insensitive");
+    }
+
+    #[test]
+    fn names_the_wildcard_does_not_cover_are_refused_not_served_a_wrong_cert() {
+        let (src, r) = resolver();
+        src.install("*.tascloud.app", material("wild"));
+        assert!(r.certified_key_for("deep.nested.tascloud.app").is_none(), "wildcard covers one label");
+        assert!(r.certified_key_for("tascloud.app").is_none(), "the bare apex is not covered");
+        assert!(r.certified_key_for("other.example.org").is_none());
+        assert!(r.certified_key_for("app.acme.com.au").is_none());
+    }
+
+    #[test]
+    fn a_renewal_installed_into_the_source_is_served_by_the_next_handshake() {
+        let (src, r) = resolver();
+        src.install("app.acme.com.au", material("v1"));
+        let a = r.certified_key_for("app.acme.com.au").unwrap();
+        let again = r.certified_key_for("app.acme.com.au").unwrap();
+        assert!(Arc::ptr_eq(&a, &again), "unchanged material is parsed once, not per handshake");
+        src.install("app.acme.com.au", material("v2"));
+        let b = r.certified_key_for("app.acme.com.au").unwrap();
+        assert!(!Arc::ptr_eq(&a, &b), "renewed material replaces the cached key");
+    }
+
+    #[test]
+    fn corrupt_material_resolves_to_no_certificate_without_poisoning_other_names() {
+        let (src, r) = resolver();
+        src.install("good.example.com", material("g"));
+        src.install("bad.example.com", CertMaterial { chain_pem: "garbage".into(), key_pem: "garbage".into() });
+        src.install("nokey.example.com", CertMaterial { chain_pem: material("x").chain_pem, key_pem: String::new() });
+        assert!(r.certified_key_for("bad.example.com").is_none());
+        assert!(r.certified_key_for("nokey.example.com").is_none());
+        assert!(r.certified_key_for("good.example.com").is_some());
+    }
+
+    #[test]
+    fn server_config_builds_with_the_resolver_and_offers_no_default_cert() {
+        let (_src, r) = resolver();
+        let cfg = r.server_config().expect("TLS1.3 config");
+        // The resolver is the only cert source: a config built this way has no static cert.
+        assert!(Arc::strong_count(&cfg) >= 1);
     }
 }

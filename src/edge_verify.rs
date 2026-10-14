@@ -296,7 +296,7 @@ mod native_probe {
         }
 
         fn challenge() -> Challenge {
-            Challenge::derive("app.acme.com.au", "acme", "amber-wren-1a2b3c.twnstack.app", b"s")
+            Challenge::derive("app.acme.com.au", "acme", "amber-wren-1a2b3c.tascloud.app", b"s")
         }
 
         #[tokio::test]
@@ -310,7 +310,7 @@ mod native_probe {
                     };
                     match name.as_str() {
                         "app.acme.com.au." => reply_to(q, vec![rec("app.acme.com.au", "edge.vendor.example")]),
-                        "edge.vendor.example." => reply_to(q, vec![rec("edge.vendor.example", "amber-wren-1a2b3c.twnstack.app")]),
+                        "edge.vendor.example." => reply_to(q, vec![rec("edge.vendor.example", "amber-wren-1a2b3c.tascloud.app")]),
                         _ => reply_to(q, vec![]),
                     }
                 },
@@ -443,8 +443,10 @@ mod tests {
 
     fn registry_with_pending() -> (EdgeRegistry, Challenge) {
         let mut reg = EdgeRegistry::new(b"secret".to_vec());
+        let apex = crate::edge::APEXES.iter().find(|a| a.zone == "tascloud.app").unwrap();
+        reg.claim_managed_label(apex, "amber-wren-1a2b3c", route()).unwrap();
         let rec = reg
-            .add_custom("app.example.com.au", "amber-wren-1a2b3c.twnstack.app", route())
+            .add_custom("app.example.com.au", "amber-wren-1a2b3c.tascloud.app", route())
             .unwrap();
         let challenge = rec.challenge.clone().unwrap();
         (reg, challenge)
@@ -474,7 +476,7 @@ mod tests {
         let (mut reg, challenge) = registry_with_pending();
         // Pointing at a DIFFERENT tenant's managed hostname must not prove anything — it is
         // still "a CNAME into our zone", which a naive suffix check would accept.
-        let probe = StaticProbe::new().with_cname(&challenge.fqdn, vec!["someone-else-9f8e7d.twnstack.app"]);
+        let probe = StaticProbe::new().with_cname(&challenge.fqdn, vec!["someone-else-9f8e7d.tascloud.app"]);
 
         let results = sweep(&probe, &mut reg, 5).await;
         assert_eq!(results[0].1, HostnameState::PendingDns, "must still be unproven");
@@ -483,7 +485,7 @@ mod tests {
     #[tokio::test]
     async fn a_token_issued_for_another_domain_does_not_validate() {
         let (mut reg, challenge) = registry_with_pending();
-        let foreign = Challenge::derive("app.other.com.au", "acme", "x.twnstack.app", b"secret");
+        let foreign = Challenge::derive("app.other.com.au", "acme", "x.tascloud.app", b"secret");
         let probe = StaticProbe::new().with_txt(&challenge.txt_name, vec![&foreign.token]);
 
         let results = sweep(&probe, &mut reg, 5).await;

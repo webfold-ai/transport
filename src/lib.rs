@@ -40,6 +40,8 @@ pub mod load_balance;
 /// tas-edge — the SaaS hostname layer (managed subdomains, BYO custom hostnames). Pure
 /// registry logic over hashtrinity, so it is always compiled; only the DNS halves need a dep.
 pub mod edge;
+/// PEM / base64 plumbing for the certificate paths.
+pub mod pem;
 pub mod edge_dns;
 /// Proof-of-control checks for BYO hostnames. The sweep and its `DnsProbe` seam are always
 /// compiled (and unit-tested against a static probe); only the real resolver is gated.
