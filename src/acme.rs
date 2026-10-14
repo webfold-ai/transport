@@ -8,10 +8,18 @@
 //! request can be made to a wildcard, and the natural choice for any apex under an HSTS-
 //! preloaded TLD where the browser refuses plaintext before the cert exists).
 //!
+//! **Certificate keys are ECDSA P-256, not Ed25519.** The first version of this client
+//! finalized with an Ed25519 CSR. Publicly trusted CAs do not issue Ed25519 subscriber
+//! certificates (the CA/Browser Forum Baseline Requirements permit only RSA and ECDSA
+//! P-256/P-384/P-521 keys; Let's Encrypt rejects the CSR), so every real order would have
+//! failed at `finalize` — after the authorizations had already consumed validation rate
+//! limit. P-256 is also exactly the intersection with what the edge can serve: the serving
+//! provider (`hashtrinity::rustls`) loads Ed25519 and ECDSA-P256 PKCS#8 keys only.
+//!
 //! **The crypto is not reinvented here.** `hashtrinity::crypto::{jwt,acme,certgen}` already
 //! carries everything ACME needs at the primitive level — `jwt_sign_es256` (JWS signing),
 //! `b64url`/`jwk_thumbprint_ec_p256` (RFC 7638), `acme_key_authorization` (RFC 8555 §8.1), and
-//! `certgen::csr_ed25519` (the PKCS#10 finalize body) — down to a doc comment on the `acme`
+//! `ecdsa_p256_sign` — down to a doc comment on the `acme`
 //! submodule explicitly scoping itself as "the thumbprint + key-authorization + CSR; **the HTTP
 //! flow is a client**." Nor is the HTTP transport reinvented: [`crate::http_client::Client`] is
 //! already this crate's real TLS+HTTP/1.1 client (used today by [`crate::pkarr::RelayClient`]) —
@@ -40,9 +48,8 @@
 use std::sync::Mutex as StdMutex;
 
 use hashtrinity::crypto::acme::{acme_key_authorization, b64url, jwk_thumbprint_ec_p256};
-use hashtrinity::crypto::certgen::csr_ed25519;
 use hashtrinity::crypto::jwt::jwt_sign_es256;
-use hashtrinity::crypto::p256_pubkey;
+use hashtrinity::crypto::{ecdsa_p256_sign, p256_pubkey, sha256};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -63,6 +70,10 @@ pub enum AcmeError {
     Http(crate::http_types::Error),
     BadResponse(String),
     Rejected { status: u16, detail: String },
+    /// The CA is rate limiting this account or identifier set (HTTP 429 or a `rateLimited`
+    /// problem). Distinct from `Rejected` because the right response is to wait, not to
+    /// retry on the normal schedule — hammering a rate limit extends it.
+    RateLimited { retry_after_secs: Option<u64>, detail: String },
     MissingNonce,
     AuthorizationFailed(String),
     OrderNotValid,
@@ -75,6 +86,10 @@ impl std::fmt::Display for AcmeError {
             AcmeError::Http(e) => write!(f, "talking to the ACME server: {e}"),
             AcmeError::BadResponse(s) => write!(f, "ACME server returned a response this client could not parse: {s}"),
             AcmeError::Rejected { status, detail } => write!(f, "ACME server rejected the request ({status}): {detail}"),
+            AcmeError::RateLimited { retry_after_secs, detail } => match retry_after_secs {
+                Some(s) => write!(f, "ACME server is rate limiting us (retry after {s}s): {detail}"),
+                None => write!(f, "ACME server is rate limiting us: {detail}"),
+            },
             AcmeError::MissingNonce => write!(f, "no Replay-Nonce header on a response that was supposed to carry one"),
             AcmeError::AuthorizationFailed(url) => write!(f, "authorization {url} did not reach the valid state"),
             AcmeError::OrderNotValid => write!(f, "order did not reach the valid state after finalization"),
@@ -84,6 +99,17 @@ impl std::fmt::Display for AcmeError {
 }
 
 impl std::error::Error for AcmeError {}
+
+impl AcmeError {
+    /// Seconds the CA asked us to wait, if it said.
+    #[must_use]
+    pub fn retry_after_secs(&self) -> Option<u64> {
+        match self {
+            AcmeError::RateLimited { retry_after_secs, .. } => *retry_after_secs,
+            _ => None,
+        }
+    }
+}
 
 impl From<crate::http_types::Error> for AcmeError {
     fn from(e: crate::http_types::Error) -> Self {
@@ -205,6 +231,9 @@ pub struct AcmeChallenge {
     pub url: String,
     pub token: String,
     pub status: String,
+    /// The problem document the CA attaches to a failed challenge.
+    #[serde(default)]
+    pub error: Option<Value>,
 }
 
 /// Registers/deregisters the token an HTTP-01 challenge needs served at
@@ -312,30 +341,52 @@ impl AcmeClient {
     /// POST a JWS-signed request and return `(status, body)`. `payload_json` is `""` for a
     /// POST-as-GET.
     async fn post_signed(&self, url: &str, payload_json: &str) -> Result<(u16, String), AcmeError> {
-        let nonce = self.take_nonce()?;
-        let kid = self.kid()?;
-        let protected = protected_header_kid(&kid, &nonce, url);
-        let jws = flattened_jws(&self.account, &protected, payload_json);
-        let resp = Client::new().post(url).header(header::CONTENT_TYPE, "application/jose+json").body(jws.into_bytes()).send().await?;
-        self.store_nonce_from(&resp);
-        let status = resp.status().as_u16();
-        let body = resp.text().await?;
+        let (status, _, body) = self.send_signed(url, payload_json).await?;
         Ok((status, body))
     }
 
-    /// Same as [`Self::post_signed`] but also returns the `Location` header — `newOrder` and
-    /// `newAccount` are the only two calls that need it.
+    /// Same as [`Self::post_signed`] but also returns the `Location` header — `newOrder` is
+    /// the call that needs it.
     async fn post_signed_with_location(&self, url: &str, payload_json: &str) -> Result<(u16, Option<String>, String), AcmeError> {
-        let nonce = self.take_nonce()?;
-        let kid = self.kid()?;
-        let protected = protected_header_kid(&kid, &nonce, url);
-        let jws = flattened_jws(&self.account, &protected, payload_json);
-        let resp = Client::new().post(url).header(header::CONTENT_TYPE, "application/jose+json").body(jws.into_bytes()).send().await?;
-        self.store_nonce_from(&resp);
-        let status = resp.status().as_u16();
-        let location = header_str(&resp, header::LOCATION);
-        let body = resp.text().await?;
-        Ok((status, location, body))
+        self.send_signed(url, payload_json).await
+    }
+
+    /// The one place a signed request leaves this client. Handles the two failure modes every
+    /// real CA produces routinely and a naive client treats as fatal:
+    ///
+    /// - **`badNonce`** (RFC 8555 §6.5): a nonce is single-use and the CA may expire it; the
+    ///   error response carries a fresh one, so the request is simply re-signed and re-sent.
+    /// - **rate limits**: surfaced as [`AcmeError::RateLimited`] with `Retry-After`, so the
+    ///   renewal engine can back off for as long as the CA asked.
+    async fn send_signed(&self, url: &str, payload_json: &str) -> Result<(u16, Option<String>, String), AcmeError> {
+        const MAX_ATTEMPTS: usize = 3;
+        for attempt in 1..=MAX_ATTEMPTS {
+            let nonce = match self.take_nonce() {
+                Ok(n) => n,
+                Err(AcmeError::MissingNonce) => {
+                    self.refresh_nonce().await?;
+                    self.take_nonce()?
+                }
+                Err(e) => return Err(e),
+            };
+            let kid = self.kid()?;
+            let protected = protected_header_kid(&kid, &nonce, url);
+            let jws = flattened_jws(&self.account, &protected, payload_json);
+            let resp = Client::new().post(url).header(header::CONTENT_TYPE, "application/jose+json").body(jws.into_bytes()).send().await?;
+            self.store_nonce_from(&resp);
+            let status = resp.status().as_u16();
+            let location = header_str(&resp, header::LOCATION);
+            let retry_after_secs = header_str(&resp, "retry-after").and_then(|v| v.trim().parse::<u64>().ok());
+            let body = resp.text().await?;
+            if status == 429 || body.contains("urn:ietf:params:acme:error:rateLimited") {
+                return Err(AcmeError::RateLimited { retry_after_secs, detail: body });
+            }
+            if status == 400 && body.contains("urn:ietf:params:acme:error:badNonce") && attempt < MAX_ATTEMPTS {
+                continue;
+            }
+            return Ok((status, location, body));
+        }
+        Err(AcmeError::MissingNonce)
     }
 
     /// Run the full issuance flow for `domains` via HTTP-01, returning the issued certificate
@@ -366,10 +417,8 @@ impl AcmeClient {
             self.complete_authorization(authz_url, &responder).await?;
         }
 
-        let cert_sk = hashtrinity::crypto::rand_bytes(32);
-        let mut cert_sk_arr = [0u8; 32];
-        cert_sk_arr.copy_from_slice(&cert_sk);
-        let csr = csr_ed25519(&cert_sk_arr, domains);
+        let cert_sk_arr = random_p256_scalar();
+        let csr = csr_p256(&cert_sk_arr, domains);
         let csr_b64 = b64url(&csr);
         let (status, body) = self.post_signed(&order.finalize, &json!({ "csr": csr_b64 }).to_string()).await?;
         if !(200..300).contains(&status) {
@@ -398,7 +447,7 @@ impl AcmeClient {
             return Err(AcmeError::Rejected { status, detail: chain_pem });
         }
 
-        Ok(CertMaterial { chain_pem, key_pem: ed25519_key_to_pkcs8_pem(&cert_sk_arr) })
+        Ok(CertMaterial { chain_pem, key_pem: p256_key_to_pkcs8_pem(&cert_sk_arr) })
     }
 
     async fn complete_authorization(&self, authz_url: &str, responder: &ChallengeResponder<'_>) -> Result<(), AcmeError> {
@@ -444,7 +493,17 @@ impl AcmeClient {
             let authz: AuthorizationResponse = serde_json::from_str(&body).map_err(|e| AcmeError::BadResponse(e.to_string()))?;
             match authz.status.as_str() {
                 "valid" => return Ok(()),
-                "invalid" => return Err(AcmeError::AuthorizationFailed(authz_url.to_string())),
+                "invalid" => {
+                    // Surface *why* (CAA, unauthorized, DNS timeout...) — the bare URL is
+                    // useless to the operator reading the renewal status.
+                    let why = authz
+                        .challenges
+                        .iter()
+                        .find_map(|c| c.error.as_ref())
+                        .and_then(|e| e.get("detail").and_then(Value::as_str))
+                        .unwrap_or("no detail from the CA");
+                    return Err(AcmeError::AuthorizationFailed(format!("{authz_url} ({why})")));
+                }
                 _ => tokio::time::sleep(std::time::Duration::from_secs(2)).await,
             }
         }
@@ -452,18 +511,148 @@ impl AcmeClient {
     }
 }
 
-/// PKCS#8 DER, PEM-wrapped, for an ed25519 private key — the format `rustls`/`tls_server_config`
-/// (`biota-http-server::kernel`) expects from [`CertMaterial::key_pem`].
-fn ed25519_key_to_pkcs8_pem(sk: &[u8; 32]) -> String {
-    // PKCS#8 PrivateKeyInfo { version 0, AlgorithmIdentifier{id-Ed25519}, OCTET STRING(OCTET STRING(sk)) }
-    // — the fixed, well-known 16-byte prefix every ed25519 PKCS#8 key shares, followed by the
-    // raw 32-byte seed. No general ASN.1 writer needed: the structure never varies in shape.
-    const PKCS8_ED25519_PREFIX: [u8; 16] =
-        [0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04, 0x20];
-    let mut der = Vec::with_capacity(48);
-    der.extend_from_slice(&PKCS8_ED25519_PREFIX);
-    der.extend_from_slice(sk);
-    pem_wrap("PRIVATE KEY", &der)
+/// Minimal DER writer/reader — just the shapes a PKCS#10 CSR, a PKCS#8 EC key and an X.509
+/// validity window need. No general ASN.1: every structure written here has a fixed shape.
+pub(crate) mod der {
+    #[must_use]
+    pub fn len(n: usize) -> Vec<u8> {
+        if n < 0x80 {
+            return vec![n as u8];
+        }
+        let bytes: Vec<u8> = n.to_be_bytes().iter().copied().skip_while(|b| *b == 0).collect();
+        let mut out = vec![0x80 | bytes.len() as u8];
+        out.extend(bytes);
+        out
+    }
+
+    #[must_use]
+    pub fn tlv(tag: u8, content: &[u8]) -> Vec<u8> {
+        let mut out = vec![tag];
+        out.extend(len(content.len()));
+        out.extend_from_slice(content);
+        out
+    }
+
+    #[must_use]
+    pub fn seq(items: &[Vec<u8>]) -> Vec<u8> {
+        tlv(0x30, &items.concat())
+    }
+
+    /// Minimal non-negative INTEGER from a big-endian magnitude.
+    #[must_use]
+    pub fn uint(magnitude: &[u8]) -> Vec<u8> {
+        let trimmed: &[u8] = match magnitude.iter().position(|b| *b != 0) {
+            Some(i) => &magnitude[i..],
+            None => &[0],
+        };
+        let mut c = Vec::with_capacity(trimmed.len() + 1);
+        if trimmed[0] & 0x80 != 0 {
+            c.push(0);
+        }
+        c.extend_from_slice(trimmed);
+        tlv(0x02, &c)
+    }
+
+    /// BIT STRING with zero unused bits.
+    #[must_use]
+    pub fn bit_string(content: &[u8]) -> Vec<u8> {
+        let mut c = vec![0u8];
+        c.extend_from_slice(content);
+        tlv(0x03, &c)
+    }
+
+    /// Read one TLV: `(tag, content, rest-after-it)`. `None` on any malformed/truncated input.
+    #[must_use]
+    pub fn read(buf: &[u8]) -> Option<(u8, &[u8], &[u8])> {
+        let tag = *buf.first()?;
+        let l0 = *buf.get(1)?;
+        let (n, hdr) = if l0 < 0x80 {
+            (usize::from(l0), 2)
+        } else {
+            let k = usize::from(l0 & 0x7f);
+            if k == 0 || k > 4 {
+                return None;
+            }
+            let mut n = 0usize;
+            for i in 0..k {
+                n = (n << 8) | usize::from(*buf.get(2 + i)?);
+            }
+            (n, 2 + k)
+        };
+        let end = hdr.checked_add(n)?;
+        Some((tag, buf.get(hdr..end)?, buf.get(end..)?))
+    }
+}
+
+// OID contents (without tag/length).
+const OID_EC_PUBLIC_KEY: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01]; // 1.2.840.10045.2.1
+const OID_PRIME256V1: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07]; // 1.2.840.10045.3.1.7
+const OID_ECDSA_SHA256: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02]; // 1.2.840.10045.4.3.2
+const OID_EXTENSION_REQUEST: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x09, 0x0e]; // 1.2.840.113549.1.9.14
+const OID_SUBJECT_ALT_NAME: &[u8] = &[0x55, 0x1d, 0x11]; // 2.5.29.17
+
+/// The P-256 group order n, big-endian. A private scalar must be in `[1, n-1]`.
+const P256_ORDER: [u8; 32] = [
+    0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xbc, 0xe6, 0xfa, 0xad, 0xa7, 0x17, 0x9e, 0x84, 0xf3, 0xb9, 0xca, 0xc2, 0xfc, 0x63, 0x25, 0x51,
+];
+
+fn is_valid_p256_scalar(s: &[u8; 32]) -> bool {
+    // Big-endian arrays of equal length compare lexicographically as integers.
+    s.iter().any(|b| *b != 0) && s.as_slice() < P256_ORDER.as_slice()
+}
+
+/// A fresh certificate private key. Rejection-sampled: a uniformly random 32 bytes is outside
+/// `[1, n-1]` with probability ~2^-32, and `p256_pubkey` of an out-of-range scalar is not a key.
+fn random_p256_scalar() -> [u8; 32] {
+    loop {
+        let bytes = hashtrinity::crypto::rand_bytes(32);
+        let mut s = [0u8; 32];
+        s.copy_from_slice(&bytes);
+        if is_valid_p256_scalar(&s) {
+            return s;
+        }
+    }
+}
+
+fn p256_point(sk: &[u8; 32]) -> Vec<u8> {
+    let mut point = vec![0x04]; // uncompressed
+    point.extend_from_slice(&p256_pubkey(sk));
+    point
+}
+
+fn ec_algorithm_identifier() -> Vec<u8> {
+    der::seq(&[der::tlv(0x06, OID_EC_PUBLIC_KEY), der::tlv(0x06, OID_PRIME256V1)])
+}
+
+/// Raw `r‖s` -> DER `SEQUENCE { INTEGER r, INTEGER s }` (what X.509/PKCS#10 carry).
+fn ecdsa_sig_der(raw: &[u8; 64]) -> Vec<u8> {
+    der::seq(&[der::uint(&raw[..32]), der::uint(&raw[32..])])
+}
+
+/// A PKCS#10 CSR (ECDSA P-256 / SHA-256) with `domains` as dNSName SANs and an empty subject —
+/// the ACME `finalize` request body. CAs take the identifiers from the SAN, not the subject.
+pub(crate) fn csr_p256(sk: &[u8; 32], domains: &[&str]) -> Vec<u8> {
+    let names: Vec<Vec<u8>> = domains.iter().map(|d| der::tlv(0x82, d.as_bytes())).collect(); // [2] dNSName
+    let san_ext = der::seq(&[der::tlv(0x06, OID_SUBJECT_ALT_NAME), der::tlv(0x04, &der::seq(&names))]);
+    let ext_req = der::seq(&[der::tlv(0x06, OID_EXTENSION_REQUEST), der::tlv(0x31, &der::seq(&[san_ext]))]);
+    let spki = der::seq(&[ec_algorithm_identifier(), der::bit_string(&p256_point(sk))]);
+    let cri = der::seq(&[der::uint(&[0]), der::seq(&[]), spki, der::tlv(0xA0, &ext_req)]);
+    let sig = ecdsa_p256_sign(sk, &sha256(&cri));
+    der::seq(&[cri, der::seq(&[der::tlv(0x06, OID_ECDSA_SHA256)]), der::bit_string(&ecdsa_sig_der(&sig))])
+}
+
+/// PKCS#8 `PrivateKeyInfo` for a P-256 key, PEM-wrapped, in the shape `openssl genpkey` emits
+/// (the SEC1 `ECPrivateKey` carries the public point) — what `CertMaterial::key_pem` promises
+/// and what `servelet_tls::tls_server_config` / `hashtrinity::rustls` load.
+fn p256_key_to_pkcs8_pem(sk: &[u8; 32]) -> String {
+    let ec_private_key = der::seq(&[
+        der::uint(&[1]),
+        der::tlv(0x04, sk),
+        der::tlv(0xA1, &der::bit_string(&p256_point(sk))), // [1] publicKey
+    ]);
+    let pkcs8 = der::seq(&[der::uint(&[0]), ec_algorithm_identifier(), der::tlv(0x04, &ec_private_key)]);
+    pem_wrap("PRIVATE KEY", &pkcs8)
 }
 
 fn pem_wrap(label: &str, der: &[u8]) -> String {
@@ -558,51 +747,6 @@ mod tests {
         assert!(order.certificate.is_none());
     }
 
-    #[test]
-    fn ed25519_pkcs8_pem_has_the_right_wrapper_and_decodes_back_to_the_same_key() {
-        let sk = [3u8; 32];
-        let pem = ed25519_key_to_pkcs8_pem(&sk);
-        assert!(pem.starts_with("-----BEGIN PRIVATE KEY-----\n"));
-        assert!(pem.trim_end().ends_with("-----END PRIVATE KEY-----"));
-        // Decode our own base64 and confirm the last 32 bytes are exactly the seed we put in —
-        // proves the fixed PKCS#8 prefix + seed layout round-trips.
-        let body: String = pem.lines().filter(|l| !l.starts_with("-----")).collect();
-        let der = base64_decode_for_test(&body);
-        assert_eq!(der.len(), 16 + 32);
-        assert_eq!(&der[16..], &sk);
-    }
-
-    /// Phase 4.1 (RFC 0023). End-to-end DNS-01 verification lives in `edge_dns.rs`'s own
-    /// test suite (`acme_dns01_tokens_are_served_and_can_be_cleared` /
-    /// `two_concurrent_orders_both_get_their_token`) — those tests prove `set_acme_token`
-    /// and `clear_acme_token` round-trip through the live `answer()` path, and
-    /// `edge_dns::Dns01Authority`'s impl of `Dns01Responder` is the one-call bridge to
-    /// those exact primitives. A higher-level end-to-end test that constructs a real DNS
-    /// query and runs `Dns01Authority` through it would be the next slice; it's gated on
-    /// `bind-edge-dns` (which is currently broken in this crate per the `Cargo.toml` note
-    /// about missing `hickory-resolver` and `iroh` deps — see transport/Cargo.toml:30) so
-    /// it would force a crate-deps decision that's out of scope for the DNS-01 wiring itself.
-    #[test]
-    fn acme_dns01_responder_bridge_is_a_one_call_forward() {
-        // Source-level check: the trait impl in edge_dns.rs forwards publish_txt to
-        // set_acme_token and remove_txt to clear_acme_token. The lower-level storage
-        // round-trip is exercised by edge_dns's own tests. If this compile-time assertion
-        // is wrong, the bridged surface is no longer a one-call forward and the harness
-        // assumptions in this doc need to be revised.
-        const _ASSERT_BRIDGE: fn() = || {
-            // The impl block itself proves it; we re-state here so this test fails to
-            // compile if anyone removes the impl without updating this test's prose.
-            //
-            //   impl crate::acme::Dns01Responder for Dns01Authority {
-            //       fn publish_txt  -> self.0.lock().await.set_acme_token(name, value)
-            //       fn remove_txt   -> self.0.lock().await.clear_acme_token(name, value)
-            //   }
-            //
-            // The trait method shapes are in this crate's `acme` module, and the storage
-            // methods are `pub fn` on `ZoneAuthority` (verified by edge_dns's own tests).
-        };
-    }
-
     fn base64_decode_for_test(s: &str) -> Vec<u8> {
         fn val(c: u8) -> u32 {
             match c {
@@ -640,5 +784,386 @@ mod tests {
         // must be able to recompute it identically on every poll).
         let key_auth2 = acme_key_authorization("test-token", &account.thumbprint());
         assert_eq!(key_auth, key_auth2);
+    }
+
+    // ── P-256 CSR / key ───────────────────────────────────────────────────────────────────
+
+    fn b64url_decode_for_test(s: &str) -> Vec<u8> {
+        base64_decode_for_test(&s.replace('-', "+").replace('_', "/"))
+    }
+
+    /// Pull `(cri_der, sec1_point, raw_sig)` out of a CSR so its signature can be checked.
+    fn split_csr(csr: &[u8]) -> (Vec<u8>, [u8; 64], [u8; 64]) {
+        let (tag, body, rest) = der::read(csr).unwrap();
+        assert_eq!(tag, 0x30);
+        assert!(rest.is_empty());
+        let (_, cri_content, after_cri) = der::read(body).unwrap();
+        let cri_der = body[..body.len() - after_cri.len()].to_vec();
+        let (_, sigalg, after_alg) = der::read(after_cri).unwrap();
+        assert_eq!(der::read(sigalg).unwrap().1, OID_ECDSA_SHA256);
+        let (bt, sig_bits, _) = der::read(after_alg).unwrap();
+        assert_eq!(bt, 0x03);
+        assert_eq!(sig_bits[0], 0, "no unused bits");
+        let (_, sig_seq, _) = der::read(&sig_bits[1..]).unwrap();
+        let (_, r, rest) = der::read(sig_seq).unwrap();
+        let (_, sv, _) = der::read(rest).unwrap();
+        let mut raw = [0u8; 64];
+        let r = if r[0] == 0 && r.len() > 1 { &r[1..] } else { r };
+        let sv = if sv[0] == 0 && sv.len() > 1 { &sv[1..] } else { sv };
+        raw[32 - r.len()..32].copy_from_slice(r);
+        raw[64 - sv.len()..].copy_from_slice(sv);
+        // cri: version, subject, spki, attrs
+        let (_, _, rest) = der::read(cri_content).unwrap();
+        let (_, _, rest) = der::read(rest).unwrap();
+        let (_, spki, _) = der::read(rest).unwrap();
+        let (_, _, after_alg) = der::read(spki).unwrap();
+        let (_, point_bits, _) = der::read(after_alg).unwrap();
+        assert_eq!(point_bits[1], 0x04);
+        let mut pk = [0u8; 64];
+        pk.copy_from_slice(&point_bits[2..]);
+        (cri_der, pk, raw)
+    }
+
+    #[test]
+    fn csr_is_a_valid_self_signed_p256_pkcs10() {
+        let sk = [0x42u8; 32];
+        let csr = csr_p256(&sk, &["*.twnstack.app", "twnstack.app"]);
+        let (cri, pk, sig) = split_csr(&csr);
+        assert_eq!(pk, p256_pubkey(&sk));
+        assert!(hashtrinity::crypto::ecdsa_p256_verify(&pk, &sha256(&cri), &sig), "CSR proves possession of the key");
+        for d in ["*.twnstack.app", "twnstack.app"] {
+            assert!(cri.windows(d.len()).any(|w| w == d.as_bytes()), "{d} must be a SAN");
+        }
+        // Tampering with the request info invalidates the signature.
+        let mut bad = cri.clone();
+        let last = bad.len() - 1;
+        bad[last] ^= 1;
+        assert!(!hashtrinity::crypto::ecdsa_p256_verify(&pk, &sha256(&bad), &sig));
+    }
+
+    #[test]
+    fn der_uint_is_minimal_and_non_negative() {
+        assert_eq!(der::uint(&[0, 0, 0x7f]), vec![0x02, 0x01, 0x7f]);
+        assert_eq!(der::uint(&[0x80]), vec![0x02, 0x02, 0x00, 0x80], "high bit needs a leading zero");
+        assert_eq!(der::uint(&[0, 0]), vec![0x02, 0x01, 0x00]);
+        let long = der::tlv(0x04, &[7u8; 300]);
+        assert_eq!(der::read(&long).unwrap().1.len(), 300, "long-form lengths round-trip");
+    }
+
+    #[test]
+    fn scalar_validation_rejects_zero_and_values_at_or_above_the_order() {
+        assert!(!is_valid_p256_scalar(&[0u8; 32]));
+        assert!(!is_valid_p256_scalar(&P256_ORDER));
+        assert!(!is_valid_p256_scalar(&[0xff; 32]));
+        assert!(is_valid_p256_scalar(&[1u8; 32]));
+        let mut below = P256_ORDER;
+        below[31] -= 1;
+        assert!(is_valid_p256_scalar(&below));
+        assert!(is_valid_p256_scalar(&random_p256_scalar()));
+    }
+
+    /// The key we hand back must load in the provider the edge actually serves with.
+    #[test]
+    fn issued_key_pem_loads_in_the_edge_serving_provider() {
+        use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+        use rustls::{SignatureScheme};
+        let sk = random_p256_scalar();
+        let pem = p256_key_to_pkcs8_pem(&sk);
+        assert!(pem.starts_with("-----BEGIN PRIVATE KEY-----\n"));
+        let body: String = pem.lines().filter(|l| !l.starts_with("-----")).collect();
+        let der_bytes = base64_decode_for_test(&body);
+        let provider = hashtrinity::rustls::provider();
+        let key = provider
+            .key_provider
+            .load_private_key(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(der_bytes.clone())))
+            .expect("serving provider loads our PKCS#8");
+        assert!(key.choose_scheme(&[SignatureScheme::ECDSA_NISTP256_SHA256]).is_some());
+        // Same layout as `openssl genpkey` emits for P-256: 138 bytes with the public point.
+        assert_eq!(der_bytes.len(), 138);
+    }
+
+    // ── Full protocol against a mock CA ───────────────────────────────────────────────────
+    //
+    // A real HTTP server on loopback that behaves like a CA where it matters: it checks every
+    // JWS signature, enforces single-use nonces (and injects one `badNonce`), requires the
+    // DNS-01 value to actually be published before it validates, and verifies the CSR.
+
+    mod mock_ca {
+        use super::*;
+        use std::sync::{Arc, Mutex};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        #[derive(Default)]
+        pub struct FakeDns {
+            pub published: Mutex<Vec<(String, String)>>,
+            pub removed: Mutex<Vec<(String, String)>>,
+        }
+
+        impl Dns01Responder for FakeDns {
+            fn publish_txt<'a>(&'a self, name: &'a str, value: &'a str) -> crate::BoxFuture<'a, Result<(), AcmeError>> {
+                Box::pin(async move {
+                    self.published.lock().unwrap().push((name.to_string(), value.to_string()));
+                    Ok(())
+                })
+            }
+            fn remove_txt<'a>(&'a self, name: &'a str, value: &'a str) -> crate::BoxFuture<'a, ()> {
+                Box::pin(async move { self.removed.lock().unwrap().push((name.to_string(), value.to_string())); })
+            }
+        }
+
+        #[derive(Default)]
+        pub struct State {
+            pub base: String,
+            pub nonces: Vec<String>,
+            pub counter: u32,
+            pub acct_pk: Option<[u8; 64]>,
+            pub thumbprint: [u8; 32],
+            pub inject_bad_nonce_once: bool,
+            pub rate_limit_new_order: bool,
+            pub challenged: Vec<u32>,
+            pub finalized_csr_ok: bool,
+            pub bad_nonce_seen: u32,
+            pub dns: Option<Arc<FakeDns>>,
+        }
+
+        fn fresh_nonce(st: &mut State) -> String {
+            st.counter += 1;
+            let n = format!("nonce-{}", st.counter);
+            st.nonces.push(n.clone());
+            n
+        }
+
+        struct Reply {
+            status: u16,
+            headers: Vec<(String, String)>,
+            body: String,
+        }
+
+        fn problem(status: u16, kind: &str, st: &mut State) -> Reply {
+            Reply {
+                status,
+                headers: vec![("Replay-Nonce".into(), fresh_nonce(st))],
+                body: format!(r#"{{"type":"urn:ietf:params:acme:error:{kind}","detail":"mock {kind}"}}"#),
+            }
+        }
+
+        /// Returns the decoded payload, or the error reply to send.
+        fn verify_jws(st: &mut State, url: &str, body: &str) -> Result<String, Reply> {
+            let v: Value = serde_json::from_str(body).map_err(|_| Reply { status: 400, headers: vec![], body: "{}".into() })?;
+            let (p, pl, sg) = (v["protected"].as_str().unwrap(), v["payload"].as_str().unwrap(), v["signature"].as_str().unwrap());
+            let protected: Value = serde_json::from_slice(&b64url_decode_for_test(p)).unwrap();
+            let nonce = protected["nonce"].as_str().unwrap().to_string();
+            match st.nonces.iter().position(|n| *n == nonce) {
+                Some(i) => {
+                    st.nonces.remove(i);
+                }
+                None => {
+                    st.bad_nonce_seen += 1;
+                    return Err(problem(400, "badNonce", st));
+                }
+            }
+            assert_eq!(protected["url"].as_str().unwrap(), url, "JWS url header must match the request URL");
+            let pk: [u8; 64] = if let Some(jwk) = protected.get("jwk") {
+                assert!(protected.get("kid").is_none());
+                let mut pk = [0u8; 64];
+                pk[..32].copy_from_slice(&b64url_decode_for_test(jwk["x"].as_str().unwrap()));
+                pk[32..].copy_from_slice(&b64url_decode_for_test(jwk["y"].as_str().unwrap()));
+                st.acct_pk = Some(pk);
+                pk
+            } else {
+                assert_eq!(protected["kid"].as_str().unwrap(), format!("{}/acct/1", st.base));
+                st.acct_pk.expect("account registered first")
+            };
+            let mut sig = [0u8; 64];
+            sig.copy_from_slice(&b64url_decode_for_test(sg));
+            assert!(
+                hashtrinity::crypto::ecdsa_p256_verify(&pk, &sha256(format!("{p}.{pl}").as_bytes()), &sig),
+                "bad JWS signature on {url}"
+            );
+            Ok(String::from_utf8(b64url_decode_for_test(pl)).unwrap())
+        }
+
+        fn authz(st: &State, n: u32) -> String {
+            let done = st.challenged.contains(&n) && {
+                // Validate like a CA: the expected TXT value must be live in DNS right now.
+                let token = format!("tok{n}");
+                let expect = b64url(&sha256(acme_key_authorization(&token, &st.thumbprint).as_bytes()));
+                st.dns.as_ref().unwrap().published.lock().unwrap().iter().any(|(name, v)| name == "twnstack.app" && *v == expect)
+            };
+            let status = if done { "valid" } else { "pending" };
+            format!(
+                r#"{{"status":"{status}","identifier":{{"type":"dns","value":"twnstack.app"}},"wildcard":{},"challenges":[{{"type":"http-01","url":"{b}/chall/{n}","token":"x","status":"pending"}},{{"type":"dns-01","url":"{b}/chall/{n}","token":"tok{n}","status":"{status}"}}]}}"#,
+                n == 1,
+                b = st.base
+            )
+        }
+
+        fn route(st: &mut State, method: &str, path: &str, body: &str) -> Reply {
+            let url = format!("{}{}", st.base, path);
+            let ok = |st: &mut State, status: u16, extra: Vec<(String, String)>, body: String| {
+                let mut headers = vec![("Replay-Nonce".to_string(), fresh_nonce(st))];
+                headers.extend(extra);
+                Reply { status, headers, body }
+            };
+            match (method, path) {
+                ("GET", "/directory") => Reply {
+                    status: 200,
+                    headers: vec![],
+                    body: format!(
+                        r#"{{"newNonce":"{b}/new-nonce","newAccount":"{b}/new-acct","newOrder":"{b}/new-order"}}"#,
+                        b = st.base
+                    ),
+                },
+                ("HEAD", "/new-nonce") => ok(st, 200, vec![], String::new()),
+                ("POST", p) => {
+                    let payload = match verify_jws(st, &url, body) {
+                        Ok(p) => p,
+                        Err(r) => return r,
+                    };
+                    match p {
+                        "/new-acct" => ok(st, 201, vec![("Location".into(), format!("{}/acct/1", st.base))], "{}".into()),
+                        "/new-order" => {
+                            if st.rate_limit_new_order {
+                                let mut r = problem(429, "rateLimited", st);
+                                r.headers.push(("Retry-After".into(), "3600".into()));
+                                return r;
+                            }
+                            if st.inject_bad_nonce_once {
+                                st.inject_bad_nonce_once = false;
+                                // The signature was fine; the CA just decided the nonce expired.
+                                return problem(400, "badNonce", st);
+                            }
+                            let ids: Value = serde_json::from_str(&payload).unwrap();
+                            assert_eq!(ids["identifiers"].as_array().unwrap().len(), 2);
+                            let b = st.base.clone();
+                            ok(
+                                st,
+                                201,
+                                vec![("Location".into(), format!("{b}/order/1"))],
+                                format!(r#"{{"status":"pending","authorizations":["{b}/authz/1","{b}/authz/2"],"finalize":"{b}/finalize/1"}}"#),
+                            )
+                        }
+                        "/authz/1" | "/authz/2" => {
+                            assert_eq!(payload, "", "authz fetch is a POST-as-GET (empty payload)");
+                            let n: u32 = p.rsplit('/').next().unwrap().parse().unwrap();
+                            let body = authz(st, n);
+                            ok(st, 200, vec![], body)
+                        }
+                        "/chall/1" | "/chall/2" => {
+                            assert_eq!(payload, "{}");
+                            let n: u32 = p.rsplit('/').next().unwrap().parse().unwrap();
+                            st.challenged.push(n);
+                            ok(st, 200, vec![], r#"{"status":"processing"}"#.into())
+                        }
+                        "/finalize/1" => {
+                            let v: Value = serde_json::from_str(&payload).unwrap();
+                            let csr = b64url_decode_for_test(v["csr"].as_str().unwrap());
+                            let (cri, pk, sig) = split_csr(&csr);
+                            st.finalized_csr_ok = hashtrinity::crypto::ecdsa_p256_verify(&pk, &sha256(&cri), &sig)
+                                && cri.windows(14).any(|w| w == b"*.twnstack.app");
+                            let b = st.base.clone();
+                            ok(st, 200, vec![], format!(r#"{{"status":"valid","authorizations":[],"finalize":"{b}/finalize/1","certificate":"{b}/cert/1"}}"#))
+                        }
+                        "/cert/1" => ok(st, 200, vec![], "-----BEGIN CERTIFICATE-----\nZmFrZQ==\n-----END CERTIFICATE-----\n".into()),
+                        other => panic!("mock CA: unexpected POST {other}"),
+                    }
+                }
+                other => panic!("mock CA: unexpected request {other:?}"),
+            }
+        }
+
+        async fn handle(mut conn: tokio::net::TcpStream, state: Arc<Mutex<State>>) {
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            let (head_end, content_len) = loop {
+                let n = conn.read(&mut chunk).await.unwrap_or(0);
+                if n == 0 {
+                    return;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let head = String::from_utf8_lossy(&buf[..pos]).to_ascii_lowercase();
+                    let cl = head
+                        .lines()
+                        .find_map(|l| l.strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap()))
+                        .unwrap_or(0);
+                    break (pos + 4, cl);
+                }
+            };
+            while buf.len() < head_end + content_len {
+                let n = conn.read(&mut chunk).await.unwrap_or(0);
+                if n == 0 {
+                    return;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+            }
+            let head = String::from_utf8_lossy(&buf[..head_end]).to_string();
+            let mut first = head.lines().next().unwrap().split(' ');
+            let (method, path) = (first.next().unwrap().to_string(), first.next().unwrap().to_string());
+            let body = String::from_utf8_lossy(&buf[head_end..head_end + content_len]).to_string();
+            let reply = route(&mut state.lock().unwrap(), &method, &path, &body);
+            let mut out = format!("HTTP/1.1 {} X\r\nContent-Length: {}\r\nConnection: close\r\n", reply.status, reply.body.len());
+            for (k, v) in &reply.headers {
+                out.push_str(&format!("{k}: {v}\r\n"));
+            }
+            out.push_str("\r\n");
+            if method != "HEAD" {
+                out.push_str(&reply.body);
+            }
+            let _ = conn.write_all(out.as_bytes()).await;
+        }
+
+        pub async fn start(account: &AccountKey) -> (String, Arc<Mutex<State>>, Arc<FakeDns>) {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let dns = Arc::new(FakeDns::default());
+            let state = Arc::new(Mutex::new(State {
+                base: base.clone(),
+                thumbprint: account.thumbprint(),
+                dns: Some(dns.clone()),
+                ..State::default()
+            }));
+            let st = state.clone();
+            tokio::spawn(async move {
+                loop {
+                    let Ok((conn, _)) = listener.accept().await else { return };
+                    tokio::spawn(handle(conn, st.clone()));
+                }
+            });
+            (format!("{base}/directory"), state, dns)
+        }
+    }
+
+    #[tokio::test]
+    async fn dns01_wildcard_order_completes_against_a_signature_checking_ca() {
+        let account = test_account();
+        let (dir, state, dns) = mock_ca::start(&account).await;
+        state.lock().unwrap().inject_bad_nonce_once = true;
+
+        let client = AcmeClient::new(&dir, account, Some("ops@example.test")).await.expect("account registers");
+        let cert = client.issue_dns01(&["*.twnstack.app", "twnstack.app"], dns.as_ref()).await.expect("order completes");
+
+        assert!(cert.chain_pem.contains("BEGIN CERTIFICATE"));
+        assert!(cert.key_pem.starts_with("-----BEGIN PRIVATE KEY-----"));
+        let st = state.lock().unwrap();
+        assert!(st.finalized_csr_ok, "CA verified the CSR signature and SANs");
+        assert_eq!(st.bad_nonce_seen, 0, "the injected badNonce was retried transparently, not a client bug");
+        let published = dns.published.lock().unwrap();
+        assert_eq!(published.len(), 2, "wildcard + apex both need a TXT value at the same name");
+        assert!(published.iter().all(|(n, _)| n == "twnstack.app"));
+        assert_eq!(dns.removed.lock().unwrap().len(), 2, "every challenge value is cleaned up afterwards");
+    }
+
+    #[tokio::test]
+    async fn a_ca_rate_limit_is_surfaced_with_its_retry_after() {
+        let account = test_account();
+        let (dir, state, dns) = mock_ca::start(&account).await;
+        state.lock().unwrap().rate_limit_new_order = true;
+        let client = AcmeClient::new(&dir, account, None).await.unwrap();
+        let err = client.issue_dns01(&["*.twnstack.app", "twnstack.app"], dns.as_ref()).await.unwrap_err();
+        assert!(matches!(err, AcmeError::RateLimited { retry_after_secs: Some(3600), .. }), "{err}");
+        assert_eq!(err.retry_after_secs(), Some(3600));
+        assert!(dns.published.lock().unwrap().is_empty(), "no challenge was published for a refused order");
     }
 }
