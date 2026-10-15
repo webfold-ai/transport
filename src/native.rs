@@ -113,14 +113,6 @@ pub(super) fn derive_session_keys(shared_secret: &[u8; 32], client: &HandshakeMs
     (blake3(&c2s_input), blake3(&s2c_input))
 }
 
-/// The X25519 base point (the constant `9`, per RFC 7748) — shared so every caller generating
-/// an ephemeral keypair uses the same point, not a re-typed magic value.
-pub(super) const X25519_BASEPOINT: [u8; 32] = {
-    let mut b = [0u8; 32];
-    b[0] = 9;
-    b
-};
-
 /// Generate a fresh ephemeral X25519 keypair for one handshake. Returns (secret, public).
 pub(super) fn generate_ephemeral_x25519() -> ([u8; 32], [u8; 32]) {
     let ephemeral_secret_bytes = hashtrinity::crypto::rand_bytes(32);
@@ -202,6 +194,11 @@ fn nonce_from_counter(counter: u64) -> [u8; 12] {
     nonce
 }
 
+/// Largest sealed-frame ciphertext accepted. Writers chunk at 4 KiB; 1 MiB leaves ample room for
+/// callers that write larger buffers in one `write_all`, while bounding what an unauthenticated
+/// length prefix can make the reader allocate.
+const MAX_FRAME_CIPHERTEXT: usize = 1 << 20;
+
 /// Read + open one sealed frame from `r`. Enforces strict counter monotonicity (the nonce
 /// counter must be strictly greater than the last one accepted) to reject replay of an old
 /// frame. Returns (stream_id, payload).
@@ -226,6 +223,11 @@ async fn read_sealed_frame(
     let mut len_buf = [0u8; 4];
     r.read_exact(&mut len_buf).await?;
     let ct_len = u32::from_le_bytes(len_buf) as usize;
+    // The length is not yet authenticated: without a cap, one unauthenticated header makes us
+    // allocate up to 4 GiB per connection (any Ed25519 key passes the handshake).
+    if ct_len > MAX_FRAME_CIPHERTEXT {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "sealed frame exceeds the maximum size"));
+    }
 
     let mut ct = vec![0u8; ct_len];
     r.read_exact(&mut ct).await?;
@@ -473,9 +475,13 @@ impl BiStream for SealedStreamSend {
         let key = self.key;
         let counter = self.counter.clone();
         Box::pin(async move {
+            // Take the write lock FIRST, then the counter: the counter order must equal the wire
+            // order, because the receiver rejects any frame whose counter is not strictly greater
+            // than the last accepted one. Allocating it before the lock let two concurrent writers
+            // put counters 5 and 6 on the wire as 6 then 5 — and the connection died as a "replay".
+            let mut w = write.lock().await;
             let n = counter.fetch_add(1, Ordering::SeqCst);
             let sealed = seal_frame(&key, n, stream_id, &data);
-            let mut w = write.lock().await;
             w.write_all(&sealed).await
         })
     }
@@ -553,6 +559,70 @@ mod tests {
         let addr = endpoint.local_addr().unwrap();
         // The endpoint is bound and listening
         assert!(addr.contains("127.0.0.1"));
+    }
+
+    /// Concurrent writers on one connection must not trip the receiver's replay check.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_writers_never_produce_out_of_order_counters() {
+        // Needs real parallelism: on a single-threaded runtime nothing can run between taking a
+        // counter and queueing for the write lock, so the (fixed) race could never fire.
+        const WRITERS: usize = 8;
+        const PER_WRITER: usize = 1500;
+        let server = NativeEndpoint::bind("127.0.0.1:0").await.unwrap();
+        let addr = server.local_addr().unwrap();
+        let reader = tokio::spawn(async move {
+            let conn = Transport::accept(&server).await.unwrap();
+            let (_, mut recv) = Connection::accept_bi(&conn).await.unwrap();
+            let mut got = 0usize;
+            let mut buf = [0u8; 16];
+            while got < WRITERS * PER_WRITER {
+                let n = recv.read(&mut buf).await.expect("no frame may be rejected as a replay");
+                assert_eq!(n, 16);
+                got += 1;
+            }
+            got
+        });
+        let client = NativeEndpoint::bind("127.0.0.1:0").await.unwrap();
+        let conn = std::sync::Arc::new(Transport::connect(&client, &addr, b"test").await.unwrap());
+        let mut tasks = Vec::new();
+        for w in 0..WRITERS {
+            let conn = conn.clone();
+            tasks.push(tokio::spawn(async move {
+                let (mut send, _) = Connection::open_bi(&*conn).await.unwrap();
+                for i in 0..PER_WRITER {
+                    let mut frame = [0u8; 16];
+                    frame[..8].copy_from_slice(&(w as u64).to_le_bytes());
+                    frame[8..].copy_from_slice(&(i as u64).to_le_bytes());
+                    send.write_all(&frame).await.unwrap();
+                }
+            }));
+        }
+        for t in tasks {
+            t.await.unwrap();
+        }
+        assert_eq!(tokio::time::timeout(std::time::Duration::from_secs(20), reader).await.unwrap().unwrap(), WRITERS * PER_WRITER);
+    }
+
+    /// An unauthenticated length prefix must not make the reader allocate gigabytes.
+    #[tokio::test]
+    async fn an_oversized_length_prefix_is_refused_before_allocating() {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let attacker = tokio::spawn(async move {
+            let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let mut header = 1u64.to_le_bytes().to_vec(); // a plausible counter
+            header.extend_from_slice(&u32::MAX.to_le_bytes()); // 4 GiB "ciphertext"
+            s.write_all(&header).await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        });
+        let (stream, _) = listener.accept().await.unwrap();
+        let (mut r, _w) = stream.into_split();
+        let last = AtomicU64::new(0);
+        let err = read_sealed_frame(&mut r, &[1u8; 32], &last).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("maximum size"), "{err}");
+        attacker.abort();
     }
 
     #[tokio::test]

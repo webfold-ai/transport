@@ -34,7 +34,7 @@ use super::{Connection, PeerId};
 use hashtrinity::Table;
 use hashtrinity::crypto::to_hex;
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::Arc;
 
 /// What the edge should do with one inbound request.

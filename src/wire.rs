@@ -457,7 +457,12 @@ pub(crate) async fn send_request(
     // there was no length information at all, which in practice means the peer intends to close
     // the connection once the body is sent, so pooling that stream would just hand back a socket
     // that's already going away.
-    let (body, poolable) = if head.status == StatusCode::NO_CONTENT
+    // RFC 9110 §9.3.2: a response to HEAD never has a body, whatever Content-Length says (and
+    // many servers, Go's net/http among them, send none at all). Reading "until close" here made
+    // `HEAD` hang for the server's idle timeout on a keep-alive connection — ACME's `newNonce`
+    // is exactly such a request.
+    let (body, poolable) = if method == Method::HEAD
+        || head.status == StatusCode::NO_CONTENT
         || head.status == StatusCode::NOT_MODIFIED
         || head.status.is_informational()
     {
@@ -618,7 +623,8 @@ pub(crate) async fn send_request_streaming(
     let mut reader = stream.into_reader();
     let head = read_response_head(&mut reader).await?;
 
-    let framing = if head.status == StatusCode::NO_CONTENT
+    let framing = if method == Method::HEAD
+        || head.status == StatusCode::NO_CONTENT
         || head.status == StatusCode::NOT_MODIFIED
         || head.status.is_informational()
     {

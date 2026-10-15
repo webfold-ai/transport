@@ -51,7 +51,6 @@ use std::sync::Mutex as StdMutex;
 use hashtrinity::crypto::acme::{acme_key_authorization, b64url, jwk_thumbprint_ec_p256};
 use aws_lc_rs::rand::SystemRandom;
 use aws_lc_rs::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_FIXED_SIGNING};
-use hashtrinity::crypto::sha256;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -272,7 +271,12 @@ pub struct AcmeChallenge {
     #[serde(rename = "type")]
     pub kind: String,
     pub url: String,
+    /// Present for `http-01`/`dns-01`/`tls-alpn-01`. Other challenge types a CA may offer
+    /// alongside them (newer drafts) have no token — they must not make the whole authorization
+    /// unparseable, since we only ever act on the two types we implement.
+    #[serde(default)]
     pub token: String,
+    #[serde(default)]
     pub status: String,
     /// The problem document the CA attaches to a failed challenge.
     #[serde(default)]
@@ -724,6 +728,7 @@ fn base64_standard(d: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hashtrinity::crypto::sha256;
 
     fn test_account() -> AccountKey {
         // A fixed, arbitrary 32-byte scalar — deterministic tests, not a real account.
@@ -776,6 +781,20 @@ mod tests {
         let json = r#"{"newNonce":"https://x/new-nonce","newAccount":"https://x/new-acct","newOrder":"https://x/new-order","keyChange":"https://x/key-change"}"#;
         let dir: Directory = serde_json::from_str(json).unwrap();
         assert_eq!(dir.new_nonce, "https://x/new-nonce");
+    }
+
+    #[test]
+    fn an_authorization_with_challenge_types_we_do_not_implement_still_parses() {
+        // Shape taken from a real Pebble authorization: a challenge object with no `token`.
+        let json = r#"{"status":"pending","identifier":{"type":"dns","value":"example.test"},
+            "challenges":[
+              {"type":"http-01","url":"https://x/c/1","token":"t1","status":"pending"},
+              {"type":"dns-account-01","url":"https://x/c/2","status":"pending"},
+              {"type":"dns-01","url":"https://x/c/3","token":"t3","status":"pending","validated":"x","extra":1}]}"#;
+        let authz: AuthorizationResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(authz.challenges.len(), 3);
+        assert!(authz.challenges.iter().find(|c| c.kind == "dns-01").is_some_and(|c| c.token == "t3"));
+        assert!(authz.challenges.iter().find(|c| c.kind == "dns-account-01").is_some_and(|c| c.token.is_empty()));
     }
 
     #[test]

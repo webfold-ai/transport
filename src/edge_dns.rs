@@ -445,23 +445,78 @@ fn type_name(t: RecordType) -> String {
     }
 }
 
-// ── The socket loop ───────────────────────────────────────────────────────────────────────
+// ── The socket loops ──────────────────────────────────────────────────────────────────────
 
-/// Serve DNS over UDP on `addr` until the future is dropped.
-///
-/// The whole server is [`ZoneAuthority::answer`]; this is the transport around it. UDP only:
-/// TCP (and therefore responses over 512 bytes, and zone transfers) is not implemented — a
-/// stated limit, not an oversight. Our answers are small by construction (a handful of A
-/// records or one TXT), so truncation-driven TCP retry is not on the path yet.
+/// What answers a raw DNS query. [`ZoneAuthority::answer`] behind its locks is the production
+/// handler ([`AuthorityHandler`]); the seam exists so the socket loops are testable and so a
+/// deployment can front the authority with something else (rate limiting, a snapshot).
 #[cfg(feature = "native")]
-pub async fn serve_udp(
-    addr: &str,
-    authority: std::sync::Arc<tokio::sync::Mutex<ZoneAuthority>>,
-    registry: std::sync::Arc<tokio::sync::Mutex<EdgeRegistry>>,
-) -> std::io::Result<()> {
+pub trait DnsHandler: Send + Sync {
+    /// A reply to send, or `None` to stay silent (unparseable input must never be answered).
+    fn handle<'a>(&'a self, query: &'a [u8]) -> crate::BoxFuture<'a, Option<Vec<u8>>>;
+}
+
+/// The authority and the registry it reads, behind the same tokio mutexes the renewal engine
+/// uses — one TXT publish by the ACME client is visible to the next query.
+#[cfg(feature = "native")]
+pub struct AuthorityHandler {
+    pub authority: std::sync::Arc<tokio::sync::Mutex<ZoneAuthority>>,
+    pub registry: std::sync::Arc<tokio::sync::Mutex<EdgeRegistry>>,
+}
+
+#[cfg(feature = "native")]
+impl DnsHandler for AuthorityHandler {
+    fn handle<'a>(&'a self, query: &'a [u8]) -> crate::BoxFuture<'a, Option<Vec<u8>>> {
+        Box::pin(async move {
+            let registry = self.registry.lock().await;
+            let mut authority = self.authority.lock().await;
+            authority.answer(query, &registry)
+        })
+    }
+}
+
+/// The largest UDP reply the *querier* said it can take: 512 bytes unless it sent an EDNS0 OPT
+/// record (RFC 6891), whose "class" field carries its buffer size — never trusted above 1232,
+/// the DNS-flag-day size that avoids IP fragmentation (and fragment-based spoofing).
+#[must_use]
+pub fn udp_limit(query: &[u8]) -> usize {
+    const FLOOR: usize = 512;
+    const CEIL: usize = 1232;
+    Message::from_bytes(query)
+        .ok()
+        .and_then(|m| m.additionals.iter().find(|r| r.data.record_type() == RecordType::Unknown(41)).map(|r| usize::from(r.class)))
+        .map_or(FLOOR, |advertised| advertised.clamp(FLOOR, CEIL))
+}
+
+/// Fit `reply` into `limit` bytes for UDP: if it does not fit, answer with the header and
+/// question only and the TC bit set, so the resolver retries over TCP (RFC 1035 §4.2.1).
+#[must_use]
+pub fn fit_for_udp(reply: Vec<u8>, limit: usize) -> Vec<u8> {
+    if reply.len() <= limit {
+        return reply;
+    }
+    match Message::from_bytes(&reply) {
+        Ok(mut m) => {
+            m.flags.truncated = true;
+            m.answers.clear();
+            m.authorities.clear();
+            m.additionals.clear();
+            m.to_bytes()
+        }
+        Err(_) => reply,
+    }
+}
+
+/// Serve DNS over UDP on `addr` until the future is dropped. Replies that exceed the querier's
+/// UDP limit are truncated (TC) so it retries over TCP — see [`serve_tcp_with`].
+///
+/// # Errors
+/// If the socket cannot be bound.
+#[cfg(feature = "native")]
+pub async fn serve_udp_with(addr: &str, handler: std::sync::Arc<dyn DnsHandler>) -> std::io::Result<()> {
     let socket = tokio::net::UdpSocket::bind(addr).await?;
-    tracing::info!(target: "bedrock::edge_dns", addr = %addr, "authoritative DNS listening");
-    // 4096 covers an EDNS0-advertised payload; anything larger is not a query we serve.
+    tracing::info!(target: "bedrock::edge_dns", addr = %addr, "authoritative DNS listening (udp)");
+    // 4096 covers any EDNS0-advertised payload; anything larger is not a query we serve.
     let mut buf = vec![0u8; 4096];
     loop {
         let (len, peer) = match socket.recv_from(&mut buf).await {
@@ -471,17 +526,96 @@ pub async fn serve_udp(
                 continue;
             }
         };
-        let reply = {
-            let registry = registry.lock().await;
-            let mut authority = authority.lock().await;
-            authority.answer(&buf[..len], &registry)
-        };
-        if let Some(reply) = reply {
+        let query = &buf[..len];
+        if let Some(reply) = handler.handle(query).await {
+            let reply = fit_for_udp(reply, udp_limit(query));
             if let Err(e) = socket.send_to(&reply, peer).await {
                 tracing::debug!(target: "bedrock::edge_dns", error = %e, %peer, "send failed");
             }
         }
     }
+}
+
+/// Serve DNS over TCP on `addr` (RFC 1035 §4.2.2 two-byte length framing; RFC 7766 makes TCP
+/// mandatory for an authoritative server, and some validators — Pebble among them — use it
+/// exclusively). Connections may pipeline queries; each is bounded by an idle timeout and a
+/// message-size cap so a stalled or hostile client cannot hold resources.
+///
+/// # Errors
+/// If the listener cannot be bound.
+#[cfg(feature = "native")]
+pub async fn serve_tcp_with(addr: &str, handler: std::sync::Arc<dyn DnsHandler>) -> std::io::Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    const IDLE: std::time::Duration = std::time::Duration::from_secs(10);
+    const MAX_QUERY: usize = 4096;
+    // A global ceiling on concurrent connections; excess are refused by closing immediately.
+    let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(1024));
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    tracing::info!(target: "bedrock::edge_dns", addr = %addr, "authoritative DNS listening (tcp)");
+    loop {
+        let (mut stream, peer) = match listener.accept().await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::debug!(target: "bedrock::edge_dns", error = %e, "accept failed");
+                continue;
+            }
+        };
+        let Ok(permit) = permits.clone().try_acquire_owned() else { continue };
+        let handler = handler.clone();
+        tokio::spawn(async move {
+            let _permit = permit;
+            loop {
+                let mut len_buf = [0u8; 2];
+                match tokio::time::timeout(IDLE, stream.read_exact(&mut len_buf)).await {
+                    Ok(Ok(_)) => {}
+                    _ => return, // closed, errored or idle
+                }
+                let len = usize::from(u16::from_be_bytes(len_buf));
+                if len == 0 || len > MAX_QUERY {
+                    return;
+                }
+                let mut query = vec![0u8; len];
+                if !matches!(tokio::time::timeout(IDLE, stream.read_exact(&mut query)).await, Ok(Ok(_))) {
+                    return;
+                }
+                let Some(reply) = handler.handle(&query).await else { return };
+                let Ok(reply_len) = u16::try_from(reply.len()) else { return };
+                let mut framed = Vec::with_capacity(2 + reply.len());
+                framed.extend_from_slice(&reply_len.to_be_bytes());
+                framed.extend_from_slice(&reply);
+                if stream.write_all(&framed).await.is_err() {
+                    tracing::debug!(target: "bedrock::edge_dns", %peer, "tcp send failed");
+                    return;
+                }
+            }
+        });
+    }
+}
+
+/// Serve DNS over UDP on `addr` (see [`serve_udp_with`]) from an authority and its registry.
+///
+/// # Errors
+/// If the socket cannot be bound.
+#[cfg(feature = "native")]
+pub async fn serve_udp(
+    addr: &str,
+    authority: std::sync::Arc<tokio::sync::Mutex<ZoneAuthority>>,
+    registry: std::sync::Arc<tokio::sync::Mutex<EdgeRegistry>>,
+) -> std::io::Result<()> {
+    serve_udp_with(addr, std::sync::Arc::new(AuthorityHandler { authority, registry })).await
+}
+
+/// Serve DNS over TCP on `addr` (see [`serve_tcp_with`]) from an authority and its registry.
+///
+/// # Errors
+/// If the listener cannot be bound.
+#[cfg(feature = "native")]
+pub async fn serve_tcp(
+    addr: &str,
+    authority: std::sync::Arc<tokio::sync::Mutex<ZoneAuthority>>,
+    registry: std::sync::Arc<tokio::sync::Mutex<EdgeRegistry>>,
+) -> std::io::Result<()> {
+    serve_tcp_with(addr, std::sync::Arc::new(AuthorityHandler { authority, registry })).await
 }
 
 #[cfg(test)]
@@ -797,5 +931,80 @@ mod tests {
         let reg = EdgeRegistry::new(b"s".to_vec());
         ask(&mut auth, &reg, "tascloud.app", RecordType::Aaaa);
         assert_eq!(auth.query_count("AAAA"), 1);
+    }
+
+    #[test]
+    fn oversized_replies_are_truncated_for_udp_and_edns_raises_the_limit() {
+        let mut auth = authority();
+        let reg = EdgeRegistry::new(b"s".to_vec());
+        // 20 live challenge values at one name => a reply well over 512 bytes.
+        for i in 0..20 {
+            auth.set_acme_token("tascloud.app", format!("token-{i:02}-{}", "x".repeat(40)));
+        }
+        let q = query_bytes("_acme-challenge.tascloud.app", RecordType::Txt);
+        let full = auth.answer(&q, &reg).unwrap();
+        assert!(full.len() > 1232, "test setup: reply is {} bytes", full.len());
+
+        assert_eq!(udp_limit(&q), 512, "no EDNS => classic limit");
+        let cut = Message::from_bytes(&fit_for_udp(full.clone(), udp_limit(&q))).unwrap();
+        assert!(cut.flags.truncated && cut.answers.is_empty(), "TC set, answers dropped, resolver retries over TCP");
+        assert_eq!(cut.id, 0x1234);
+        assert_eq!(cut.questions.len(), 1);
+
+        // A small reply is left alone.
+        let small = auth.answer(&query_bytes("twnstack.invalid", RecordType::A), &reg).unwrap();
+        assert_eq!(fit_for_udp(small.clone(), 512), small);
+
+        // EDNS0 OPT advertising 4096 raises the limit, but never above 1232.
+        let mut m = Message::from_bytes(&q).unwrap();
+        m.additionals.push(Record { name: Name::root(), class: 4096, ttl: 0, data: RData::Unknown(41, Vec::new()) });
+        assert_eq!(udp_limit(&m.to_bytes()), 1232);
+        m.additionals[0].class = 800;
+        assert_eq!(udp_limit(&m.to_bytes()), 800);
+        m.additionals[0].class = 100;
+        assert_eq!(udp_limit(&m.to_bytes()), 512, "never below the floor");
+    }
+
+    #[cfg(feature = "native")]
+    #[tokio::test]
+    async fn tcp_service_answers_framed_queries_and_returns_the_full_untruncated_reply() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let authority = std::sync::Arc::new(tokio::sync::Mutex::new(authority()));
+        let registry = std::sync::Arc::new(tokio::sync::Mutex::new(EdgeRegistry::new(b"s".to_vec())));
+        for i in 0..20 {
+            authority.lock().await.set_acme_token("tascloud.app", format!("token-{i:02}-{}", "x".repeat(40)));
+        }
+        // Find a free port, then serve on it.
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let addr = format!("127.0.0.1:{port}");
+        tokio::spawn(serve_tcp(Box::leak(addr.clone().into_boxed_str()), authority, registry));
+        let mut stream = loop {
+            if let Ok(s) = tokio::net::TcpStream::connect(&addr).await {
+                break s;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        };
+
+        // Two pipelined queries on one connection.
+        for round in 0..2 {
+            let q = query_bytes("_acme-challenge.tascloud.app", RecordType::Txt);
+            let mut framed = (q.len() as u16).to_be_bytes().to_vec();
+            framed.extend_from_slice(&q);
+            stream.write_all(&framed).await.unwrap();
+            let mut len = [0u8; 2];
+            stream.read_exact(&mut len).await.unwrap();
+            let mut reply = vec![0u8; usize::from(u16::from_be_bytes(len))];
+            stream.read_exact(&mut reply).await.unwrap();
+            let m = Message::from_bytes(&reply).unwrap();
+            assert!(!m.flags.truncated, "TCP is never truncated");
+            assert_eq!(m.answers.len(), 20, "round {round}");
+        }
+
+        // Garbage is dropped by closing, not answered.
+        let mut bad = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        bad.write_all(&[0x00, 0x04, 1, 2, 3, 4]).await.unwrap();
+        let mut sink = Vec::new();
+        let n = tokio::time::timeout(std::time::Duration::from_secs(2), bad.read_to_end(&mut sink)).await.unwrap().unwrap();
+        assert_eq!(n, 0, "an unparseable query gets no reply");
     }
 }
