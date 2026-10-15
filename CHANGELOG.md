@@ -21,6 +21,17 @@
   a grace period, `FileCertStore` persists across restarts (atomic, 0600). Baseline = every apex wildcard.
 - CAA records can be bound to the ACME account and `dns-01` (`ZoneConfig::with_caa_account_uri`).
 
+- **Review fixes:** `Retry-After` is honoured in both forms (seconds and HTTP-date); `newAccount` goes
+  through the same `badNonce`/rate-limit handling as every other request; a CA's retry deadline and
+  failure count are persisted beside the certificate (`<name>.retry`) so a restart cannot defeat
+  backoff (`CertStore::{load,save}_retry`); an installed certificate must already be valid
+  (`notBefore` not in the future) — a future-dated one never displaces last-known-good; the cert
+  directory is fsynced after the atomic rename; wildcard orders also name the bare apex (one
+  certificate carries `*.zone` + `zone`, and `cert_name_for("zone")` resolves to it); the client TLS
+  config uses the FIPS provider explicitly under `--features fips`;
+  `EdgeRegistry::{quarantine_snapshot, restore_quarantine}` let a host persist release tombstones;
+  `Cargo.lock` regenerated for the new dependency set.
+
 ### Crypto
 - **ACME account/certificate keys, JWS signing and CSR signing now use `aws-lc-rs`** instead of
   hashtrinity's hand-written P-256 (variable-time scalar multiplication). The edge serves TLS

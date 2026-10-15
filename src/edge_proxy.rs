@@ -1120,7 +1120,10 @@ mod sni_tests {
         let (src, r) = resolver();
         src.install("*.tascloud.app", material("*.tascloud.app"));
         assert!(r.certified_key_for("deep.nested.tascloud.app").is_none(), "wildcard covers one label");
-        assert!(r.certified_key_for("tascloud.app").is_none(), "the bare apex is not covered");
+        // The bare apex shares the wildcard's certificate: the issuer orders `*.zone` + `zone` as
+        // one certificate, so the apex is looked up under the wildcard's name.
+        assert!(r.certified_key_for("tascloud.app").is_some(), "the bare apex resolves to the wildcard certificate");
+        assert!(r.certified_key_for("tascloud.dev").is_none(), "another apex has its own certificate");
         assert!(r.certified_key_for("other.example.org").is_none());
         assert!(r.certified_key_for("app.acme.com.au").is_none());
     }

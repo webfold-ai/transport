@@ -322,6 +322,52 @@ pub struct AcmeClient {
     nonce: StdMutex<Option<String>>,
 }
 
+/// Seconds since the unix epoch (0 if the clock is before it).
+fn unix_now() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+}
+
+/// A `Retry-After` value (RFC 9110 §10.2.3) as a delay in seconds: either `delay-seconds` or an
+/// HTTP-date (`Sun, 06 Nov 1994 08:49:37 GMT`), measured from `now`. A date in the past is a delay
+/// of 0. Anything else is `None` — the caller falls back to its own backoff.
+#[must_use]
+pub fn parse_retry_after(value: &str, now: i64) -> Option<u64> {
+    let v = value.trim();
+    if let Ok(secs) = v.parse::<u64>() {
+        return Some(secs);
+    }
+    let when = parse_imf_fixdate(v)?;
+    Some(u64::try_from(when.saturating_sub(now)).unwrap_or(0))
+}
+
+/// `Sun, 06 Nov 1994 08:49:37 GMT` -> unix seconds. Only the preferred IMF-fixdate form (the one
+/// HTTP/1.1 senders MUST generate); the obsolete RFC 850 / asctime forms are not accepted.
+fn parse_imf_fixdate(v: &str) -> Option<i64> {
+    let (_, rest) = v.split_once(", ")?;
+    let mut it = rest.split(' ');
+    let day: i64 = it.next()?.parse().ok()?;
+    let month = match it.next()? {
+        "Jan" => 1, "Feb" => 2, "Mar" => 3, "Apr" => 4, "May" => 5, "Jun" => 6,
+        "Jul" => 7, "Aug" => 8, "Sep" => 9, "Oct" => 10, "Nov" => 11, "Dec" => 12,
+        _ => return None,
+    };
+    let year: i64 = it.next()?.parse().ok()?;
+    let mut hms = it.next()?.split(':');
+    let (h, m, s): (i64, i64, i64) = (hms.next()?.parse().ok()?, hms.next()?.parse().ok()?, hms.next()?.parse().ok()?);
+    if it.next()? != "GMT" || it.next().is_some() || !(1..=31).contains(&day) || h > 23 || m > 59 || s > 60 || !(1970..=9999).contains(&year) {
+        return None;
+    }
+    // days-from-civil (Howard Hinnant)
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = (month + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    Some(days * 86_400 + h * 3600 + m * 60 + s)
+}
+
 impl AcmeClient {
     /// Fetch the directory and register the account (RFC 8555's `newAccount` is idempotent for
     /// an already-registered key: the CA returns the existing account's URL as `Location`).
@@ -356,23 +402,13 @@ impl AcmeClient {
     }
 
     async fn create_account(&self, contact_email: Option<&str>) -> Result<(), AcmeError> {
-        let nonce = self.take_nonce()?;
-        let protected = protected_header_jwk(&self.account, &nonce, &self.directory.new_account);
         let mut payload = json!({ "termsOfServiceAgreed": true });
         if let Some(email) = contact_email {
             payload["contact"] = json!([format!("mailto:{email}")]);
         }
-        let jws = flattened_jws(&self.account, &protected, &payload.to_string());
-        let resp = Client::new()
-            .post(&self.directory.new_account)
-            .header(header::CONTENT_TYPE, "application/jose+json")
-            .body(jws.into_bytes())
-            .send()
-            .await?;
-        self.store_nonce_from(&resp);
-        let status = resp.status().as_u16();
-        let kid = header_str(&resp, header::LOCATION);
-        let body = resp.text().await?;
+        // Same nonce/rate-limit handling as every other request; the only difference is that the
+        // account does not exist yet, so the JWS carries the public key (`jwk`) instead of a `kid`.
+        let (status, kid, body) = self.send_jws(&self.directory.new_account, &payload.to_string(), true).await?;
         if !(200..300).contains(&status) {
             return Err(AcmeError::Rejected { status, detail: body });
         }
@@ -413,6 +449,12 @@ impl AcmeClient {
     /// - **rate limits**: surfaced as [`AcmeError::RateLimited`] with `Retry-After`, so the
     ///   renewal engine can back off for as long as the CA asked.
     async fn send_signed(&self, url: &str, payload_json: &str) -> Result<(u16, Option<String>, String), AcmeError> {
+        self.send_jws(url, payload_json, false).await
+    }
+
+    /// [`Self::send_signed`] with the choice of key identification: `jwk` is for `newAccount`
+    /// (no account URL exists yet), everything else uses the account `kid`.
+    async fn send_jws(&self, url: &str, payload_json: &str, jwk: bool) -> Result<(u16, Option<String>, String), AcmeError> {
         const MAX_ATTEMPTS: usize = 3;
         for attempt in 1..=MAX_ATTEMPTS {
             let nonce = match self.take_nonce() {
@@ -423,14 +465,17 @@ impl AcmeClient {
                 }
                 Err(e) => return Err(e),
             };
-            let kid = self.kid()?;
-            let protected = protected_header_kid(&kid, &nonce, url);
+            let protected = if jwk {
+                protected_header_jwk(&self.account, &nonce, url)
+            } else {
+                protected_header_kid(&self.kid()?, &nonce, url)
+            };
             let jws = flattened_jws(&self.account, &protected, payload_json);
             let resp = Client::new().post(url).header(header::CONTENT_TYPE, "application/jose+json").body(jws.into_bytes()).send().await?;
             self.store_nonce_from(&resp);
             let status = resp.status().as_u16();
             let location = header_str(&resp, header::LOCATION);
-            let retry_after_secs = header_str(&resp, "retry-after").and_then(|v| v.trim().parse::<u64>().ok());
+            let retry_after_secs = header_str(&resp, "retry-after").and_then(|v| parse_retry_after(&v, unix_now()));
             let body = resp.text().await?;
             if status == 429 || body.contains("urn:ietf:params:acme:error:rateLimited") {
                 return Err(AcmeError::RateLimited { retry_after_secs, detail: body });
@@ -727,6 +772,22 @@ fn base64_standard(d: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn retry_after_accepts_seconds_and_http_dates() {
+        assert_eq!(parse_retry_after("120", 0), Some(120));
+        assert_eq!(parse_retry_after(" 7 ", 0), Some(7));
+        // 1994-11-06T08:49:37Z = 784111777
+        assert_eq!(parse_imf_fixdate("Sun, 06 Nov 1994 08:49:37 GMT"), Some(784_111_777));
+        assert_eq!(parse_retry_after("Sun, 06 Nov 1994 08:49:37 GMT", 784_111_777 - 90), Some(90));
+        assert_eq!(parse_retry_after("Sun, 06 Nov 1994 08:49:37 GMT", 784_111_777 + 5), Some(0), "a date in the past is no wait");
+        // leap day and the epoch
+        assert_eq!(parse_imf_fixdate("Thu, 01 Jan 1970 00:00:00 GMT"), Some(0));
+        assert_eq!(parse_imf_fixdate("Thu, 29 Feb 2024 12:00:00 GMT"), Some(1_709_208_000));
+        for bad in ["", "soon", "-5", "Sun, 06 Nov 1994 08:49:37 PST", "Sunday, 06-Nov-94 08:49:37 GMT", "Sun, 32 Nov 1994 08:49:37 GMT", "Sun, 06 Nov 1994 25:49:37 GMT", "Sun, 06 Foo 1994 08:49:37 GMT"] {
+            assert_eq!(parse_retry_after(bad, 0), None, "{bad:?}");
+        }
+    }
+
     use super::*;
     use hashtrinity::crypto::sha256;
 
@@ -988,6 +1049,8 @@ mod tests {
             pub acct_pk: Option<[u8; 64]>,
             pub thumbprint: [u8; 32],
             pub inject_bad_nonce_once: bool,
+            /// Answer the first `newAccount` with `badNonce`.
+            pub inject_bad_nonce_on_account: bool,
             pub rate_limit_new_order: bool,
             pub challenged: Vec<u32>,
             pub finalized_csr_ok: bool,
@@ -1090,6 +1153,10 @@ mod tests {
                         Err(r) => return r,
                     };
                     match p {
+                        "/new-acct" if st.inject_bad_nonce_on_account => {
+                            st.inject_bad_nonce_on_account = false;
+                            problem(400, "badNonce", st)
+                        }
                         "/new-acct" => ok(st, 201, vec![("Location".into(), format!("{}/acct/1", st.base))], "{}".into()),
                         "/new-order" => {
                             if st.rate_limit_new_order {
@@ -1221,6 +1288,15 @@ mod tests {
         assert_eq!(published.len(), 2, "wildcard + apex both need a TXT value at the same name");
         assert!(published.iter().all(|(n, _)| n == "tascloud.app"));
         assert_eq!(dns.removed.lock().unwrap().len(), 2, "every challenge value is cleaned up afterwards");
+    }
+
+    #[tokio::test]
+    async fn account_creation_survives_a_bad_nonce() {
+        let account = test_account();
+        let (dir, state, _dns) = mock_ca::start(&account).await;
+        state.lock().unwrap().inject_bad_nonce_on_account = true;
+        let client = AcmeClient::new(&dir, account, None).await.expect("newAccount is retried with a fresh nonce");
+        assert!(client.account_url().is_some());
     }
 
     #[tokio::test]

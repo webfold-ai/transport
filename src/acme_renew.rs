@@ -133,6 +133,26 @@ pub trait CertStore: CertSource {
     fn put(&self, name: &str, material: CertMaterial) -> Result<(), String>;
     fn remove(&self, name: &str);
     fn names(&self) -> Vec<String>;
+
+    /// Retry state recorded for `name` by a previous process, if this store persists it. Without
+    /// it a restart forgets a CA's `Retry-After` and immediately re-orders, which is how a routine
+    /// deploy defeats rate-limit backoff.
+    fn load_retry(&self, _name: &str) -> Option<RetryState> {
+        None
+    }
+
+    /// Record (`Some`) or clear (`None`) `name`'s retry state. Best effort: losing it costs one
+    /// early retry, never correctness.
+    fn save_retry(&self, _name: &str, _state: Option<&RetryState>) {}
+}
+
+/// The part of a name's renewal state that must survive a restart.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RetryState {
+    pub failures: u32,
+    /// Unix seconds before which no new order is placed.
+    pub next_attempt: i64,
+    pub last_error: Option<String>,
 }
 
 impl CertStore for MemoryCertSource {
@@ -221,6 +241,10 @@ impl FileCertStore {
     fn path_for(&self, name: &str) -> Option<PathBuf> {
         Some(self.dir.join(format!("{}.pem", file_stem(name)?)))
     }
+
+    fn retry_path_for(&self, name: &str) -> Option<PathBuf> {
+        Some(self.dir.join(format!("{}.retry", file_stem(name)?)))
+    }
 }
 
 /// Material is installable only if it has a chain whose leaf has a readable validity window and
@@ -264,6 +288,11 @@ impl CertStore for FileCertStore {
             f.sync_all().map_err(|e| format!("syncing {}: {e}", tmp.display()))?;
         }
         std::fs::rename(&tmp, &path).map_err(|e| format!("installing {}: {e}", path.display()))?;
+        // The rename itself must be durable too: without syncing the directory a power loss can
+        // drop the new directory entry and a restart would reload the old certificate (or none)
+        // and place another order.
+        #[cfg(unix)]
+        std::fs::File::open(&self.dir).and_then(|d| d.sync_all()).map_err(|e| format!("syncing {}: {e}", self.dir.display()))?;
         // Memory is updated only after the file is durable: what is served is never ahead of
         // what a restart would reload.
         self.mem.install(name.to_string(), material);
@@ -279,6 +308,29 @@ impl CertStore for FileCertStore {
 
     fn names(&self) -> Vec<String> {
         self.mem.names()
+    }
+
+    fn load_retry(&self, name: &str) -> Option<RetryState> {
+        let text = std::fs::read_to_string(self.retry_path_for(name)?).ok()?;
+        let mut lines = text.lines();
+        let failures = lines.next()?.strip_prefix("failures=")?.parse().ok()?;
+        let next_attempt = lines.next()?.strip_prefix("next_attempt=")?.parse().ok()?;
+        let last_error = lines.next().and_then(|l| l.strip_prefix("last_error=")).map(str::to_string).filter(|e| !e.is_empty());
+        Some(RetryState { failures, next_attempt, last_error })
+    }
+
+    fn save_retry(&self, name: &str, state: Option<&RetryState>) {
+        let Some(path) = self.retry_path_for(name) else { return };
+        let Some(state) = state else {
+            let _ = std::fs::remove_file(path);
+            return;
+        };
+        let error = state.last_error.as_deref().unwrap_or("").replace(['\n', '\r'], " ");
+        let body = format!("failures={}\nnext_attempt={}\nlast_error={error}\n", state.failures, state.next_attempt);
+        let tmp = path.with_extension("retry.tmp");
+        if std::fs::write(&tmp, body).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        }
     }
 }
 
@@ -308,8 +360,10 @@ impl AcmeIssuer {
 impl CertIssuer for AcmeIssuer {
     fn issue<'a>(&'a self, cert_name: &'a str) -> BoxFuture<'a, Result<CertMaterial, AcmeError>> {
         Box::pin(async move {
-            if cert_name.starts_with("*.") {
-                self.client.issue_dns01(&[cert_name], self.dns01.as_ref()).await
+            if let Some(apex) = cert_name.strip_prefix("*.") {
+                // The wildcard does not cover the bare apex, which we also serve; one certificate
+                // carries both names (two TXT values at the same `_acme-challenge` name).
+                self.client.issue_dns01(&[cert_name, apex], self.dns01.as_ref()).await
             } else if let Some(http01) = &self.http01 {
                 self.client.issue(&[cert_name], http01.as_ref()).await
             } else {
@@ -378,6 +432,10 @@ pub fn due(policy: &RenewalPolicy, held: Option<&CertMaterial>, now: i64) -> Opt
 
 // ── The engine ────────────────────────────────────────────────────────────────────────────
 
+/// How far ahead of `now` a certificate's `notBefore` may be and still be installed (CAs
+/// normally backdate; a few minutes of clock skew must not reject a fresh certificate).
+const NOT_BEFORE_SKEW_SECS: i64 = 300;
+
 #[derive(Clone, Debug, Default)]
 struct NameState {
     failures: u32,
@@ -435,8 +493,16 @@ impl<S: CertStore, I: CertIssuer> RenewalEngine<S, I> {
         self
     }
 
+    /// The name's state: in memory if we have seen it this process, else what a previous process
+    /// persisted (retry deadlines survive a restart), else fresh.
     fn st(&self, name: &str) -> NameState {
-        self.state.get(&name.to_string()).cloned().unwrap_or_default()
+        if let Some(s) = self.state.get(&name.to_string()) {
+            return s.clone();
+        }
+        self.store
+            .load_retry(name)
+            .map(|r| NameState { failures: r.failures, next_attempt: r.next_attempt, last_error: r.last_error, unrequired_since: None })
+            .unwrap_or_default()
     }
 
     /// Delay before the next attempt after `failures` consecutive failures. Exponential, capped,
@@ -500,7 +566,10 @@ impl<S: CertStore, I: CertIssuer> RenewalEngine<S, I> {
                 Ok(material) => match validate(&material) {
                     // Never replace a held certificate with something the CA mangled or that
                     // is already dead: a bad order must leave last-known-good untouched.
-                    Ok(v) if v.not_after > now => self.store.put(&name, material).map_err(|e| (e, None)),
+                    Ok(v) if v.not_after > now && v.not_before <= now.saturating_add(NOT_BEFORE_SKEW_SECS) => {
+                        self.store.put(&name, material).map_err(|e| (e, None))
+                    }
+                    Ok(v) if v.not_before > now => Err(("CA returned a certificate that is not yet valid".to_string(), None)),
                     Ok(_) => Err(("CA returned an already-expired certificate".to_string(), None)),
                     Err(e) => Err((format!("CA returned unusable material: {e}"), None)),
                 },
@@ -509,6 +578,7 @@ impl<S: CertStore, I: CertIssuer> RenewalEngine<S, I> {
             match outcome {
                 Ok(()) => {
                     self.state.put(name.clone(), NameState::default());
+                    self.store.save_retry(&name, None);
                     report.issued.push(name.clone());
                     let activated = registry.lock().await.activate_cert(&name);
                     tracing::info!(cert = %name, ?reason, activated = activated.len(), "certificate installed");
@@ -530,6 +600,7 @@ impl<S: CertStore, I: CertIssuer> RenewalEngine<S, I> {
             let since = *s.unrequired_since.get_or_insert(now);
             if now - since >= self.policy.prune_after_secs {
                 self.store.remove(&name);
+                self.store.save_retry(&name, None);
                 self.state.remove(&name);
                 report.pruned.push(name);
             } else {
@@ -556,6 +627,7 @@ impl<S: CertStore, I: CertIssuer> RenewalEngine<S, I> {
         let is_baseline = self.baseline.iter().any(|b| b == name);
         let give_up = never_had_one && !is_baseline && s.failures >= self.policy.give_up_after;
         tracing::warn!(cert = %name, failures = s.failures, error = %detail, "certificate issuance failed");
+        self.store.save_retry(name, Some(&RetryState { failures: s.failures, next_attempt: s.next_attempt, last_error: s.last_error.clone() }));
         self.state.put(name.to_string(), s);
         report.failed.push((name.to_string(), detail.clone()));
         if give_up {
@@ -994,6 +1066,47 @@ PfFwXFUdKr72euUqW9E4wdcMVA==\n\
     }
 
     // ── durable store ─────────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn a_ca_retry_after_survives_an_engine_restart() {
+        let dir = temp_dir("retry");
+        let reg = registry();
+        let store = Arc::new(FileCertStore::open(&dir).unwrap());
+        let (iss, calls) = issuer(|_, _| Err(AcmeError::RateLimited { retry_after_secs: Some(3 * 3600), detail: "slow down".into() }));
+        let mut eng = RenewalEngine::new(store.clone(), iss, RenewalPolicy::default());
+        let first = eng.run_once(T0, &reg).await;
+        assert_eq!(first.failed.len(), 2);
+        let ordered = calls.lock().unwrap().len();
+
+        // "Restart": a new process opens the same directory and builds a fresh engine.
+        let store2 = Arc::new(FileCertStore::open(&dir).unwrap());
+        let (iss2, calls2) = issuer(|_, _| Ok(ninety_days(T0)));
+        let mut eng2 = RenewalEngine::new(store2.clone(), iss2, RenewalPolicy::default());
+        let r = eng2.run_once(T0 + 600, &reg).await; // inside the CA's 3 h Retry-After
+        assert_eq!((r.issued.len(), r.backing_off), (0, 2), "the persisted deadline holds across the restart");
+        assert!(calls2.lock().unwrap().is_empty(), "no order placed while the CA said wait ({ordered} before)");
+        let st = eng2.status(T0 + 600, &reg).await;
+        assert_eq!(st.iter().find(|s| s.name == "app.acme.com.au").unwrap().consecutive_failures, 1);
+
+        let r = eng2.run_once(T0 + 4 * 3600, &reg).await;
+        assert_eq!(r.issued.len(), 2, "after the deadline it orders, and success clears the persisted state");
+        assert!(store2.load_retry("app.acme.com.au").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_certificate_that_is_not_yet_valid_never_displaces_the_one_we_hold() {
+        let reg = registry();
+        let (iss, _) = issuer(|_, n| if n <= 2 { Ok(ninety_days(T0)) } else { Ok(material(T0 + 61 * DAY + 3600, T0 + 150 * DAY)) });
+        let store = Arc::new(MemoryCertSource::new());
+        let mut eng = engine(store.clone(), iss);
+        eng.run_once(T0, &reg).await;
+        let held = store.cert_for("app.acme.com.au").unwrap().chain_pem;
+        let r = eng.run_once(T0 + 61 * DAY, &reg).await; // renewal due; CA hands back a future-dated cert
+        assert_eq!(r.issued.len(), 0);
+        assert!(r.failed.iter().all(|(_, why)| why.contains("not yet valid")), "{:?}", r.failed);
+        assert_eq!(store.cert_for("app.acme.com.au").unwrap().chain_pem, held);
+    }
 
     fn temp_dir(tag: &str) -> PathBuf {
         let id: String = hashtrinity::crypto::rand_bytes(6).iter().map(|b| format!("{b:02x}")).collect();

@@ -79,6 +79,7 @@ pub trait DnsProbe: Send + Sync {
 /// As [`sweep`], for a registry shared behind a tokio mutex (the edge's shape), under a
 /// [`ProofPolicy`]. The registry lock is **not** held while the probe talks to the network: the
 /// work list is snapshotted, probed lock-free, and each outcome applied under a short lock.
+#[cfg(feature = "runtime-tokio")]
 pub async fn sweep_shared(
     probe: &dyn DnsProbe,
     registry: &tokio::sync::Mutex<EdgeRegistry>,
@@ -505,6 +506,7 @@ mod tests {
         assert_eq!(results[0].1, HostnameState::PendingCert);
     }
 
+    #[cfg(feature = "runtime-tokio")]
     #[tokio::test]
     async fn txt_only_policy_refuses_a_cname_that_may_be_a_forgotten_record() {
         let (reg, challenge) = registry_with_pending();

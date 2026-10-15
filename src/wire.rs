@@ -178,15 +178,24 @@ fn tls_config() -> std::sync::Arc<rustls::ClientConfig> {
             // it, so the first real HTTPS request from ANY consumer would otherwise panic here.
             // `install_default` errors only if a provider is already installed (by this crate or
             // a consumer) — harmless, the existing one wins either way.
-            let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+            // The provider is chosen explicitly: under `fips` it is the FIPS-approved one, never
+            // whatever the process happens to have installed first.
+            #[cfg(feature = "fips")]
+            let provider = rustls::crypto::default_fips_provider();
+            #[cfg(not(feature = "fips"))]
+            let provider = rustls::crypto::aws_lc_rs::default_provider();
+            let _ = provider.clone().install_default();
             let mut roots = rustls::RootCertStore::empty();
             let loaded = rustls_native_certs::load_native_certs();
             for cert in loaded.certs {
                 let _ = roots.add(cert);
             }
-            let config = rustls::ClientConfig::builder()
+            let config = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(provider))
+                .with_safe_default_protocol_versions()
+                .expect("the provider supports the default TLS versions")
                 .with_root_certificates(roots)
                 .with_no_client_auth();
+            debug_assert_eq!(config.fips(), cfg!(feature = "fips"), "client TLS must be FIPS exactly when built for it");
             std::sync::Arc::new(config)
         })
         .clone()

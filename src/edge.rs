@@ -474,6 +474,32 @@ impl EdgeRegistry {
         }
     }
 
+    /// Live release tombstones as `(label, releasing tenant, quarantined-until unix seconds)`.
+    /// A host that persists registry state stores these with it: the tombstones are what stop a
+    /// rival claiming a released label (and inheriting a customer's stale CNAME to it) after a
+    /// restart inside the quarantine window.
+    #[must_use]
+    pub fn quarantine_snapshot(&self) -> Vec<(String, String, u64)> {
+        let now = (self.clock)();
+        self.quarantine.iter().filter(|(_, (_, until))| *until > now).map(|(label, (tenant, until))| (label.clone(), tenant.clone(), *until)).collect()
+    }
+
+    /// Reinstate tombstones saved by [`Self::quarantine_snapshot`]. Entries already expired are
+    /// ignored; an existing tombstone is only ever *extended*, never shortened.
+    pub fn restore_quarantine(&mut self, entries: impl IntoIterator<Item = (String, String, u64)>) {
+        let now = (self.clock)();
+        for (label, tenant, until) in entries {
+            if until <= now {
+                continue;
+            }
+            let label = normalize(&label);
+            if self.quarantine.get(&label).is_some_and(|(_, existing)| *existing >= until) {
+                continue;
+            }
+            self.quarantine.put(label, (tenant, until));
+        }
+    }
+
     /// Whether `fqdn` cannot be claimed by `tenant_id`: held by anyone, or quarantined after
     /// release by a *different* tenant. Expired quarantine entries are dropped here.
     fn is_unavailable(&mut self, fqdn: &str, tenant_id: &str) -> bool {
@@ -896,6 +922,10 @@ pub struct CertMaterial {
 #[must_use]
 pub fn cert_name_for(fqdn: &str) -> String {
     let fqdn = normalize(fqdn);
+    // The bare apex is covered by the same certificate as its wildcard (which carries both names).
+    if let Some(apex) = APEXES.iter().find(|a| a.zone == fqdn) {
+        return apex.wildcard();
+    }
     match apex_of(&fqdn) {
         Some(apex) => apex.wildcard(),
         None => fqdn,
@@ -1149,6 +1179,35 @@ mod tests {
         assert_ne!(other.fqdn, first.fqdn);
         // The original tenant may take it back at once.
         assert_eq!(reg.claim_managed(apex, "dk", route("acme", "tun-1b")).unwrap().fqdn, first.fqdn);
+    }
+
+    #[test]
+    fn the_bare_apex_and_its_wildcard_share_one_certificate_name() {
+        assert_eq!(cert_name_for("tascloud.app"), "*.tascloud.app");
+        assert_eq!(cert_name_for("TASCLOUD.app."), "*.tascloud.app");
+        assert_eq!(cert_name_for("mine.tascloud.app"), "*.tascloud.app");
+        assert_eq!(cert_name_for("app.acme.com.au"), "app.acme.com.au");
+    }
+
+    #[test]
+    fn quarantine_survives_a_restart_through_snapshot_and_restore() {
+        let mut a = EdgeRegistry::new(b"s".to_vec());
+        let apex = APEXES.iter().find(|x| x.zone == "tascloud.app").unwrap();
+        a.claim_managed_label(apex, "mine", route("acme", "t")).unwrap();
+        a.release("acme", "mine.tascloud.app").unwrap();
+        let saved = a.quarantine_snapshot();
+        assert_eq!(saved.len(), 1);
+
+        let mut b = EdgeRegistry::new(b"s".to_vec());
+        assert!(b.claim_managed_label(apex, "mine", route("rival", "t2")).is_ok(), "a fresh registry knows nothing (the failure being fixed)");
+        let mut c = EdgeRegistry::new(b"s".to_vec());
+        c.restore_quarantine(saved.clone());
+        assert!(c.claim_managed_label(apex, "mine", route("rival", "t2")).is_err(), "the rival is still refused after the restart");
+        assert!(c.claim_managed_label(apex, "mine", route("acme", "t3")).is_ok(), "the releasing tenant may take it back");
+        // expired entries are ignored, and restore never shortens an existing tombstone
+        let mut d = EdgeRegistry::new(b"s".to_vec());
+        d.restore_quarantine(vec![("old.tascloud.app".into(), "x".into(), 1)]);
+        assert!(d.quarantine_snapshot().is_empty());
     }
 
     #[test]
