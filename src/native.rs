@@ -256,7 +256,17 @@ pub struct NativeEndpoint {
     peer_id: PeerId,
     secret_key: [u8; 32],
     connections: Arc<Mutex<HashMap<PeerId, Arc<NativeConnection>>>>,
+    /// Handshaken inbound connections, fed by the acceptor task `accept` starts on first use.
+    incoming: Arc<tokio::sync::Mutex<Option<tokio::sync::mpsc::Receiver<NativeConnection>>>>,
 }
+
+/// Longest an unauthenticated peer may take to complete the handshake. Without it a client that
+/// connects and says nothing holds the handshake (and, before handshakes ran concurrently, the
+/// whole accept loop) open indefinitely.
+pub const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Most handshakes in flight at once; further TCP connections wait in the kernel backlog.
+const MAX_INFLIGHT_HANDSHAKES: usize = 256;
 
 impl NativeEndpoint {
     /// Bind a new endpoint on `addr` (e.g. "0.0.0.0:0" for any free port).
@@ -272,6 +282,7 @@ impl NativeEndpoint {
             peer_id,
             secret_key,
             connections: Arc::new(Mutex::new(HashMap::new())),
+            incoming: Arc::new(tokio::sync::Mutex::new(None)),
         })
     }
 
@@ -284,6 +295,7 @@ impl NativeEndpoint {
             peer_id,
             secret_key,
             connections: Arc::new(Mutex::new(HashMap::new())),
+            incoming: Arc::new(tokio::sync::Mutex::new(None)),
         })
     }
 
@@ -316,7 +328,9 @@ impl Transport for NativeEndpoint {
         Box::pin(async move {
             let mut stream = TcpStream::connect(&addr).await?;
             let peer_addr = stream.peer_addr().ok();
-            let (peer_id, send_key, recv_key) = run_handshake(&mut stream, &secret_key, true).await?;
+            let (peer_id, send_key, recv_key) = tokio::time::timeout(HANDSHAKE_TIMEOUT, run_handshake(&mut stream, &secret_key, true))
+                .await
+                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "handshake timed out"))??;
             let (read_half, write_half) = stream.into_split();
             let conn = NativeConnection::new(
                 read_half,
@@ -331,21 +345,51 @@ impl Transport for NativeEndpoint {
         })
     }
 
+    /// The next authenticated inbound connection. Handshakes run concurrently, each under
+    /// [`HANDSHAKE_TIMEOUT`], on an acceptor task started by the first call — so a peer that
+    /// connects and stalls costs one task for ten seconds, not the listener. Failed handshakes
+    /// are dropped silently; this only ever yields connections whose peer proved its identity.
     fn accept<'a>(&'a self) -> BoxFuture<'a, Option<NativeConnection>> {
         let listener = self.listener.clone();
         let secret_key = self.secret_key;
+        let incoming = self.incoming.clone();
         Box::pin(async move {
-            let (mut stream, peer_addr) = listener.accept().await.ok()?;
-            let (peer_id, send_key, recv_key) = run_handshake(&mut stream, &secret_key, false).await.ok()?;
-            let (read_half, write_half) = stream.into_split();
-            Some(NativeConnection::new(
-                read_half,
-                write_half,
-                peer_id,
-                send_key,
-                recv_key,
-                Some(peer_addr.to_string()),
-            ))
+            let mut slot = incoming.lock().await;
+            let rx = match &mut *slot {
+                Some(rx) => rx,
+                None => {
+                    let (tx, rx) = tokio::sync::mpsc::channel::<NativeConnection>(64);
+                    tokio::spawn(async move {
+                        let inflight = Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT_HANDSHAKES));
+                        loop {
+                            let permit = match inflight.clone().acquire_owned().await {
+                                Ok(p) => p,
+                                Err(_) => return,
+                            };
+                            let accepted = tokio::select! {
+                                () = tx.closed() => return,
+                                r = listener.accept() => r,
+                            };
+                            let Ok((mut stream, peer_addr)) = accepted else {
+                                // EMFILE and friends: back off rather than spin.
+                                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                                continue;
+                            };
+                            let tx = tx.clone();
+                            tokio::spawn(async move {
+                                let _permit = permit;
+                                let hs = tokio::time::timeout(HANDSHAKE_TIMEOUT, run_handshake(&mut stream, &secret_key, false)).await;
+                                let Ok(Ok((peer_id, send_key, recv_key))) = hs else { return };
+                                let (read_half, write_half) = stream.into_split();
+                                let conn = NativeConnection::new(read_half, write_half, peer_id, send_key, recv_key, Some(peer_addr.to_string()));
+                                let _ = tx.send(conn).await;
+                            });
+                        }
+                    });
+                    slot.insert(rx)
+                }
+            };
+            rx.recv().await
         })
     }
 
@@ -623,6 +667,34 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert!(err.to_string().contains("maximum size"), "{err}");
         attacker.abort();
+    }
+
+    /// A peer that connects and never speaks must not stop the next, honest peer from being
+    /// accepted: handshakes are concurrent and each is bounded.
+    #[tokio::test]
+    async fn a_stalled_handshake_does_not_block_the_next_connection() {
+        let server = NativeEndpoint::bind("127.0.0.1:0").await.unwrap();
+        let addr = server.local_addr().unwrap();
+        let server_id = Transport::id(&server);
+
+        let _squatters: Vec<_> = {
+            let mut v = Vec::new();
+            for _ in 0..3 {
+                v.push(tokio::net::TcpStream::connect(&addr).await.unwrap());
+            }
+            v
+        };
+        let accepter = tokio::spawn(async move { Transport::accept(&server).await.map(|c| Connection::peer_id(&c)) });
+
+        let client = NativeEndpoint::bind("127.0.0.1:0").await.unwrap();
+        let client_id = Transport::id(&client);
+        let conn = tokio::time::timeout(std::time::Duration::from_secs(5), Transport::connect(&client, &addr, b"t"))
+            .await
+            .expect("honest handshake must not wait behind stalled ones")
+            .unwrap();
+        assert_eq!(Connection::peer_id(&conn), server_id);
+        let seen = tokio::time::timeout(std::time::Duration::from_secs(5), accepter).await.unwrap().unwrap();
+        assert_eq!(seen, Some(client_id));
     }
 
     #[tokio::test]

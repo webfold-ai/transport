@@ -1155,6 +1155,49 @@ mod sni_tests {
         assert_eq!(cfg.fips(), cfg!(feature = "fips"), "FIPS status must match the build");
     }
 
+    /// Hybrid post-quantum key exchange (X25519MLKEM768) is the edge's preferred group on the
+    /// default build, and a client that lacks it still connects (classical fallback). The FIPS
+    /// build is deliberately excluded: rustls' FIPS provider offers only approved groups.
+    #[cfg(not(feature = "fips"))]
+    #[tokio::test]
+    async fn the_edge_negotiates_hybrid_pq_key_exchange_and_falls_back_for_classical_clients() {
+        use rustls::pki_types::{CertificateDer, ServerName};
+        let (src, r) = resolver();
+        let m = material("*.tascloud.app");
+        src.install("*.tascloud.app", m.clone());
+        let acceptor = tokio_rustls::TlsAcceptor::from(r.server_config().unwrap());
+        let mut roots = rustls::RootCertStore::empty();
+        for der in crate::pem::blocks(&m.chain_pem, "CERTIFICATE") {
+            roots.add(CertificateDer::from(der)).unwrap();
+        }
+
+        let classical_only = {
+            let mut p = super::sni::provider();
+            p.kx_groups = vec![rustls::crypto::aws_lc_rs::kx_group::X25519];
+            p
+        };
+        for (provider, expect) in [
+            (super::sni::provider(), rustls::NamedGroup::X25519MLKEM768),
+            (classical_only, rustls::NamedGroup::X25519),
+        ] {
+            let cfg = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_root_certificates(roots.clone())
+                .with_no_client_auth();
+            let (c, s) = tokio::io::duplex(64 * 1024);
+            let acceptor = acceptor.clone();
+            let server = tokio::spawn(async move {
+                let tls = acceptor.accept(s).await.unwrap();
+                tls.get_ref().1.negotiated_key_exchange_group().map(|g| g.name())
+            });
+            let name = ServerName::try_from("amber-wren-1a2b3c.tascloud.app".to_string()).unwrap();
+            let client = tokio_rustls::TlsConnector::from(Arc::new(cfg)).connect(name, c).await.unwrap();
+            assert_eq!(client.get_ref().1.negotiated_key_exchange_group().map(|g| g.name()), Some(expect));
+            assert_eq!(server.await.unwrap(), Some(expect));
+        }
+    }
+
     #[test]
     fn a_chain_whose_leaf_does_not_belong_to_the_key_is_refused() {
         let (src, r) = resolver();

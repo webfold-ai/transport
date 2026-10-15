@@ -42,6 +42,17 @@
   `sni_route`, `decide_passthrough`. Passthrough names need no certificate and are never issued one.
 - `Decision::NoConnector.status()` is 502, matching its documentation (was 503).
 
+### Native transport
+- **`NativeEndpoint::accept` no longer lets one stalled peer block the listener.** It ran the
+  handshake inline with no timeout, so a TCP connection that said nothing held every later
+  dial-in hostage indefinitely. Handshakes now run concurrently (at most 256) on an acceptor task,
+  each under `HANDSHAKE_TIMEOUT` (10 s, also applied to `connect`). `accept` yields only
+  connections whose peer proved its identity.
+- Edge helpers: `EdgeRegistry::bind_peer`, `ZoneAuthority::set_caa_account_uri`,
+  `edge_verify::{ProofPolicy, sweep_shared}`, `RenewalEngine::run_forever_with`.
+- A test pins that the edge's server config negotiates hybrid `X25519MLKEM768` and still serves
+  classical-only clients.
+
 ### Migration
 - `AccountKey::from_bytes` now returns `Result` (new: `generate`, `to_bytes`).
 - `EdgeRegistry::add_custom` returns `InvalidCnameTarget` unless the target is an active managed
