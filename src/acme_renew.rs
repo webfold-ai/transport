@@ -592,7 +592,18 @@ impl<S: CertStore, I: CertIssuer> RenewalEngine<S, I> {
 
     /// Run [`Self::run_once`] every `interval` until the future is dropped. Spawn this once at
     /// boot; it never touches the request path.
-    pub async fn run_forever(mut self, registry: Arc<tokio::sync::Mutex<EdgeRegistry>>, interval: std::time::Duration) {
+    pub async fn run_forever(self, registry: Arc<tokio::sync::Mutex<EdgeRegistry>>, interval: std::time::Duration) {
+        self.run_forever_with(registry, interval, |_, _| {}).await;
+    }
+
+    /// As [`Self::run_forever`], handing each pass's report and the per-name status to
+    /// `on_pass` — how a host publishes `/certs`-style status without owning the engine.
+    pub async fn run_forever_with(
+        mut self,
+        registry: Arc<tokio::sync::Mutex<EdgeRegistry>>,
+        interval: std::time::Duration,
+        mut on_pass: impl FnMut(&RunReport, Vec<CertStatus>) + Send,
+    ) {
         loop {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -601,6 +612,8 @@ impl<S: CertStore, I: CertIssuer> RenewalEngine<S, I> {
             if !report.issued.is_empty() || !report.failed.is_empty() || !report.pruned.is_empty() {
                 tracing::info!(?report, "renewal pass");
             }
+            let status = self.status(now, &registry).await;
+            on_pass(&report, status);
             tokio::time::sleep(interval).await;
         }
     }

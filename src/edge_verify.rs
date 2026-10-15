@@ -38,8 +38,30 @@ impl Observed {
     /// Whether what we saw satisfies `challenge` by either accepted proof.
     #[must_use]
     pub fn proves(&self, challenge: &Challenge) -> bool {
-        challenge.satisfied_by_txt(&self.txt) || challenge.satisfied_by_cname(&self.cname)
+        self.proves_under(challenge, ProofPolicy::TxtOrCname)
     }
+
+    /// As [`Self::proves`], restricted to the proofs `policy` allows.
+    #[must_use]
+    pub fn proves_under(&self, challenge: &Challenge, policy: ProofPolicy) -> bool {
+        challenge.satisfied_by_txt(&self.txt)
+            || (policy == ProofPolicy::TxtOrCname && challenge.satisfied_by_cname(&self.cname))
+    }
+}
+
+/// Which observations count as proof of control.
+///
+/// A CNAME to our managed hostname proves only that *someone once pointed* the name at us. A
+/// forgotten CNAME to a label that another tenant later holds (after the release quarantine
+/// lapses) satisfies it without the domain owner doing anything. The TXT token is derived from a
+/// server secret bound to the exact hostname and tenant, so only the domain's DNS controller can
+/// publish it. The default is therefore [`ProofPolicy::TxtOnly`]; `TxtOrCname` is the lower-
+/// friction option for deployments that accept the residual risk.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ProofPolicy {
+    #[default]
+    TxtOnly,
+    TxtOrCname,
 }
 
 /// The DNS lookups a validation sweep needs. A trait so the sweep is testable without a
@@ -54,6 +76,27 @@ pub trait DnsProbe: Send + Sync {
 /// Returns each hostname's resulting state so a caller can log or notify. `max_probes` caps
 /// how many failed checks a hostname absorbs before it is failed outright — see
 /// [`EdgeRegistry::record_probe`].
+/// As [`sweep`], for a registry shared behind a tokio mutex (the edge's shape), under a
+/// [`ProofPolicy`]. The registry lock is **not** held while the probe talks to the network: the
+/// work list is snapshotted, probed lock-free, and each outcome applied under a short lock.
+pub async fn sweep_shared(
+    probe: &dyn DnsProbe,
+    registry: &tokio::sync::Mutex<EdgeRegistry>,
+    max_probes: i64,
+    policy: ProofPolicy,
+) -> Vec<(String, HostnameState)> {
+    let pending = registry.lock().await.pending_validation();
+    let mut results = Vec::with_capacity(pending.len());
+    for record in pending {
+        let Some(challenge) = record.challenge.as_ref() else { continue };
+        let proven = probe.observe(challenge).await.proves_under(challenge, policy);
+        if let Ok(state) = registry.lock().await.record_probe(&record.fqdn, proven, max_probes) {
+            results.push((record.fqdn, state));
+        }
+    }
+    results
+}
+
 pub async fn sweep(
     probe: &dyn DnsProbe,
     registry: &mut EdgeRegistry,
@@ -460,6 +503,22 @@ mod tests {
         let results = sweep(&probe, &mut reg, 5).await;
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].1, HostnameState::PendingCert);
+    }
+
+    #[tokio::test]
+    async fn txt_only_policy_refuses_a_cname_that_may_be_a_forgotten_record() {
+        let (reg, challenge) = registry_with_pending();
+        let reg = tokio::sync::Mutex::new(reg);
+        let probe = StaticProbe::new().with_cname(&challenge.fqdn, vec![&challenge.cname_target]);
+        let results = sweep_shared(&probe, &reg, 5, ProofPolicy::TxtOnly).await;
+        assert_eq!(results[0].1, HostnameState::PendingDns, "a CNAME alone must not prove control by default");
+        let results = sweep_shared(&probe, &reg, 5, ProofPolicy::TxtOrCname).await;
+        assert_eq!(results[0].1, HostnameState::PendingCert, "...unless the deployment opts in");
+
+        let (reg, challenge) = registry_with_pending();
+        let reg = tokio::sync::Mutex::new(reg);
+        let probe = StaticProbe::new().with_txt(&challenge.txt_name, vec![&challenge.token]);
+        assert_eq!(sweep_shared(&probe, &reg, 5, ProofPolicy::default()).await[0].1, HostnameState::PendingCert);
     }
 
     #[tokio::test]

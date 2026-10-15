@@ -191,6 +191,15 @@ impl ZoneAuthority {
         }
     }
 
+    /// Bind CAA issuance to the ACME account at `uri` for every zone (RFC 8657), once the account
+    /// exists. Until it is called, zones publish the plain `issue` records.
+    pub fn set_caa_account_uri(&mut self, uri: &str) {
+        let updated: Vec<ZoneConfig> = self.zones.iter().map(|(_, z)| z.clone().with_caa_account_uri(uri)).collect();
+        for z in updated {
+            self.zones.put(z.zone.clone(), z);
+        }
+    }
+
     /// The zone `fqdn` falls in — the apex itself or anything under it.
     fn zone_for(&self, fqdn: &str) -> Option<&ZoneConfig> {
         self.zones

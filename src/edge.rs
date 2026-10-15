@@ -227,6 +227,10 @@ pub struct Route {
     pub origin_port: u16,
 }
 
+/// The all-zero peer: a hostname admitted before its connector has enrolled. It can match no real
+/// connection (an Ed25519 public key is never all-zero), so an unbound route is simply offline.
+pub const UNBOUND_PEER: PeerId = [0u8; 32];
+
 /// A hostname's lifecycle. Managed names skip straight past `PendingDns` (we are the
 /// authority, so there is nothing to prove); custom names walk the whole ladder.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -372,6 +376,8 @@ pub enum EdgeError {
     NotFound(String),
     /// The caller's tenant does not own this hostname.
     Forbidden(String),
+    /// The hostname's connector identity is already bound to a different peer.
+    PeerConflict(String),
     /// The operation is not valid in the hostname's current state (e.g. resuming one that is
     /// not suspended, or suspending a failed one).
     BadState(String),
@@ -390,6 +396,7 @@ impl std::fmt::Display for EdgeError {
             EdgeError::Taken(h) => write!(f, "hostname already taken: {h}"),
             EdgeError::NotFound(h) => write!(f, "no such hostname: {h}"),
             EdgeError::Forbidden(h) => write!(f, "hostname belongs to another tenant: {h}"),
+            EdgeError::PeerConflict(h) => write!(f, "hostname is already bound to a different connector: {h}"),
             EdgeError::BadState(h) => write!(f, "operation not valid in the current state of: {h}"),
             EdgeError::InvalidCnameTarget(t) => {
                 write!(f, "CNAME target must be an active managed hostname of this tenant: {t}")
@@ -734,6 +741,29 @@ impl EdgeRegistry {
             }
         }
         waiting
+    }
+
+    /// Bind the connector that will serve `fqdn`: the first enrollment fixes its identity and
+    /// origin port (trust on first use, within the window between admission and enrollment —
+    /// a portal that already knows the connector's identity should pass it at admission instead).
+    /// Re-enrolling the same peer is idempotent; a different peer is refused, so a second agent
+    /// holding the shared enrollment secret cannot take over a hostname.
+    pub fn bind_peer(&mut self, fqdn: &str, peer: PeerId, origin_port: u16) -> Result<(), EdgeError> {
+        let fqdn = normalize(fqdn);
+        let Some(record) = self.hosts.get(&fqdn) else {
+            return Err(EdgeError::NotFound(fqdn));
+        };
+        let mut record = record.clone();
+        if peer == UNBOUND_PEER {
+            return Err(EdgeError::InvalidHostname(fqdn));
+        }
+        if record.route.peer != UNBOUND_PEER && record.route.peer != peer {
+            return Err(EdgeError::PeerConflict(fqdn));
+        }
+        record.route.peer = peer;
+        record.route.origin_port = origin_port;
+        self.hosts.put(fqdn, record);
+        Ok(())
     }
 
     /// Choose who terminates TLS for one of the tenant's hostnames.
@@ -1293,6 +1323,24 @@ mod tests {
         assert!(!reg.lookup("secure.acme.com.au").unwrap().is_servable(false));
         // Only the owner may flip it.
         assert!(matches!(reg.set_tls_mode("rival", "secure.acme.com.au", TlsMode::Passthrough), Err(EdgeError::Forbidden(_))));
+    }
+
+    #[test]
+    fn the_first_enrollment_binds_the_connector_and_a_second_peer_cannot_take_over() {
+        let mut reg = EdgeRegistry::new(b"s".to_vec());
+        let apex = APEXES.iter().find(|a| a.zone == "tascloud.app").unwrap();
+        let mut r = route("acme", "t1");
+        r.peer = UNBOUND_PEER;
+        let rec = reg.claim_managed(apex, "dk", r).unwrap();
+
+        let (a, b) = ([1u8; 32], [2u8; 32]);
+        reg.bind_peer(&rec.fqdn, a, 9000).unwrap();
+        assert_eq!(reg.lookup(&rec.fqdn).unwrap().route.peer, a);
+        assert_eq!(reg.lookup(&rec.fqdn).unwrap().route.origin_port, 9000);
+        reg.bind_peer(&rec.fqdn, a, 9001).unwrap(); // idempotent re-enrollment (may move the port)
+        assert!(matches!(reg.bind_peer(&rec.fqdn, b, 9000), Err(EdgeError::PeerConflict(_))));
+        assert!(matches!(reg.bind_peer(&rec.fqdn, UNBOUND_PEER, 1), Err(_)), "zero is not an identity");
+        assert!(matches!(reg.bind_peer("nope.tascloud.app", a, 1), Err(EdgeError::NotFound(_))));
     }
 
     #[test]
