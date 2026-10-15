@@ -32,6 +32,23 @@
   `EdgeRegistry::{quarantine_snapshot, restore_quarantine}` let a host persist release tombstones;
   `Cargo.lock` regenerated for the new dependency set.
 
+- **ACME External Account Binding (RFC 8555 §7.3.4)**: `AcmeClient::new_with_eab` +
+  `ExternalAccountBinding::{from_base64url}` register with CAs that require a CA-issued `kid` and
+  HMAC key (ZeroSSL, Google, Sectigo...); `new` is the unchanged no-EAB wrapper. The key is never
+  logged (`Debug` redacts it).
+- **ACME account key rollover (RFC 8555 §7.3.5)**: `AcmeClient::rollover_account_key(&self, new_key)`
+  swaps the account's key via the directory's `keyChange` (old-key outer JWS around a new-key inner
+  JWS); the account URL is unchanged and the client signs with the new key from then on. `Directory`
+  now exposes `key_change`.
+- **ACME Renewal Information (RFC 9773)**: `AcmeClient::renewal_info` fetches the CA's suggested
+  renewal window (`Directory::renewal_info`, `acme::ari_cert_id`, `RenewalWindow`). The engine uses it
+  through the new `CertIssuer::renewal_window` (default: no advice; `AcmeIssuer` asks the CA): a name
+  is also due, as `Reason::CaSuggested`, once a deterministic per-name instant inside the window
+  (`ari_renew_at`) has passed. Advisory and advance-only: a CA without ARI, a failed lookup or a
+  window still ahead leaves the percent-of-lifetime rule in charge; lookups are at most once per
+  `Retry-After` (default 6 h) per name and never while a name is backing off. Pebble end-to-end tests
+  cover all three features.
+
 ### Crypto
 - **ACME account/certificate keys, JWS signing and CSR signing now use `aws-lc-rs`** instead of
   hashtrinity's hand-written P-256 (variable-time scalar multiplication). The edge serves TLS
@@ -65,6 +82,8 @@
   classical-only clients.
 
 ### Migration
+- `acme::Directory` gained `key_change` and `renewal_info` (both `Option`); `acme_renew::Reason` gained
+  `CaSuggested`; `CertIssuer` gained a defaulted `renewal_window` (existing implementors compile as is).
 - `AccountKey::from_bytes` now returns `Result` (new: `generate`, `to_bytes`).
 - `EdgeRegistry::add_custom` returns `InvalidCnameTarget` unless the target is an active managed
   hostname of the same tenant. `HostnameRecord` has a new `tls_mode` field.

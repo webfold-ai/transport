@@ -10,7 +10,11 @@
 //! - **When to renew.** At a fraction of the certificate's own lifetime ([`RenewalPolicy`]),
 //!   not "30 days before expiry": lifetimes are shrinking (90 -> 45 -> 6 days) and a fixed
 //!   30-day window would mean renewing a 45-day certificate after 15 days and a 6-day one
-//!   immediately, forever.
+//!   immediately, forever. Sooner if the CA says so: where it publishes ACME Renewal
+//!   Information (RFC 9773, [`CertIssuer::renewal_window`]) a name is also due once a
+//!   deterministic per-name instant inside the CA's suggested window has passed
+//!   ([`Reason::CaSuggested`], [`ari_renew_at`]). ARI is advisory and can only *advance* a
+//!   renewal: a CA without it, or one whose answer fails, leaves the percentage rule in charge.
 //! - **What to do when it fails.** Keep serving the last-known-good certificate (a failed
 //!   *renewal* is not a failed hostname — INV-06), back off exponentially with deterministic
 //!   per-name jitter, honour the CA's `Retry-After`, and never hammer a rate limit.
@@ -38,7 +42,7 @@ use std::sync::Arc;
 use hashtrinity::crypto::sha256;
 use hashtrinity::Table;
 
-use crate::acme::{der, AcmeClient, AcmeError, Dns01Responder, Http01Responder};
+use crate::acme::{days_from_civil, der, AcmeClient, AcmeError, Dns01Responder, Http01Responder, RenewalWindow};
 use crate::edge::{CertMaterial, CertSource, EdgeRegistry, APEXES};
 use crate::edge_proxy::MemoryCertSource;
 use crate::BoxFuture;
@@ -57,17 +61,6 @@ impl Validity {
     pub fn lifetime(&self) -> i64 {
         self.not_after - self.not_before
     }
-}
-
-/// Days since 1970-01-01 for a proleptic-Gregorian civil date (Hinnant's algorithm).
-fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
-    let y = if m <= 2 { y - 1 } else { y };
-    let era = y.div_euclid(400);
-    let yoe = y - era * 400;
-    let mp = (m + 9) % 12;
-    let doy = (153 * mp + 2) / 5 + d - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146_097 + doe - 719_468
 }
 
 /// `UTCTime` (`YYMMDDHHMMSSZ`) or `GeneralizedTime` (`YYYYMMDDHHMMSSZ`) -> unix seconds.
@@ -340,6 +333,15 @@ impl CertStore for FileCertStore {
 /// CA; [`AcmeIssuer`] is the production implementation.
 pub trait CertIssuer: Send + Sync {
     fn issue<'a>(&'a self, cert_name: &'a str) -> BoxFuture<'a, Result<CertMaterial, AcmeError>>;
+
+    /// The CA's renewal advice for a certificate it issued (ACME Renewal Information, RFC 9773),
+    /// if it gives any. Advisory: `None` — the default — means "no advice", whether the CA has
+    /// no ARI, does not know the certificate or failed to answer, and the engine then renews on
+    /// the percentage rule alone. An implementation should not retry or sleep here; the engine
+    /// polls at most once per [`RenewalWindow::retry_after_secs`] (default 6 h) per name.
+    fn renewal_window<'a>(&'a self, _material: &'a CertMaterial) -> BoxFuture<'a, Option<RenewalWindow>> {
+        Box::pin(async { None })
+    }
 }
 
 /// [`CertIssuer`] over a registered ACME account: DNS-01 for wildcards (we are the
@@ -369,6 +371,18 @@ impl CertIssuer for AcmeIssuer {
             } else {
                 // No way to prove control of a customer's name without an HTTP-01 listener.
                 Err(AcmeError::ChallengeSetup)
+            }
+        })
+    }
+
+    fn renewal_window<'a>(&'a self, material: &'a CertMaterial) -> BoxFuture<'a, Option<RenewalWindow>> {
+        Box::pin(async move {
+            match self.client.renewal_info(&material.chain_pem).await {
+                Ok(window) => window,
+                Err(e) => {
+                    tracing::debug!(error = %e, "ARI lookup failed; renewing on the percentage rule");
+                    None
+                }
             }
         })
     }
@@ -416,9 +430,13 @@ pub enum Reason {
     Unreadable,
     Expired,
     Renewal,
+    /// The CA's ACME Renewal Information window (RFC 9773) has opened for this certificate,
+    /// ahead of the percentage-of-lifetime rule.
+    CaSuggested,
 }
 
-/// Whether, given what is held, `cert_name` needs an order now. Pure.
+/// Whether, given what is held, `cert_name` needs an order now. Pure. This is the
+/// percentage-of-lifetime rule only; [`due_with_window`] adds the CA's advice.
 #[must_use]
 pub fn due(policy: &RenewalPolicy, held: Option<&CertMaterial>, now: i64) -> Option<Reason> {
     let Some(material) = held else { return Some(Reason::Missing) };
@@ -430,11 +448,61 @@ pub fn due(policy: &RenewalPolicy, held: Option<&CertMaterial>, now: i64) -> Opt
     (now >= renew_at).then_some(Reason::Renewal)
 }
 
+/// The instant within the CA's suggested window at which `name` renews: `start` plus a
+/// deterministic, name-derived fraction of the window (SHA-256, like the retry jitter), so a
+/// fleet of certificates sharing a window spreads across it instead of renewing in one burst
+/// (RFC 9773 §4.2 asks clients to pick randomly), reproducibly across restarts and in logs.
+/// Always within `start..=end`; a degenerate window yields `start`.
+#[must_use]
+pub fn ari_renew_at(name: &str, window: &RenewalWindow) -> i64 {
+    let d = sha256(format!("ari:{name}").as_bytes());
+    let frac = u64::from_be_bytes([d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]]);
+    let span = u128::try_from(window.end.saturating_sub(window.start)).unwrap_or(0);
+    let offset = i64::try_from((span * u128::from(frac)) >> 64).unwrap_or(0);
+    window.start.saturating_add(offset)
+}
+
+/// [`due`] plus the CA's renewal advice. A held, otherwise healthy certificate is
+/// [`Reason::CaSuggested`] once `now` reaches [`ari_renew_at`] inside `window` (an `end` already
+/// past makes that immediate); anything else is [`due`]'s answer. A `window` of `None` — no ARI,
+/// or a failed lookup — changes nothing, and a window still in the future never causes an order:
+/// ARI can only advance a renewal, never delay one the percentage rule already wants.
+///
+/// A window that starts before the held certificate's `notBefore` is advice about some other
+/// certificate (or a broken CA) and is ignored. Without that, a CA answering every lookup with
+/// the same long-past window would have each replacement re-ordered on the next pass, burning
+/// its rate limit. Pure.
+#[must_use]
+pub fn due_with_window(policy: &RenewalPolicy, name: &str, held: Option<&CertMaterial>, now: i64, window: Option<&RenewalWindow>) -> Option<Reason> {
+    if let Some(reason) = due(policy, held, now) {
+        return Some(reason);
+    }
+    let (v, w) = (cert_validity(&held?.chain_pem)?, window?);
+    (w.start >= v.not_before && now >= ari_renew_at(name, w)).then_some(Reason::CaSuggested)
+}
+
 // ── The engine ────────────────────────────────────────────────────────────────────────────
 
 /// How far ahead of `now` a certificate's `notBefore` may be and still be installed (CAs
 /// normally backdate; a few minutes of clock skew must not reject a fresh certificate).
 const NOT_BEFORE_SKEW_SECS: i64 = 300;
+
+/// How long to wait before asking the CA for renewal information again when it did not say
+/// (RFC 9773 §4.2 suggests a few hours), and the most a `Retry-After` can defer the next ask.
+const ARI_DEFAULT_POLL_SECS: u64 = 6 * 3600;
+const ARI_MAX_POLL_SECS: u64 = 7 * 24 * 3600;
+
+/// The last renewal advice fetched for a name's held certificate. In memory only: after a
+/// restart the CA is asked once more.
+#[derive(Clone, Debug)]
+struct AriCache {
+    /// SHA-256 of the chain it was fetched for; advice about a replaced certificate is dropped.
+    cert: [u8; 32],
+    /// `None` when the CA had no advice (or the lookup failed) — cached so a failing ARI endpoint
+    /// is not hit on every pass.
+    window: Option<RenewalWindow>,
+    poll_after: i64,
+}
 
 #[derive(Clone, Debug, Default)]
 struct NameState {
@@ -442,6 +510,7 @@ struct NameState {
     next_attempt: i64,
     last_error: Option<String>,
     unrequired_since: Option<i64>,
+    ari: Option<AriCache>,
 }
 
 /// What one pass did.
@@ -501,7 +570,7 @@ impl<S: CertStore, I: CertIssuer> RenewalEngine<S, I> {
         }
         self.store
             .load_retry(name)
-            .map(|r| NameState { failures: r.failures, next_attempt: r.next_attempt, last_error: r.last_error, unrequired_since: None })
+            .map(|r| NameState { failures: r.failures, next_attempt: r.next_attempt, last_error: r.last_error, ..NameState::default() })
             .unwrap_or_default()
     }
 
@@ -517,6 +586,22 @@ impl<S: CertStore, I: CertIssuer> RenewalEngine<S, I> {
         let base_i = i128::from(base);
         let jittered = u64::try_from(base_i + base_i * per_mille / 1000).unwrap_or(base);
         jittered.max(retry_after.unwrap_or(0).min(7 * 24 * 3600))
+    }
+
+    /// The CA's renewal window for `name`'s held `material`, from the cache in `s` or — at most
+    /// once per [`RenewalWindow::retry_after_secs`] (default 6 h) — from the issuer. No I/O while
+    /// the name is backing off: no order could be placed anyway.
+    async fn ca_window(&self, material: &CertMaterial, s: &mut NameState, now: i64) -> Option<RenewalWindow> {
+        if s.next_attempt > now {
+            return None;
+        }
+        let cert = sha256(material.chain_pem.as_bytes());
+        if !s.ari.as_ref().is_some_and(|c| c.cert == cert && now < c.poll_after) {
+            let window = self.issuer.renewal_window(material).await;
+            let wait = window.as_ref().and_then(|w| w.retry_after_secs).unwrap_or(ARI_DEFAULT_POLL_SECS).min(ARI_MAX_POLL_SECS);
+            s.ari = Some(AriCache { cert, window, poll_after: now.saturating_add(i64::try_from(wait).unwrap_or(i64::MAX / 4)) });
+        }
+        s.ari.as_ref().and_then(|c| c.window.clone())
     }
 
     /// One pass: decide what is due, order it, install it, and tell the registry.
@@ -538,8 +623,15 @@ impl<S: CertStore, I: CertIssuer> RenewalEngine<S, I> {
             let held = self.store.cert_for(name);
             let mut s = self.st(name);
             s.unrequired_since = None;
+            // The percentage rule decides first and costs nothing; only a held certificate it
+            // calls healthy is worth asking the CA about.
+            let mut reason = due(&self.policy, held.as_ref(), now);
+            if let (None, Some(material)) = (reason, &held) {
+                let window = self.ca_window(material, &mut s, now).await;
+                reason = due_with_window(&self.policy, name, held.as_ref(), now, window.as_ref());
+            }
             self.state.put(name.clone(), s.clone());
-            match due(&self.policy, held.as_ref(), now) {
+            match reason {
                 None => {
                     // Held and healthy: make sure waiting hostnames (e.g. registry rebuilt
                     // after a restart) are activated.
@@ -1177,5 +1269,277 @@ PfFwXFUdKr72euUqW9E4wdcMVA==\n\
         assert_eq!(store.names(), vec!["good.example.com".to_string()]);
         std::fs::remove_dir_all(&dir).unwrap();
     }
-}
 
+    // ── CA-suggested renewal (ACME Renewal Information) ──────────────────────────────────
+
+    use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering::SeqCst};
+
+    fn window(start: i64, end: i64, retry_after: Option<u64>) -> RenewalWindow {
+        RenewalWindow { start, end, explanation_url: None, retry_after_secs: retry_after }
+    }
+
+    /// The CA's advice as the test controls it: what to answer, and how often it was asked.
+    #[derive(Clone, Default)]
+    struct Ari {
+        answer: Arc<Mutex<Option<RenewalWindow>>>,
+        polls: Arc<AtomicUsize>,
+    }
+
+    impl Ari {
+        fn set(&self, w: Option<RenewalWindow>) {
+            *self.answer.lock().unwrap() = w;
+        }
+        fn polls(&self) -> usize {
+            self.polls.load(SeqCst)
+        }
+    }
+
+    struct AriIssuer {
+        inner: FnIssuer,
+        ari: Ari,
+    }
+
+    impl CertIssuer for AriIssuer {
+        fn issue<'a>(&'a self, cert_name: &'a str) -> BoxFuture<'a, Result<CertMaterial, AcmeError>> {
+            self.inner.issue(cert_name)
+        }
+        fn renewal_window<'a>(&'a self, _material: &'a CertMaterial) -> BoxFuture<'a, Option<RenewalWindow>> {
+            Box::pin(async move {
+                self.ari.polls.fetch_add(1, SeqCst);
+                self.ari.answer.lock().unwrap().clone()
+            })
+        }
+    }
+
+    /// An issuer whose certificates are 90-day ones starting at the (settable) clock, a CA whose
+    /// advice is `ari`, and the log of issue calls.
+    fn ari_issuer(fail: Arc<std::sync::atomic::AtomicBool>) -> (AriIssuer, Ari, Arc<AtomicI64>, Arc<Mutex<Vec<String>>>) {
+        let clock = Arc::new(AtomicI64::new(T0));
+        let c = clock.clone();
+        let (inner, calls) = issuer(move |_, _| {
+            if fail.load(SeqCst) {
+                Err(AcmeError::Rejected { status: 500, detail: "boom".into() })
+            } else {
+                Ok(ninety_days(c.load(SeqCst)))
+            }
+        });
+        let ari = Ari::default();
+        (AriIssuer { inner, ari: ari.clone() }, ari, clock, calls)
+    }
+
+    fn no_failure() -> Arc<std::sync::atomic::AtomicBool> {
+        Arc::new(std::sync::atomic::AtomicBool::new(false))
+    }
+
+    #[test]
+    fn the_renewal_instant_is_a_deterministic_per_name_point_inside_the_window() {
+        let w = window(1_000_000, 1_000_000 + 2 * DAY, None);
+        let picks: Vec<i64> = (0..64).map(|i| ari_renew_at(&format!("host{i}.example.com"), &w)).collect();
+        assert!(picks.iter().all(|p| (w.start..=w.end).contains(p)), "{picks:?}");
+        assert_eq!(picks[5], ari_renew_at("host5.example.com", &w), "deterministic");
+        let mut distinct = picks.clone();
+        distinct.sort_unstable();
+        distinct.dedup();
+        assert!(distinct.len() >= 60, "names spread across the window rather than renewing together: {} distinct", distinct.len());
+        assert!(distinct[0] < w.start + DAY / 2 && distinct[distinct.len() - 1] > w.end - DAY / 2, "and across all of it");
+        // Degenerate and extreme windows neither panic nor leave the window.
+        assert_eq!(ari_renew_at("x", &window(500, 500, None)), 500);
+        assert_eq!(ari_renew_at("x", &window(500, 400, None)), 500);
+        let huge = window(i64::MIN / 2, i64::MAX / 2, None);
+        assert!((huge.start..=huge.end).contains(&ari_renew_at("x", &huge)));
+        let at_max = window(i64::MAX - 5, i64::MAX, None);
+        assert!((at_max.start..=at_max.end).contains(&ari_renew_at("x", &at_max)));
+    }
+
+    #[test]
+    fn the_cas_advice_only_ever_advances_a_renewal() {
+        let p = RenewalPolicy::default();
+        let cert = material(T0, T0 + 90 * DAY);
+        let w = window(T0 + 10 * DAY, T0 + 11 * DAY, None);
+        let pick = ari_renew_at("n", &w);
+        let at = |now: i64, win: Option<&RenewalWindow>, held: Option<&CertMaterial>| due_with_window(&p, "n", held, now, win);
+
+        assert_eq!(at(T0 + 5 * DAY, None, Some(&cert)), None, "no advice: the percentage rule alone");
+        assert_eq!(at(T0 + 5 * DAY, Some(&w), Some(&cert)), None, "a window that has not opened is not a reason");
+        assert_eq!(at(w.start - 1, Some(&w), Some(&cert)), None);
+        assert_eq!(at(pick - 1, Some(&w), Some(&cert)), None, "inside the window but before this name's instant");
+        assert_eq!(at(pick, Some(&w), Some(&cert)), Some(Reason::CaSuggested));
+        assert_eq!(at(w.end + DAY, Some(&w), Some(&cert)), Some(Reason::CaSuggested), "a window already past means now");
+        // Whatever the percentage rule says stays, and wins over the advice.
+        assert_eq!(at(T0 + 61 * DAY, Some(&w), Some(&cert)), Some(Reason::Renewal));
+        assert_eq!(at(T0 + 91 * DAY, Some(&w), Some(&cert)), Some(Reason::Expired));
+        assert_eq!(at(T0, Some(&w), None), Some(Reason::Missing));
+        let junk = CertMaterial { chain_pem: "x".into(), key_pem: "y".into() };
+        assert_eq!(at(T0, Some(&w), Some(&junk)), Some(Reason::Unreadable));
+        // Advice that predates the certificate is about some other certificate.
+        let newer = material(T0 + 20 * DAY, T0 + 110 * DAY);
+        assert_eq!(at(T0 + 25 * DAY, Some(&w), Some(&newer)), None);
+    }
+
+    #[tokio::test]
+    async fn a_ca_suggested_window_renews_each_name_at_its_own_instant_and_not_before_it_opens() {
+        let reg = registry();
+        let (iss, ari, clock, calls) = ari_issuer(no_failure());
+        let store = Arc::new(MemoryCertSource::new());
+        let mut eng = engine(store.clone(), iss);
+        eng.run_once(T0, &reg).await;
+        assert_eq!((calls.lock().unwrap().len(), ari.polls()), (2, 0), "nothing held yet, so nothing to ask the CA about");
+
+        let w = window(T0 + 10 * DAY, T0 + 11 * DAY, Some(3600));
+        ari.set(Some(w.clone()));
+        let r = eng.run_once(T0 + 5 * DAY, &reg).await;
+        assert!(r.issued.is_empty() && r.failed.is_empty(), "far from the window nothing is ordered: {r:?}");
+        assert_eq!(ari.polls(), 2, "one lookup per held name, in one pass");
+        assert!(eng.run_once(T0 + 10 * DAY - 1, &reg).await.issued.is_empty(), "a second before the window opens");
+
+        // Each name has its own instant inside the window.
+        let (wild, custom) = (ari_renew_at("*.tascloud.app", &w), ari_renew_at("app.acme.com.au", &w));
+        assert!(wild != custom && wild > w.start && custom > w.start, "{wild} {custom}");
+        let (first, second, first_name, second_name) =
+            if wild < custom { (wild, custom, "*.tascloud.app", "app.acme.com.au") } else { (custom, wild, "app.acme.com.au", "*.tascloud.app") };
+        assert!(eng.run_once(first - 1, &reg).await.issued.is_empty());
+        clock.store(first, SeqCst);
+        assert_eq!(eng.run_once(first, &reg).await.issued, vec![first_name.to_string()], "only the name whose instant has come");
+        clock.store(second, SeqCst);
+        assert_eq!(eng.run_once(second, &reg).await.issued, vec![second_name.to_string()]);
+        assert_eq!(calls.lock().unwrap().len(), 4);
+        for name in [first_name, second_name] {
+            let v = cert_validity(&store.cert_for(name).unwrap().chain_pem).unwrap();
+            assert!(v.not_before >= first, "{name} was replaced, 10 days into a 90-day certificate");
+        }
+
+        // The CA keeps answering with the old, long-past window. It is not about the replacements
+        // (it starts before they existed), so it must not trigger an order storm.
+        for hours in 1..=6 {
+            let t = second + hours * 3600 + 1;
+            clock.store(t, SeqCst);
+            let r = eng.run_once(t, &reg).await;
+            assert!(r.issued.is_empty() && r.failed.is_empty(), "hour {hours}: {r:?}");
+        }
+        assert_eq!(calls.lock().unwrap().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn a_ca_suggested_renewal_installs_and_activates_like_any_other_renewal() {
+        let reg = registry();
+        let (iss, ari, clock, _calls) = ari_issuer(no_failure());
+        let store = Arc::new(MemoryCertSource::new());
+        let mut eng = engine(store.clone(), iss);
+        eng.run_once(T0, &reg).await;
+        let before = store.cert_for("app.acme.com.au").unwrap().chain_pem;
+
+        // Revocation-style advice: the window closed a while ago.
+        ari.set(Some(window(T0 + DAY, T0 + DAY + 3600, None)));
+        clock.store(T0 + 2 * DAY, SeqCst);
+        let r = eng.run_once(T0 + 2 * DAY, &reg).await;
+        assert_eq!(r.issued.len(), 2, "{r:?}");
+        assert_ne!(store.cert_for("app.acme.com.au").unwrap().chain_pem, before);
+        assert_eq!(state_of(&reg, "app.acme.com.au").await, HostnameState::Active);
+        assert!(due(&RenewalPolicy::default(), store.cert_for("app.acme.com.au").as_ref(), T0 + 2 * DAY).is_none(), "the percentage rule alone would not have renewed");
+    }
+
+    #[tokio::test]
+    async fn without_usable_advice_the_percentage_rule_decides_and_the_ca_is_not_pestered() {
+        let reg = registry();
+        let (iss, ari, clock, calls) = ari_issuer(no_failure());
+        let store = Arc::new(MemoryCertSource::new());
+        let mut eng = engine(store.clone(), iss);
+        eng.run_once(T0, &reg).await; // ARI answers None throughout: no ARI, or a failed lookup
+
+        for t in [T0 + DAY, T0 + DAY + 60, T0 + DAY + 3600, T0 + DAY + 5 * 3600] {
+            assert!(eng.run_once(t, &reg).await.issued.is_empty());
+        }
+        assert_eq!(ari.polls(), 2, "an unanswered lookup is not repeated every pass: the default 6 h applies");
+        assert!(eng.run_once(T0 + DAY + 7 * 3600, &reg).await.issued.is_empty());
+        assert_eq!(ari.polls(), 4);
+        assert!(eng.run_once(T0 + 30 * DAY, &reg).await.issued.is_empty(), "30 days into 90: no advice, no order");
+
+        let polls = ari.polls();
+        clock.store(T0 + 61 * DAY, SeqCst);
+        assert_eq!(eng.run_once(T0 + 61 * DAY, &reg).await.issued.len(), 2, "the percentage rule still renews");
+        assert_eq!(ari.polls(), polls, "a name already due by the percentage rule is not worth a lookup");
+        assert_eq!(calls.lock().unwrap().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn the_ca_is_asked_at_most_once_per_retry_after_per_name() {
+        let reg = registry();
+        let (iss, ari, clock, calls) = ari_issuer(no_failure());
+        let store = Arc::new(MemoryCertSource::new());
+        let mut eng = engine(store.clone(), iss);
+        eng.run_once(T0, &reg).await;
+
+        ari.set(Some(window(T0 + 80 * DAY, T0 + 81 * DAY, Some(7200))));
+        for t in [T0 + DAY, T0 + DAY + 60, T0 + DAY + 3599, T0 + DAY + 7199] {
+            assert!(eng.run_once(t, &reg).await.issued.is_empty());
+        }
+        assert_eq!(ari.polls(), 2, "Retry-After: 7200 honoured: asked once per name");
+        assert!(eng.run_once(T0 + DAY + 7200, &reg).await.issued.is_empty());
+        assert_eq!(ari.polls(), 4, "and again once it has elapsed");
+
+        // The CA changes its mind (an incident): the next permitted lookup picks it up.
+        ari.set(Some(window(T0 + DAY, T0 + 2 * DAY, Some(7200))));
+        clock.store(T0 + 3 * DAY, SeqCst);
+        assert!(eng.run_once(T0 + DAY + 7200 + 60, &reg).await.issued.is_empty(), "cached advice is used until the lookup is due");
+        assert_eq!(eng.run_once(T0 + 3 * DAY, &reg).await.issued.len(), 2);
+        assert_eq!(calls.lock().unwrap().len(), 4);
+
+        // A silly Retry-After cannot switch the lookups off for good.
+        ari.set(Some(window(T0 + 80 * DAY, T0 + 81 * DAY, Some(u64::MAX))));
+        let polls = ari.polls();
+        eng.run_once(T0 + 4 * DAY, &reg).await;
+        assert_eq!(ari.polls(), polls + 2);
+        eng.run_once(T0 + 4 * DAY + 8 * 24 * 3600, &reg).await;
+        assert_eq!(ari.polls(), polls + 4, "capped at 7 days");
+    }
+
+    #[tokio::test]
+    async fn a_name_that_is_backing_off_is_not_looked_up_and_is_retried_on_the_backoff_schedule() {
+        let reg = registry();
+        let fail = no_failure();
+        let (iss, ari, clock, calls) = ari_issuer(fail.clone());
+        let store = Arc::new(MemoryCertSource::new());
+        let mut eng = engine(store.clone(), iss);
+        eng.run_once(T0, &reg).await;
+        let held = store.cert_for("app.acme.com.au").unwrap().chain_pem;
+
+        ari.set(Some(window(T0 + DAY, T0 + 2 * DAY, Some(60))));
+        fail.store(true, SeqCst);
+        let r = eng.run_once(T0 + 3 * DAY, &reg).await;
+        assert_eq!(r.failed.len(), 2, "advised renewal attempted and failed: {r:?}");
+        assert_eq!(state_of(&reg, "app.acme.com.au").await, HostnameState::Active, "a failed advised renewal keeps last-known-good");
+        assert_eq!(store.cert_for("app.acme.com.au").unwrap().chain_pem, held);
+        let (polls, orders) = (ari.polls(), calls.lock().unwrap().len());
+
+        let r = eng.run_once(T0 + 3 * DAY + 120, &reg).await; // the CA's 60 s have passed, the backoff (~10 min) has not
+        assert!(r.failed.is_empty() && r.issued.is_empty(), "{r:?}");
+        assert_eq!((ari.polls(), calls.lock().unwrap().len()), (polls, orders), "backing off: no order and no lookup");
+
+        fail.store(false, SeqCst);
+        clock.store(T0 + 3 * DAY + 3 * 3600, SeqCst);
+        assert_eq!(eng.run_once(T0 + 3 * DAY + 3 * 3600, &reg).await.issued.len(), 2, "retried once the backoff has passed");
+    }
+
+    #[tokio::test]
+    async fn replacing_a_certificate_discards_the_advice_cached_for_the_old_one() {
+        let reg = registry();
+        let (iss, ari, _clock, _calls) = ari_issuer(no_failure());
+        let store = Arc::new(MemoryCertSource::new());
+        let mut eng = engine(store.clone(), iss);
+        eng.run_once(T0, &reg).await;
+        ari.set(Some(window(T0 + 80 * DAY, T0 + 81 * DAY, Some(7 * 24 * 3600))));
+        eng.run_once(T0 + DAY, &reg).await;
+        eng.run_once(T0 + 2 * DAY, &reg).await;
+        assert_eq!(ari.polls(), 2);
+
+        store.install("app.acme.com.au", material(T0 + DAY, T0 + 91 * DAY)); // an operator drops in another certificate
+        eng.run_once(T0 + 2 * DAY + 1, &reg).await;
+        assert_eq!(ari.polls(), 3, "only the replaced name is asked again");
+    }
+
+    #[tokio::test]
+    async fn an_issuer_without_renewal_information_gives_no_advice() {
+        let (iss, _) = issuer(|_, _| Ok(ninety_days(T0)));
+        assert!(iss.renewal_window(&ninety_days(T0)).await.is_none());
+    }
+}

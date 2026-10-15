@@ -37,6 +37,11 @@
 //! `acme_dns01_responder_round_trips_through_edge_dns` test below exercises the trait impl
 //! itself, so a regression in either half is caught.
 //!
+//! **Beyond the basic order flow**: External Account Binding for CAs that require it
+//! ([`AcmeClient::new_with_eab`], RFC 8555 §7.3.4), account key rollover
+//! ([`AcmeClient::rollover_account_key`], §7.3.5) and ACME Renewal Information
+//! ([`AcmeClient::renewal_info`], RFC 9773 — consumed by [`crate::acme_renew`]'s engine).
+//!
 //! **What's genuinely verified here vs. not**: every pure step (JWS/JWK construction, the
 //! flattened-JSON envelope ACME's wire format needs — not the compact `a.b.c` form
 //! `jwt_sign_es256` returns — the CSR's PKCS#8 key wrapping, the DNS-01 responder round-trip
@@ -49,6 +54,7 @@
 use std::sync::Mutex as StdMutex;
 
 use hashtrinity::crypto::acme::{acme_key_authorization, b64url, jwk_thumbprint_ec_p256};
+use aws_lc_rs::hmac;
 use aws_lc_rs::rand::SystemRandom;
 use aws_lc_rs::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_FIXED_SIGNING};
 use serde::Deserialize;
@@ -203,6 +209,54 @@ impl AccountKey {
     }
 }
 
+/// The credentials a CA hands out for External Account Binding (RFC 8555 §7.3.4): a key
+/// identifier and an HMAC key that tie a new ACME account to an account the CA already knows
+/// (a customer in its billing system). ZeroSSL, Google Trust Services, Sectigo and most
+/// commercial CAs require it on `newAccount`; Let's Encrypt does not.
+///
+/// The key is a secret: `Debug` prints the `kid` and redacts the key, and nothing in this module
+/// logs it.
+#[derive(Clone)]
+pub struct ExternalAccountBinding {
+    /// The CA's key identifier (the `kid` of the binding JWS — not the ACME account URL).
+    pub kid: String,
+    /// The raw HMAC-SHA-256 key.
+    pub hmac_key: Vec<u8>,
+}
+
+impl ExternalAccountBinding {
+    /// From the base64url key as CAs publish it. Unpadded base64url is what RFC 8555 §7.3.4 and
+    /// the CAs' dashboards use; trailing `=` padding, surrounding whitespace and (since the two
+    /// alphabets do not overlap) the standard `+`/`/` alphabet are tolerated too.
+    ///
+    /// # Errors
+    /// If `key_b64` is not valid base64 or decodes to nothing.
+    pub fn from_base64url(kid: impl Into<String>, key_b64: &str) -> Result<Self, AcmeError> {
+        let standard = key_b64.trim().replace('-', "+").replace('_', "/");
+        match crate::pem::base64_decode(&standard) {
+            Some(hmac_key) if !hmac_key.is_empty() => Ok(ExternalAccountBinding { kid: kid.into(), hmac_key }),
+            _ => Err(AcmeError::BadResponse("external account binding key is not valid base64url".to_string())),
+        }
+    }
+
+    /// The `externalAccountBinding` member of the `newAccount` payload: a flattened JWS whose
+    /// protected header is `{alg: HS256, kid, url}` (no nonce — RFC 8555 §7.3.4), whose payload
+    /// is the account's public JWK, MACed with the CA's key.
+    fn jws(&self, account: &AccountKey, new_account_url: &str) -> Value {
+        let protected_b64 = b64url(json!({ "alg": "HS256", "kid": self.kid, "url": new_account_url }).to_string().as_bytes());
+        let payload_b64 = b64url(account.jwk().to_string().as_bytes());
+        let key = hmac::Key::new(hmac::HMAC_SHA256, &self.hmac_key);
+        let tag = hmac::sign(&key, format!("{protected_b64}.{payload_b64}").as_bytes());
+        json!({ "protected": protected_b64, "payload": payload_b64, "signature": b64url(tag.as_ref()) })
+    }
+}
+
+impl std::fmt::Debug for ExternalAccountBinding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExternalAccountBinding").field("kid", &self.kid).field("hmac_key", &"<redacted>").finish()
+    }
+}
+
 /// Build the flattened-JSON JWS body ACME's wire format requires: `{"protected","payload","signature"}`
 /// as JSON string members, not the compact `header.payload.sig` dot form (that form is for tokens
 /// carried inside another envelope, e.g. an `Authorization:` header — ACME's own request bodies
@@ -242,6 +296,65 @@ pub struct Directory {
     pub new_account: String,
     #[serde(rename = "newOrder")]
     pub new_order: String,
+    /// Account key rollover endpoint (RFC 8555 §7.3.5); a CA that does not offer it makes
+    /// [`AcmeClient::rollover_account_key`] fail with an explanatory error.
+    #[serde(rename = "keyChange", default)]
+    pub key_change: Option<String>,
+    /// ACME Renewal Information base URL (RFC 9773); `None` for a CA without ARI.
+    #[serde(rename = "renewalInfo", default)]
+    pub renewal_info: Option<String>,
+}
+
+/// The CA's advice on when to renew one certificate (RFC 9773 `suggestedWindow`), unix seconds.
+/// Any instant in `start..=end` is acceptable to the CA; spreading renewals across the window
+/// (see [`crate::acme_renew::ari_renew_at`]) is what lets it smooth load.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RenewalWindow {
+    pub start: i64,
+    pub end: i64,
+    /// A human-readable page explaining why the CA suggests this window (`explanationURL`).
+    pub explanation_url: Option<String>,
+    /// The CA's `Retry-After` for this resource: seconds before asking again.
+    pub retry_after_secs: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct RenewalInfoResponse {
+    #[serde(rename = "suggestedWindow")]
+    suggested_window: SuggestedWindow,
+    #[serde(rename = "explanationURL", default)]
+    explanation_url: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct SuggestedWindow {
+    start: String,
+    end: String,
+}
+
+/// A `renewalInfo` response body -> window. RFC 9773 §4.2 makes a window whose `end` does not
+/// follow its `start` invalid, so it is an error here rather than a renew-immediately signal.
+fn parse_renewal_info(body: &str, retry_after_secs: Option<u64>) -> Result<RenewalWindow, AcmeError> {
+    let info: RenewalInfoResponse = serde_json::from_str(body).map_err(|e| AcmeError::BadResponse(format!("renewalInfo: {e}")))?;
+    let time = |what: &str, v: &str| parse_rfc3339(v).ok_or_else(|| AcmeError::BadResponse(format!("renewalInfo: suggestedWindow.{what} {v:?} is not an RFC 3339 timestamp")));
+    let (start, end) = (time("start", &info.suggested_window.start)?, time("end", &info.suggested_window.end)?);
+    if end <= start {
+        return Err(AcmeError::BadResponse("renewalInfo: suggestedWindow ends before it starts".to_string()));
+    }
+    Ok(RenewalWindow { start, end, explanation_url: info.explanation_url, retry_after_secs })
+}
+
+/// The RFC 9773 §4.1 certificate ID for the leaf of `chain_pem`: the base64url of the Authority
+/// Key Identifier's `keyIdentifier`, `.`, and the base64url of the serial number's DER INTEGER
+/// content octets. The content octets are used as encoded — including the leading `0x00` DER
+/// adds when the serial's high bit is set (RFC 9773 appendix A: serial `0x87654321` is
+/// `AIdlQyE`, not `h2VDIQ`). `None` if there is no certificate, no AKI `keyIdentifier`, or the
+/// DER is malformed.
+#[must_use]
+pub fn ari_cert_id(chain_pem: &str) -> Option<String> {
+    let cert = crate::pem::blocks(chain_pem, "CERTIFICATE").into_iter().next()?;
+    let (aki, serial) = der::aki_and_serial(&cert)?;
+    Some(format!("{}.{}", b64url(aki), b64url(serial)))
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -317,7 +430,9 @@ fn header_str(resp: &crate::http_types::Response, name: &str) -> Option<String> 
 /// machine against a real ACME server via [`crate::http_client::Client`].
 pub struct AcmeClient {
     directory: Directory,
-    account: AccountKey,
+    /// Behind a lock because [`Self::rollover_account_key`] swaps it; every request snapshots it
+    /// (`AccountKey` is a cheap `Arc` clone), so a request is always signed by one whole key.
+    account: StdMutex<AccountKey>,
     kid: StdMutex<Option<String>>,
     nonce: StdMutex<Option<String>>,
 }
@@ -357,15 +472,69 @@ fn parse_imf_fixdate(v: &str) -> Option<i64> {
     if it.next()? != "GMT" || it.next().is_some() || !(1..=31).contains(&day) || h > 23 || m > 59 || s > 60 || !(1970..=9999).contains(&year) {
         return None;
     }
-    // days-from-civil (Howard Hinnant)
-    let y = if month <= 2 { year - 1 } else { year };
+    Some(days_from_civil(year, month, day) * 86_400 + h * 3600 + m * 60 + s)
+}
+
+/// Days since 1970-01-01 for a proleptic-Gregorian civil date (Howard Hinnant's algorithm).
+pub(crate) fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
     let era = y.div_euclid(400);
     let yoe = y - era * 400;
-    let mp = (month + 9) % 12;
-    let doy = (153 * mp + 2) / 5 + day - 1;
+    let mp = (m + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let days = era * 146_097 + doe - 719_468;
-    Some(days * 86_400 + h * 3600 + m * 60 + s)
+    era * 146_097 + doe - 719_468
+}
+
+/// An RFC 3339 timestamp (`2026-10-15T08:30:00Z`, `...:00.123+10:00`) -> unix seconds, the
+/// fraction truncated. Strict: fixed-width fields, a real calendar date, `T` between date and
+/// time, and a mandatory `Z`/`±HH:MM` offset — what ACME servers emit for RFC 9773's
+/// `suggestedWindow`, with nothing lenient to mis-parse a hostile response.
+fn parse_rfc3339(s: &str) -> Option<i64> {
+    let b = s.as_bytes();
+    if !s.is_ascii() {
+        return None;
+    }
+    let num = |from: usize, to: usize| -> Option<i64> {
+        let d = b.get(from..to)?;
+        d.iter().all(u8::is_ascii_digit).then(|| d.iter().fold(0i64, |acc, c| acc * 10 + i64::from(c - b'0')))
+    };
+    let at = |i: usize, c: u8| b.get(i) == Some(&c);
+    if !(at(4, b'-') && at(7, b'-') && (at(10, b'T') || at(10, b't')) && at(13, b':') && at(16, b':')) {
+        return None;
+    }
+    let (year, month, day) = (num(0, 4)?, num(5, 7)?, num(8, 10)?);
+    let (hour, min, sec) = (num(11, 13)?, num(14, 16)?, num(17, 19)?);
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let days_in_month = match month {
+        2 if leap => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    };
+    if year < 1 || !(1..=12).contains(&month) || !(1..=days_in_month).contains(&day) || hour > 23 || min > 59 || sec > 60 {
+        return None;
+    }
+    let mut i = 19;
+    if at(i, b'.') {
+        let digits_from = i + 1;
+        i = digits_from;
+        while b.get(i).is_some_and(u8::is_ascii_digit) {
+            i += 1;
+        }
+        if i == digits_from {
+            return None;
+        }
+    }
+    let offset = if (at(i, b'Z') || at(i, b'z')) && b.len() == i + 1 {
+        0
+    } else if (at(i, b'+') || at(i, b'-')) && b.len() == i + 6 && at(i + 3, b':') {
+        let secs = num(i + 1, i + 3).filter(|h| *h <= 23)? * 3600 + num(i + 4, i + 6).filter(|m| *m <= 59)? * 60;
+        if at(i, b'-') { -secs } else { secs }
+    } else {
+        return None;
+    };
+    Some(days_from_civil(year, month, day) * 86_400 + hour * 3600 + min * 60 + sec - offset)
 }
 
 impl AcmeClient {
@@ -375,13 +544,36 @@ impl AcmeClient {
     /// # Errors
     /// Any transport failure, or the CA rejecting account creation.
     pub async fn new(directory_url: &str, account: AccountKey, contact_email: Option<&str>) -> Result<Self, AcmeError> {
+        Self::new_with_eab(directory_url, account, contact_email, None).await
+    }
+
+    /// [`Self::new`] for a CA that requires External Account Binding (RFC 8555 §7.3.4): the
+    /// `newAccount` request carries an `externalAccountBinding` JWS proving the caller holds
+    /// `eab`'s CA-issued credentials. `None` is exactly [`Self::new`]. A CA that requires a
+    /// binding and gets none answers `externalAccountRequired`, surfaced as
+    /// [`AcmeError::Rejected`].
+    ///
+    /// # Errors
+    /// Any transport failure, or the CA rejecting account creation (including a binding it does
+    /// not recognise).
+    pub async fn new_with_eab(
+        directory_url: &str,
+        account: AccountKey,
+        contact_email: Option<&str>,
+        eab: Option<ExternalAccountBinding>,
+    ) -> Result<Self, AcmeError> {
         let body = Client::new().get(directory_url).send().await?.text().await?;
         let directory: Directory = serde_json::from_str(&body).map_err(|e| AcmeError::BadResponse(e.to_string()))?;
 
-        let client = AcmeClient { directory, account, kid: StdMutex::new(None), nonce: StdMutex::new(None) };
+        let client = AcmeClient { directory, account: StdMutex::new(account), kid: StdMutex::new(None), nonce: StdMutex::new(None) };
         client.refresh_nonce().await?;
-        client.create_account(contact_email).await?;
+        client.create_account(contact_email, eab.as_ref()).await?;
         Ok(client)
+    }
+
+    /// The key requests are signed with right now.
+    fn account(&self) -> AccountKey {
+        self.account.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
     }
 
     async fn refresh_nonce(&self) -> Result<(), AcmeError> {
@@ -401,10 +593,14 @@ impl AcmeClient {
         }
     }
 
-    async fn create_account(&self, contact_email: Option<&str>) -> Result<(), AcmeError> {
+    async fn create_account(&self, contact_email: Option<&str>, eab: Option<&ExternalAccountBinding>) -> Result<(), AcmeError> {
         let mut payload = json!({ "termsOfServiceAgreed": true });
         if let Some(email) = contact_email {
             payload["contact"] = json!([format!("mailto:{email}")]);
+        }
+        if let Some(eab) = eab {
+            // No nonce inside the binding, so the same bytes survive a `badNonce` re-sign.
+            payload["externalAccountBinding"] = eab.jws(&self.account(), &self.directory.new_account);
         }
         // Same nonce/rate-limit handling as every other request; the only difference is that the
         // account does not exist yet, so the JWS carries the public key (`jwk`) instead of a `kid`.
@@ -426,6 +622,74 @@ impl AcmeClient {
 
     fn kid(&self) -> Result<String, AcmeError> {
         self.kid.lock().unwrap().clone().ok_or_else(|| AcmeError::BadResponse("no account kid yet".to_string()))
+    }
+
+    /// Replace the account's signing key with `new_key` at the CA (RFC 8555 §7.3.5 `keyChange`)
+    /// and, once the CA has accepted, sign everything that follows with it. The account URL
+    /// ([`Self::account_url`]) and its authorization history are unchanged; the old key stops
+    /// working for the account.
+    ///
+    /// The request is a JWS signed by the OLD key (`kid`, `url` = `keyChange`) whose payload is
+    /// an inner JWS signed by the NEW key (`jwk` = the new public key, `url` = `keyChange`, no
+    /// nonce) over `{"account": <account URL>, "oldKey": <old public JWK>}` — so the CA sees
+    /// both keys vouch for the swap.
+    ///
+    /// Persist `new_key` (e.g. [`AccountKey::to_bytes`] into the sealed store) as soon as this
+    /// returns: the old key no longer identifies the account. If this fails the client keeps
+    /// signing with the old key. Do not run orders concurrently with a rollover; one signed
+    /// under the old key just before the CA switched is rejected and has to be retried.
+    ///
+    /// # Errors
+    /// The CA's directory has no `keyChange`, `new_key` is the key already in use, any transport
+    /// failure, or the CA rejecting the change (e.g. `new_key` already belongs to another
+    /// account, a 409).
+    pub async fn rollover_account_key(&self, new_key: AccountKey) -> Result<(), AcmeError> {
+        let url = self.directory.key_change.as_deref().ok_or_else(|| {
+            AcmeError::BadResponse("this CA's directory has no keyChange URL, so it does not support account key rollover".to_string())
+        })?;
+        let old_key = self.account();
+        if old_key.thumbprint() == new_key.thumbprint() {
+            return Err(AcmeError::BadResponse("the new account key is the key already in use".to_string()));
+        }
+        let inner_payload = json!({ "account": self.kid()?, "oldKey": old_key.jwk() });
+        let inner_protected = json!({ "alg": "ES256", "jwk": new_key.jwk(), "url": url });
+        let inner = flattened_jws(&new_key, &inner_protected, &inner_payload.to_string());
+        // The outer JWS is built by `send_jws` like any kid-authenticated request, so it gets the
+        // same nonce, `badNonce` and rate-limit handling, signed by the still-current old key.
+        let (status, _, body) = self.send_signed(url, &inner).await?;
+        if !(200..300).contains(&status) {
+            return Err(AcmeError::Rejected { status, detail: body });
+        }
+        *self.account.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = new_key;
+        Ok(())
+    }
+
+    /// The CA's renewal advice for a certificate it issued (ACME Renewal Information, RFC 9773):
+    /// the window in which it suggests renewing — typically earlier than the usual schedule when
+    /// the certificate is affected by a revocation event or an incident. `chain_pem` is the
+    /// certificate chain as issued (only the leaf is read).
+    ///
+    /// `Ok(None)` when there is no advice: the directory has no `renewalInfo`, or the CA does not
+    /// know the certificate (404). The lookup is an unauthenticated GET and costs no nonce.
+    /// [`RenewalWindow::retry_after_secs`] is the CA's `Retry-After`: do not ask again sooner.
+    ///
+    /// # Errors
+    /// The certificate has no Authority Key Identifier to build the lookup ID from, any transport
+    /// failure, a CA error or rate limit, or a response that is not a valid window.
+    pub async fn renewal_info(&self, chain_pem: &str) -> Result<Option<RenewalWindow>, AcmeError> {
+        let Some(base) = self.directory.renewal_info.as_deref() else { return Ok(None) };
+        let id = ari_cert_id(chain_pem)
+            .ok_or_else(|| AcmeError::BadResponse("certificate has no Authority Key Identifier keyIdentifier, so it has no ARI certificate ID".to_string()))?;
+        let resp = Client::new().get(format!("{}/{id}", base.trim_end_matches('/'))).send().await?;
+        let status = resp.status().as_u16();
+        let retry_after_secs = header_str(&resp, "retry-after").and_then(|v| parse_retry_after(&v, unix_now()));
+        let body = resp.text().await?;
+        match status {
+            200 => parse_renewal_info(&body, retry_after_secs).map(Some),
+            404 => Ok(None),
+            429 => Err(AcmeError::RateLimited { retry_after_secs, detail: body }),
+            _ => Err(AcmeError::Rejected { status, detail: body }),
+        }
     }
 
     /// POST a JWS-signed request and return `(status, body)`. `payload_json` is `""` for a
@@ -465,12 +729,13 @@ impl AcmeClient {
                 }
                 Err(e) => return Err(e),
             };
+            let account = self.account();
             let protected = if jwk {
-                protected_header_jwk(&self.account, &nonce, url)
+                protected_header_jwk(&account, &nonce, url)
             } else {
                 protected_header_kid(&self.kid()?, &nonce, url)
             };
-            let jws = flattened_jws(&self.account, &protected, payload_json);
+            let jws = flattened_jws(&account, &protected, payload_json);
             let resp = Client::new().post(url).header(header::CONTENT_TYPE, "application/jose+json").body(jws.into_bytes()).send().await?;
             self.store_nonce_from(&resp);
             let status = resp.status().as_u16();
@@ -562,7 +827,7 @@ impl AcmeClient {
             .find(|c| c.kind == kind)
             .ok_or_else(|| AcmeError::AuthorizationFailed(authz_url.to_string()))?;
 
-        let key_auth = acme_key_authorization(&challenge.token, &self.account.thumbprint());
+        let key_auth = acme_key_authorization(&challenge.token, &self.account().thumbprint());
         let dns_name = authz.identifier.value.trim_start_matches("*.");
         let dns_value = b64url(&hashtrinity::crypto::sha256(key_auth.as_bytes()));
         match responder {
@@ -610,8 +875,9 @@ impl AcmeClient {
     }
 }
 
-/// Minimal DER writer/reader — just the shapes a PKCS#10 CSR, a PKCS#8 EC key and an X.509
-/// validity window need. No general ASN.1: every structure written here has a fixed shape.
+/// Minimal DER writer/reader — just the shapes a PKCS#10 CSR, a PKCS#8 EC key, an X.509
+/// validity window and an RFC 9773 certificate ID (AKI + serial) need. No general ASN.1: every
+/// structure written here has a fixed shape.
 pub(crate) mod der {
     #[must_use]
     pub fn len(n: usize) -> Vec<u8> {
@@ -660,6 +926,69 @@ pub(crate) mod der {
         tlv(0x03, &c)
     }
 
+    /// `(keyIdentifier of the Authority Key Identifier extension, serialNumber content octets)` of
+    /// a DER X.509 certificate — the two halves of an RFC 9773 certificate ID. `None` if the
+    /// certificate is malformed, has no AKI extension, or the AKI carries no `keyIdentifier`.
+    #[must_use]
+    pub fn aki_and_serial(cert: &[u8]) -> Option<(&[u8], &[u8])> {
+        let (tag, cert, _) = read(cert)?;
+        let (tag2, tbs, _) = read(cert)?;
+        if tag != 0x30 || tag2 != 0x30 {
+            return None;
+        }
+        // TBSCertificate: [0] version OPTIONAL, serial, signature alg, issuer, validity, subject,
+        // spki, [1] issuerUID OPTIONAL, [2] subjectUID OPTIONAL, [3] extensions OPTIONAL.
+        let (t0, _, after) = read(tbs)?;
+        let rest = if t0 == 0xA0 { after } else { tbs };
+        let (tag, serial, mut rest) = read(rest)?;
+        if tag != 0x02 || serial.is_empty() {
+            return None;
+        }
+        for _ in 0..5 {
+            rest = read(rest)?.2;
+        }
+        while !rest.is_empty() {
+            let (tag, content, next) = read(rest)?;
+            rest = next;
+            if tag != 0xA3 {
+                continue;
+            }
+            let (tag, mut exts, _) = read(content)?;
+            if tag != 0x30 {
+                return None;
+            }
+            while !exts.is_empty() {
+                let (tag, ext, next) = read(exts)?;
+                exts = next;
+                let (oid_tag, oid, body) = read(ext)?;
+                if tag != 0x30 || oid_tag != 0x06 || oid != super::OID_AUTHORITY_KEY_IDENTIFIER {
+                    continue;
+                }
+                // extnID, critical BOOLEAN DEFAULT FALSE, extnValue OCTET STRING { AuthorityKeyIdentifier }
+                let (t, v, after) = read(body)?;
+                let (t, value) = if t == 0x01 {
+                    let (t, v, _) = read(after)?;
+                    (t, v)
+                } else {
+                    (t, v)
+                };
+                let (tag, mut aki, _) = read(value)?;
+                if t != 0x04 || tag != 0x30 {
+                    return None;
+                }
+                while !aki.is_empty() {
+                    let (tag, content, next) = read(aki)?;
+                    aki = next;
+                    if tag == 0x80 {
+                        return Some((content, serial)); // keyIdentifier [0] IMPLICIT OCTET STRING
+                    }
+                }
+                return None;
+            }
+        }
+        None
+    }
+
     /// Read one TLV: `(tag, content, rest-after-it)`. `None` on any malformed/truncated input.
     #[must_use]
     pub fn read(buf: &[u8]) -> Option<(u8, &[u8], &[u8])> {
@@ -689,6 +1018,7 @@ const OID_PRIME256V1: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07];
 const OID_ECDSA_SHA256: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02]; // 1.2.840.10045.4.3.2
 const OID_EXTENSION_REQUEST: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x09, 0x0e]; // 1.2.840.113549.1.9.14
 const OID_SUBJECT_ALT_NAME: &[u8] = &[0x55, 0x1d, 0x11]; // 2.5.29.17
+const OID_AUTHORITY_KEY_IDENTIFIER: &[u8] = &[0x55, 0x1d, 0x23]; // 2.5.29.35
 
 fn generate_ec_key() -> Result<EcdsaKeyPair, AcmeError> {
     EcdsaKeyPair::generate(&ECDSA_P256_SHA256_FIXED_SIGNING)
@@ -1056,6 +1386,20 @@ mod tests {
             pub finalized_csr_ok: bool,
             pub bad_nonce_seen: u32,
             pub dns: Option<Arc<FakeDns>>,
+            /// `(kid, hmac key)` of the one external account this CA knows.
+            pub eab: Option<(String, Vec<u8>)>,
+            /// Refuse `newAccount` without an `externalAccountBinding`.
+            pub require_eab: bool,
+            pub eab_accepted: u32,
+            /// Leave `keyChange` out of the directory.
+            pub no_key_change: bool,
+            /// Answer a (fully verified) `keyChange` with 409, as for a key another account owns.
+            pub reject_key_change: bool,
+            pub key_changes: u32,
+            /// `(status, Retry-After, body)` served for every ARI lookup; `None` = the directory
+            /// has no `renewalInfo`.
+            pub ari: Option<(u16, Option<String>, String)>,
+            pub ari_requests: Vec<String>,
         }
 
         fn fresh_nonce(st: &mut State) -> String {
@@ -1115,6 +1459,71 @@ mod tests {
             Ok(String::from_utf8(b64url_decode_for_test(pl)).unwrap())
         }
 
+        fn jwk_point(jwk: &Value) -> [u8; 64] {
+            assert_eq!((jwk["kty"].as_str(), jwk["crv"].as_str()), (Some("EC"), Some("P-256")));
+            assert_eq!(jwk.as_object().unwrap().len(), 4, "a public JWK is exactly kty, crv, x, y: {jwk}");
+            let mut pk = [0u8; 64];
+            pk[..32].copy_from_slice(&b64url_decode_for_test(jwk["x"].as_str().unwrap()));
+            pk[32..].copy_from_slice(&b64url_decode_for_test(jwk["y"].as_str().unwrap()));
+            pk
+        }
+
+        /// RFC 8555 §7.3.4, as a CA checks it. `Ok` also when this CA has no EAB configured
+        /// (it ignores a binding it did not ask for).
+        fn check_eab(st: &mut State, url: &str, payload: &str) -> Result<(), Reply> {
+            let v: Value = serde_json::from_str(payload).unwrap();
+            let Some(eab) = v.get("externalAccountBinding") else {
+                return if st.require_eab { Err(problem(403, "externalAccountRequired", st)) } else { Ok(()) };
+            };
+            let Some((kid, key)) = st.eab.clone() else { return Ok(()) };
+            let (p, pl, sg) = (eab["protected"].as_str().unwrap(), eab["payload"].as_str().unwrap(), eab["signature"].as_str().unwrap());
+            assert_eq!(eab.as_object().unwrap().len(), 3, "a flattened JWS: protected, payload, signature");
+            let protected: Value = serde_json::from_slice(&b64url_decode_for_test(p)).unwrap();
+            assert_eq!(protected["alg"], "HS256");
+            assert_eq!(protected["url"], url, "the binding names the same URL as the outer JWS");
+            assert!(protected.get("nonce").is_none(), "RFC 8555 §7.3.4: no nonce inside the binding");
+            assert_eq!(protected.as_object().unwrap().len(), 3, "alg, kid, url and nothing else: {protected}");
+            let jwk: Value = serde_json::from_slice(&b64url_decode_for_test(pl)).unwrap();
+            assert_eq!(jwk_point(&jwk), st.acct_pk.unwrap(), "the binding's payload is the key signing newAccount");
+            // Judge the MAC with a HMAC that is not the one the client used (aws-lc).
+            let expect = hashtrinity::crypto::hmac_sha256(&key, format!("{p}.{pl}").as_bytes());
+            if protected["kid"] != kid {
+                return Err(problem(401, "unauthorized", st));
+            }
+            if b64url_decode_for_test(sg) != expect {
+                return Err(problem(401, "unauthorized", st));
+            }
+            st.eab_accepted += 1;
+            Ok(())
+        }
+
+        /// RFC 8555 §7.3.5: the (outer-verified) payload is an inner JWS by the new key over
+        /// `{account, oldKey}`. Returns the new public key on success.
+        fn check_key_change(st: &State, url: &str, outer_payload: &str) -> [u8; 64] {
+            let inner: Value = serde_json::from_str(outer_payload).expect("the outer payload is the inner JWS, JSON-serialized");
+            assert_eq!(inner.as_object().unwrap().len(), 3, "flattened JWS");
+            let (p, pl, sg) = (inner["protected"].as_str().unwrap(), inner["payload"].as_str().unwrap(), inner["signature"].as_str().unwrap());
+            let protected: Value = serde_json::from_slice(&b64url_decode_for_test(p)).unwrap();
+            assert_eq!(protected["alg"], "ES256");
+            assert_eq!(protected["url"], url, "inner url is the keyChange URL, like the outer one");
+            assert!(protected.get("nonce").is_none(), "RFC 8555 §7.3.5: no nonce in the inner JWS");
+            assert!(protected.get("kid").is_none(), "the inner JWS identifies the NEW key by jwk");
+            assert_eq!(protected.as_object().unwrap().len(), 3, "alg, jwk, url: {protected}");
+            let new_pk = jwk_point(&protected["jwk"]);
+            let mut sig = [0u8; 64];
+            sig.copy_from_slice(&b64url_decode_for_test(sg));
+            assert!(
+                hashtrinity::crypto::ecdsa_p256_verify(&new_pk, &sha256(format!("{p}.{pl}").as_bytes()), &sig),
+                "the inner JWS must be signed by the new key"
+            );
+            let payload: Value = serde_json::from_slice(&b64url_decode_for_test(pl)).unwrap();
+            assert_eq!(payload.as_object().unwrap().len(), 2, "account and oldKey only: {payload}");
+            assert_eq!(payload["account"], format!("{}/acct/1", st.base), "the account URL, which does not change");
+            assert_eq!(jwk_point(&payload["oldKey"]), st.acct_pk.unwrap(), "oldKey is the key the account has now");
+            assert_ne!(new_pk, st.acct_pk.unwrap());
+            new_pk
+        }
+
         fn authz(st: &State, n: u32) -> String {
             let done = st.challenged.contains(&n) && {
                 // Validate like a CA: the expected TXT value must be live in DNS right now.
@@ -1141,11 +1550,26 @@ mod tests {
                 ("GET", "/directory") => Reply {
                     status: 200,
                     headers: vec![],
-                    body: format!(
-                        r#"{{"newNonce":"{b}/new-nonce","newAccount":"{b}/new-acct","newOrder":"{b}/new-order"}}"#,
-                        b = st.base
-                    ),
+                    body: {
+                        let b = &st.base;
+                        let mut dir = format!(r#"{{"newNonce":"{b}/new-nonce","newAccount":"{b}/new-acct","newOrder":"{b}/new-order""#);
+                        if !st.no_key_change {
+                            dir.push_str(&format!(r#","keyChange":"{b}/key-change""#));
+                        }
+                        if st.ari.is_some() {
+                            // Pebble-style: no trailing slash; the client adds it.
+                            dir.push_str(&format!(r#","renewalInfo":"{b}/renewal-info""#));
+                        }
+                        dir.push('}');
+                        dir
+                    },
                 },
+                ("GET", p) if p.starts_with("/renewal-info/") => {
+                    st.ari_requests.push(p.to_string());
+                    let (status, retry_after, body) = st.ari.clone().expect("ARI is configured when it is requested");
+                    let headers = retry_after.map(|r| vec![("Retry-After".to_string(), r)]).unwrap_or_default();
+                    Reply { status, headers, body }
+                }
                 ("HEAD", "/new-nonce") => ok(st, 200, vec![], String::new()),
                 ("POST", p) => {
                     let payload = match verify_jws(st, &url, body) {
@@ -1157,7 +1581,23 @@ mod tests {
                             st.inject_bad_nonce_on_account = false;
                             problem(400, "badNonce", st)
                         }
-                        "/new-acct" => ok(st, 201, vec![("Location".into(), format!("{}/acct/1", st.base))], "{}".into()),
+                        "/new-acct" => {
+                            if let Err(refusal) = check_eab(st, &url, &payload) {
+                                return refusal;
+                            }
+                            ok(st, 201, vec![("Location".into(), format!("{}/acct/1", st.base))], "{}".into())
+                        }
+                        "/key-change" => {
+                            let new_pk = check_key_change(st, &url, &payload);
+                            if st.reject_key_change {
+                                return problem(409, "conflict", st);
+                            }
+                            let (x, y): ([u8; 32], [u8; 32]) = (new_pk[..32].try_into().unwrap(), new_pk[32..].try_into().unwrap());
+                            st.acct_pk = Some(new_pk);
+                            st.thumbprint = hashtrinity::crypto::acme::jwk_thumbprint_ec_p256(&x, &y);
+                            st.key_changes += 1;
+                            ok(st, 200, vec![], "{}".into())
+                        }
                         "/new-order" => {
                             if st.rate_limit_new_order {
                                 let mut r = problem(429, "rateLimited", st);
@@ -1309,5 +1749,344 @@ mod tests {
         assert!(matches!(err, AcmeError::RateLimited { retry_after_secs: Some(3600), .. }), "{err}");
         assert_eq!(err.retry_after_secs(), Some(3600));
         assert!(dns.published.lock().unwrap().is_empty(), "no challenge was published for a refused order");
+    }
+
+    // ── External Account Binding (RFC 8555 §7.3.4) ───────────────────────────────────────
+
+    const EAB_KEY: [u8; 32] = [0x42; 32];
+
+    fn eab_ca(state: &std::sync::Mutex<mock_ca::State>, require: bool) {
+        let mut st = state.lock().unwrap();
+        st.eab = Some(("eab-kid-1".to_string(), EAB_KEY.to_vec()));
+        st.require_eab = require;
+    }
+
+    #[test]
+    fn eab_keys_are_base64url_and_never_printed() {
+        let raw = vec![0xfb, 0xff, 0xbf, 0xfe, 0x01];
+        let url = b64url(&raw);
+        assert!(url.contains('-') && url.contains('_'), "the vector must exercise the URL-safe alphabet: {url}");
+        for text in [url.clone(), format!("{url}="), format!(" {url}\n"), url.replace('-', "+").replace('_', "/")] {
+            assert_eq!(ExternalAccountBinding::from_base64url("k", &text).unwrap().hmac_key, raw, "{text:?}");
+        }
+        for bad in ["", "   ", "A", "!!!!", "====", "ab$d"] {
+            assert!(ExternalAccountBinding::from_base64url("k", bad).is_err(), "{bad:?}");
+        }
+
+        let eab = ExternalAccountBinding::from_base64url("eab-kid-1", &url).unwrap();
+        let shown = format!("{eab:?} {eab:#?}");
+        assert!(shown.contains("eab-kid-1") && shown.contains("<redacted>"), "{shown}");
+        assert!(!shown.contains(&url) && !shown.contains("251") && !shown.contains("0xfb") && !shown.contains("fb"), "the key leaked into Debug: {shown}");
+        let err = ExternalAccountBinding::from_base64url("k", "ab$d").unwrap_err().to_string();
+        assert!(!err.contains("ab$d"), "an invalid key is not echoed: {err}");
+    }
+
+    #[test]
+    fn eab_jws_binds_the_account_key_with_hmac_sha256_and_no_nonce() {
+        let account = test_account();
+        let eab = ExternalAccountBinding { kid: "eab-kid-1".to_string(), hmac_key: EAB_KEY.to_vec() };
+        let jws = eab.jws(&account, "https://ca.test/new-acct");
+        let (p, pl, sg) = (jws["protected"].as_str().unwrap(), jws["payload"].as_str().unwrap(), jws["signature"].as_str().unwrap());
+        let protected: Value = serde_json::from_slice(&b64url_decode_for_test(p)).unwrap();
+        assert_eq!(protected, json!({ "alg": "HS256", "kid": "eab-kid-1", "url": "https://ca.test/new-acct" }));
+        let payload: Value = serde_json::from_slice(&b64url_decode_for_test(pl)).unwrap();
+        assert_eq!(payload, account.jwk(), "the payload is the same JWK the outer newAccount JWS carries");
+        // Checked with a HMAC implementation other than the aws-lc one the client uses.
+        assert_eq!(b64url_decode_for_test(sg), hashtrinity::crypto::hmac_sha256(&EAB_KEY, format!("{p}.{pl}").as_bytes()));
+        assert_eq!(b64url_decode_for_test(sg).len(), 32);
+    }
+
+    #[tokio::test]
+    async fn a_ca_that_requires_eab_accepts_only_a_binding_made_with_its_key() {
+        let account = test_account();
+        let (dir, state, _dns) = mock_ca::start(&account).await;
+        eab_ca(&state, true);
+
+        let err = AcmeClient::new(&dir, account.clone(), None).await.map(|_| ()).unwrap_err();
+        assert!(matches!(&err, AcmeError::Rejected { status: 403, detail } if detail.contains("externalAccountRequired")), "{err}");
+
+        let wrong_key = ExternalAccountBinding { kid: "eab-kid-1".to_string(), hmac_key: vec![0x43; 32] };
+        let err = AcmeClient::new_with_eab(&dir, account.clone(), None, Some(wrong_key)).await.map(|_| ()).unwrap_err();
+        assert!(matches!(err, AcmeError::Rejected { status: 401, .. }), "{err}");
+        let wrong_kid = ExternalAccountBinding { kid: "someone-else".to_string(), hmac_key: EAB_KEY.to_vec() };
+        let err = AcmeClient::new_with_eab(&dir, account.clone(), None, Some(wrong_kid)).await.map(|_| ()).unwrap_err();
+        assert!(matches!(err, AcmeError::Rejected { status: 401, .. }), "{err}");
+        assert_eq!(state.lock().unwrap().eab_accepted, 0);
+
+        let good = ExternalAccountBinding::from_base64url("eab-kid-1", &b64url(&EAB_KEY)).unwrap();
+        let client = AcmeClient::new_with_eab(&dir, account, Some("ops@example.test"), Some(good)).await.expect("a valid binding registers the account");
+        assert!(client.account_url().is_some());
+        assert_eq!(state.lock().unwrap().eab_accepted, 1, "the CA verified the binding (kid, url, payload JWK, MAC)");
+    }
+
+    #[tokio::test]
+    async fn eab_survives_a_bad_nonce_and_is_optional_for_a_ca_that_does_not_ask() {
+        let account = test_account();
+        let (dir, state, _dns) = mock_ca::start(&account).await;
+        eab_ca(&state, true);
+        state.lock().unwrap().inject_bad_nonce_on_account = true;
+        let eab = ExternalAccountBinding { kid: "eab-kid-1".to_string(), hmac_key: EAB_KEY.to_vec() };
+        AcmeClient::new_with_eab(&dir, account.clone(), None, Some(eab.clone())).await.expect("re-signed with a fresh nonce, same binding");
+        assert_eq!(state.lock().unwrap().eab_accepted, 1);
+
+        // A CA with no EAB policy ignores a binding it did not ask for.
+        let (dir2, state2, _dns2) = mock_ca::start(&account).await;
+        AcmeClient::new_with_eab(&dir2, account, None, Some(eab)).await.expect("harmless extra member");
+        assert_eq!(state2.lock().unwrap().eab_accepted, 0);
+    }
+
+    // ── Account key rollover (RFC 8555 §7.3.5) ───────────────────────────────────────────
+
+    const ALL_NAMES: [&str; 2] = ["*.tascloud.app", "tascloud.app"];
+
+    #[tokio::test]
+    async fn rollover_switches_signing_to_the_new_key_and_the_account_url_does_not_change() {
+        let old = test_account();
+        let new = AccountKey::from_bytes([9u8; 32]).unwrap();
+        let (dir, state, dns) = mock_ca::start(&old).await;
+        let client = AcmeClient::new(&dir, old.clone(), None).await.unwrap();
+        let account_url = client.account_url().unwrap();
+        client.issue_dns01(&ALL_NAMES, dns.as_ref()).await.expect("an order under the old key");
+
+        client.rollover_account_key(new.clone()).await.expect("rollover");
+        {
+            // The mock checked both signatures and the inner payload (see `check_key_change`).
+            let st = state.lock().unwrap();
+            assert_eq!(st.key_changes, 1);
+            assert_eq!(st.acct_pk, Some(new.xy()), "the CA now knows the account by the new key");
+            assert_eq!(st.bad_nonce_seen, 0);
+        }
+        assert_eq!(client.account_url().unwrap(), account_url, "the account is the same account");
+        assert_eq!(client.account().thumbprint(), new.thumbprint());
+
+        // A whole new order: every request is verified under the new key by the CA, and the
+        // DNS-01 values are derived from the new key's thumbprint (the mock only validates a
+        // value computed from it).
+        dns.published.lock().unwrap().clear();
+        client.issue_dns01(&ALL_NAMES, dns.as_ref()).await.expect("an order signed by the new key");
+        let expect: Vec<String> =
+            (1..=2).map(|n| b64url(&sha256(acme_key_authorization(&format!("tok{n}"), &new.thumbprint()).as_bytes()))).collect();
+        let published: Vec<String> = dns.published.lock().unwrap().iter().map(|(_, v)| v.clone()).collect();
+        assert_eq!(published, expect);
+    }
+
+    #[tokio::test]
+    async fn a_rejected_rollover_leaves_the_client_on_its_old_key() {
+        let old = test_account();
+        let (dir, state, dns) = mock_ca::start(&old).await;
+        state.lock().unwrap().reject_key_change = true;
+        let client = AcmeClient::new(&dir, old.clone(), None).await.unwrap();
+
+        let err = client.rollover_account_key(AccountKey::from_bytes([9u8; 32]).unwrap()).await.unwrap_err();
+        assert!(matches!(err, AcmeError::Rejected { status: 409, .. }), "{err}");
+        assert_eq!(client.account().thumbprint(), old.thumbprint());
+        assert_eq!(state.lock().unwrap().acct_pk, Some(old.xy()));
+        client.issue_dns01(&ALL_NAMES, dns.as_ref()).await.expect("still signing with, and known by, the old key");
+    }
+
+    #[tokio::test]
+    async fn rollover_needs_a_key_change_endpoint_and_a_different_key() {
+        let old = test_account();
+        let (dir, state, _dns) = mock_ca::start(&old).await;
+        state.lock().unwrap().no_key_change = true;
+        let client = AcmeClient::new(&dir, old.clone(), None).await.unwrap();
+        let err = client.rollover_account_key(AccountKey::from_bytes([9u8; 32]).unwrap()).await.unwrap_err();
+        assert!(matches!(&err, AcmeError::BadResponse(m) if m.contains("keyChange")), "{err}");
+        assert_eq!(state.lock().unwrap().key_changes, 0);
+
+        let (dir, _state, _dns) = mock_ca::start(&old).await;
+        let client = AcmeClient::new(&dir, old.clone(), None).await.unwrap();
+        let err = client.rollover_account_key(old).await.unwrap_err();
+        assert!(matches!(&err, AcmeError::BadResponse(m) if m.contains("already in use")), "{err}");
+    }
+
+    #[test]
+    fn directory_exposes_key_change_and_renewal_info_when_offered() {
+        let full = r#"{"newNonce":"https://x/n","newAccount":"https://x/a","newOrder":"https://x/o","keyChange":"https://x/kc","renewalInfo":"https://x/ari","meta":{"termsOfService":"x"}}"#;
+        let dir: Directory = serde_json::from_str(full).unwrap();
+        assert_eq!((dir.key_change.as_deref(), dir.renewal_info.as_deref()), (Some("https://x/kc"), Some("https://x/ari")));
+        let bare: Directory = serde_json::from_str(r#"{"newNonce":"https://x/n","newAccount":"https://x/a","newOrder":"https://x/o"}"#).unwrap();
+        assert_eq!((bare.key_change, bare.renewal_info), (None, None), "a CA without them still parses");
+    }
+
+    // ── ACME Renewal Information (RFC 9773) ──────────────────────────────────────────────
+
+    /// RFC 9773 appendix A's example: AKI keyIdentifier 69:88:5B:6B:87:46:40:41:E1:B3:7B:84:7B:A0:AE:2C:DE:01:C8:D4,
+    /// serial 0x87654321, certificate ID `aYhba4dGQEHhs3uEe6CuLN4ByNQ.AIdlQyE`.
+    const RFC9773_AKI: [u8; 20] = [
+        0x69, 0x88, 0x5B, 0x6B, 0x87, 0x46, 0x40, 0x41, 0xE1, 0xB3, 0x7B, 0x84, 0x7B, 0xA0, 0xAE, 0x2C, 0xDE, 0x01, 0xC8, 0xD4,
+    ];
+    const RFC9773_CERT_ID: &str = "aYhba4dGQEHhs3uEe6CuLN4ByNQ.AIdlQyE";
+
+    /// A real (rcgen-made) end-entity certificate issued by a CA whose key identifier is `aki`,
+    /// carrying `serial` and — when `with_aki` — the AKI extension naming that CA.
+    fn rcgen_leaf(aki: &[u8], serial: &[u8], with_aki: bool) -> String {
+        let ca_key = rcgen::KeyPair::generate().unwrap();
+        let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        ca_params.key_identifier_method = rcgen::KeyIdMethod::PreSpecified(aki.to_vec());
+        let ca = ca_params.self_signed(&ca_key).unwrap();
+        let leaf_key = rcgen::KeyPair::generate().unwrap();
+        let mut params = rcgen::CertificateParams::new(vec!["example.test".to_string()]).unwrap();
+        params.serial_number = Some(rcgen::SerialNumber::from_slice(serial));
+        params.use_authority_key_identifier_extension = with_aki;
+        params.signed_by(&leaf_key, &ca, &ca_key).unwrap().pem()
+    }
+
+    #[test]
+    fn ari_cert_id_of_a_real_certificate_matches_the_rfc_9773_example() {
+        assert_eq!(b64url(&RFC9773_AKI), RFC9773_CERT_ID.split('.').next().unwrap(), "the vector's AKI half");
+        let pem = rcgen_leaf(&RFC9773_AKI, &[0x87, 0x65, 0x43, 0x21], true);
+        assert_eq!(ari_cert_id(&pem).as_deref(), Some(RFC9773_CERT_ID));
+        // A chain: only the leaf (first block) is read.
+        let chain = format!("{pem}{}", rcgen_leaf(&[7; 20], &[1], true));
+        assert_eq!(ari_cert_id(&chain).as_deref(), Some(RFC9773_CERT_ID));
+    }
+
+    #[test]
+    fn ari_cert_id_keeps_the_der_leading_zero_only_where_der_has_one() {
+        let id = |serial: &[u8]| ari_cert_id(&rcgen_leaf(&RFC9773_AKI, serial, true)).unwrap().split_once('.').unwrap().1.to_string();
+        // High bit set -> DER content is 00 87 65 43 21 -> "AIdlQyE" (not "h2VDIQ", the 4-byte form).
+        assert_eq!(id(&[0x87, 0x65, 0x43, 0x21]), "AIdlQyE");
+        assert_eq!(id(&[0x00, 0x87, 0x65, 0x43, 0x21]), "AIdlQyE", "an explicit leading zero is the same integer");
+        // High bit clear -> no padding byte: 01 02 03.
+        assert_eq!(id(&[0x01, 0x02, 0x03]), b64url(&[1, 2, 3]));
+        // A full 20-byte serial (the CA/B Forum maximum) round-trips.
+        let long: Vec<u8> = (1..=20).collect();
+        assert_eq!(id(&long), b64url(&long));
+    }
+
+    #[test]
+    fn ari_cert_id_is_none_without_an_aki_or_for_junk() {
+        assert_eq!(ari_cert_id(&rcgen_leaf(&RFC9773_AKI, &[1, 2, 3], false)), None, "no AKI extension");
+        assert_eq!(ari_cert_id(""), None);
+        assert_eq!(ari_cert_id("-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n"), None);
+        // Truncations of a real certificate never panic and never yield an ID.
+        let pem = rcgen_leaf(&RFC9773_AKI, &[1, 2, 3], true);
+        let der = crate::pem::blocks(&pem, "CERTIFICATE").remove(0);
+        for cut in 0..der.len() {
+            assert!(der::aki_and_serial(&der[..cut]).is_none(), "cut at {cut}");
+        }
+    }
+
+    #[test]
+    fn rfc3339_parses_offsets_and_fractions_and_rejects_everything_else() {
+        for (text, unix) in [
+            ("1970-01-01T00:00:00Z", 0),
+            ("2000-01-01T00:00:00Z", 946_684_800),
+            ("2024-02-29T12:00:00Z", 1_709_208_000),
+            ("2024-02-29T12:00:00.999999999Z", 1_709_208_000),
+            ("2024-02-29t12:00:00z", 1_709_208_000),
+            ("2026-10-15T08:30:00Z", 1_792_053_000),
+            ("2026-10-15T18:30:00+10:00", 1_792_053_000),
+            ("2026-10-15T03:00:00-05:30", 1_792_053_000),
+            ("2100-03-01T00:00:00Z", 4_107_542_400),
+            ("2024-12-31T23:59:59Z", 1_735_689_599),
+            ("1999-12-31T23:59:59Z", 946_684_799),
+        ] {
+            assert_eq!(parse_rfc3339(text), Some(unix), "{text}");
+            // Agrees with the (lenient, millisecond) parser the HTTP client carries, where that
+            // one accepts the spelling at all (it wants an upper-case `T`).
+            if text.contains('T') {
+                assert_eq!(crate::http_client::parse_rfc3339(text).map(|ms| ms.div_euclid(1000)), Some(unix), "{text}");
+            }
+        }
+        for bad in [
+            "", "soon", "2024-02-29", "2023-02-29T00:00:00Z", "2100-02-29T00:00:00Z", "2024-13-01T00:00:00Z", "2024-00-10T00:00:00Z",
+            "2024-04-31T00:00:00Z", "2024-02-29T24:00:00Z", "2024-02-29T00:60:00Z", "2024-02-29T00:00:61Z", "2024-02-29T12:00:00",
+            "2024-02-29 12:00:00Z", "2024-02-29T12:00:00.Z", "2024-02-29T12:00:00Zjunk", "2024-02-29T12:00:00+25:00",
+            "2024-02-29T12:00:00+10:60", "2024-02-29T12:00:00+1000", "2024-2-29T12:00:00Z", "２０２４-02-29T12:00:00Z", "0000-01-01T00:00:00Z",
+        ] {
+            assert_eq!(parse_rfc3339(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn renewal_info_bodies_become_windows_and_invalid_ones_are_errors() {
+        let w = parse_renewal_info(
+            r#"{"suggestedWindow":{"start":"2026-10-15T08:30:00Z","end":"2026-10-17T08:30:00.5Z"},"explanationURL":"https://ca.test/why","somethingNew":1}"#,
+            Some(21_600),
+        )
+        .unwrap();
+        assert_eq!(w, RenewalWindow { start: 1_792_053_000, end: 1_792_053_000 + 2 * 86_400, explanation_url: Some("https://ca.test/why".into()), retry_after_secs: Some(21_600) });
+        let w = parse_renewal_info(r#"{"suggestedWindow":{"start":"2026-10-15T08:30:00Z","end":"2026-10-15T08:30:01Z"}}"#, None).unwrap();
+        assert_eq!((w.explanation_url, w.retry_after_secs), (None, None));
+        for bad in [
+            "",
+            "{}",
+            r#"{"suggestedWindow":{}}"#,
+            r#"{"suggestedWindow":{"start":"2026-10-15T08:30:00Z"}}"#,
+            r#"{"suggestedWindow":{"start":"yesterday","end":"2026-10-15T08:30:00Z"}}"#,
+            r#"{"suggestedWindow":{"start":"2026-10-15T08:30:00Z","end":"2026-10-15T08:30:00Z"}}"#,
+            r#"{"suggestedWindow":{"start":"2026-10-16T08:30:00Z","end":"2026-10-15T08:30:00Z"}}"#,
+            r#"{"suggestedWindow":{"start":1,"end":2}}"#,
+        ] {
+            assert!(matches!(parse_renewal_info(bad, None), Err(AcmeError::BadResponse(_))), "{bad:?}");
+        }
+    }
+
+    const ARI_BODY: &str = r#"{"suggestedWindow":{"start":"2026-10-15T08:30:00Z","end":"2026-10-17T08:30:00Z"},"explanationURL":"https://ca.test/why"}"#;
+
+    #[tokio::test]
+    async fn renewal_info_asks_for_the_certificate_id_and_reports_the_window_and_retry_after() {
+        let account = test_account();
+        let (dir, state, _dns) = mock_ca::start(&account).await;
+        state.lock().unwrap().ari = Some((200, Some("21600".to_string()), ARI_BODY.to_string()));
+        let client = AcmeClient::new(&dir, account, None).await.unwrap();
+
+        let pem = rcgen_leaf(&RFC9773_AKI, &[0x87, 0x65, 0x43, 0x21], true);
+        let w = client.renewal_info(&pem).await.expect("lookup").expect("the CA has advice");
+        assert_eq!(
+            w,
+            RenewalWindow {
+                start: 1_792_053_000,
+                end: 1_792_053_000 + 2 * 86_400,
+                explanation_url: Some("https://ca.test/why".to_string()),
+                retry_after_secs: Some(21_600),
+            }
+        );
+        assert_eq!(state.lock().unwrap().ari_requests, vec![format!("/renewal-info/{RFC9773_CERT_ID}")]);
+        assert_eq!(state.lock().unwrap().nonces.len(), 1, "an unauthenticated GET: it neither takes nor burns a nonce");
+
+        // A directory URL with a trailing slash does not double it.
+        let mut with_slash = AcmeClient::new(&dir, test_account(), None).await.unwrap();
+        with_slash.directory.renewal_info = with_slash.directory.renewal_info.map(|u| format!("{u}/"));
+        with_slash.renewal_info(&pem).await.unwrap().unwrap();
+        assert_eq!(state.lock().unwrap().ari_requests[1], format!("/renewal-info/{RFC9773_CERT_ID}"));
+    }
+
+    #[tokio::test]
+    async fn renewal_info_is_none_without_ari_and_other_failures_are_typed_errors() {
+        let account = test_account();
+        let pem = rcgen_leaf(&RFC9773_AKI, &[1, 2, 3], true);
+
+        // No `renewalInfo` in the directory: no advice, and not even a request.
+        let (dir, state, _dns) = mock_ca::start(&account).await;
+        let client = AcmeClient::new(&dir, account.clone(), None).await.unwrap();
+        assert_eq!(client.renewal_info(&pem).await.unwrap(), None);
+        assert!(state.lock().unwrap().ari_requests.is_empty());
+        assert_eq!(client.renewal_info("not a certificate").await.unwrap(), None, "nothing to ask about, nothing to ask");
+
+        let cases: [(u16, Option<&str>, &str); 4] =
+            [(404, None, "{}"), (429, Some("120"), r#"{"type":"urn:ietf:params:acme:error:rateLimited"}"#), (500, None, "oops"), (200, None, "<html>")];
+        let mut results = Vec::new();
+        for (status, retry_after, body) in cases {
+            let (dir, state, _dns) = mock_ca::start(&account).await;
+            state.lock().unwrap().ari = Some((status, retry_after.map(str::to_string), body.to_string()));
+            let client = AcmeClient::new(&dir, account.clone(), None).await.unwrap();
+            results.push(client.renewal_info(&pem).await);
+        }
+        assert!(matches!(results[0], Ok(None)), "a CA that does not know the certificate has no advice: {:?}", results[0]);
+        assert!(matches!(results[1], Err(AcmeError::RateLimited { retry_after_secs: Some(120), .. })), "{:?}", results[1]);
+        assert!(matches!(results[2], Err(AcmeError::Rejected { status: 500, .. })), "{:?}", results[2]);
+        assert!(matches!(results[3], Err(AcmeError::BadResponse(_))), "{:?}", results[3]);
+
+        // With ARI offered, a certificate that cannot name an AKI is an error, not silence.
+        let (dir, state, _dns) = mock_ca::start(&account).await;
+        state.lock().unwrap().ari = Some((200, None, ARI_BODY.to_string()));
+        let client = AcmeClient::new(&dir, account, None).await.unwrap();
+        let err = client.renewal_info(&rcgen_leaf(&RFC9773_AKI, &[1, 2, 3], false)).await.unwrap_err();
+        assert!(matches!(&err, AcmeError::BadResponse(m) if m.contains("Authority Key Identifier")), "{err}");
+        assert!(state.lock().unwrap().ari_requests.is_empty());
     }
 }
