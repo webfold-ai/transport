@@ -85,6 +85,8 @@ pub mod acme_renew;
 /// injected lookups; the live resolver is `edge_verify`'s DNS client.
 #[cfg(feature = "native")]
 pub mod dns_health;
+/// Owner-signed object replication over the native transport (zone snapshots, ACME challenge state).
+pub mod zone_sync;
 
 use std::future::Future;
 use std::io;
