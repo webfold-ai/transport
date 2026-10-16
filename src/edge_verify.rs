@@ -126,7 +126,7 @@ pub async fn sweep(
 #[cfg(feature = "native")]
 mod native_probe {
     use super::{Challenge, DnsProbe, Observed};
-    use crate::dns::{Flags, Message, Name, Question, RData, RecordType, ResponseCode};
+    use crate::dns::{Flags, Message, Name, Question, RData, Record, RecordType, ResponseCode};
     use crate::BoxFuture;
     use std::net::SocketAddr;
     use std::time::Duration;
@@ -135,6 +135,72 @@ mod native_probe {
     /// How far a customer's CNAME chain is followed. Real chains are 1-3 hops; the cap exists
     /// so a looping chain terminates.
     const MAX_CNAME_HOPS: usize = 8;
+
+    /// How one query is asked.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct QueryOptions {
+        /// Set the RD bit: ask a recursive resolver to do the work. Clear it for a direct
+        /// question to an authoritative server.
+        pub recursion_desired: bool,
+        /// Send an EDNS0 OPT record with the DO bit (RFC 3225), so a signed zone's answer carries
+        /// its RRSIGs and DNSKEY/DS data. Also advertises a 1232-byte UDP payload.
+        pub dnssec_ok: bool,
+    }
+
+    /// The UDP payload size advertised with EDNS0 (the DNS-flag-day-2020 recommendation: small
+    /// enough to avoid fragmentation).
+    const EDNS_UDP_PAYLOAD: u16 = 1232;
+    /// OPT TTL field: extended-rcode 0, version 0, DO bit set (RFC 3225 §3).
+    const EDNS_DO_TTL: u32 = 0x0000_8000;
+
+    /// A one-shot DNS client on this crate's own wire format: UDP from a fresh random source port
+    /// with a random id, TCP retry on truncation, and a reply believed only if it answers exactly
+    /// the question asked (id, QR bit and echoed question). It is the transport under both the
+    /// proof-of-control probe and [`crate::dns_health`].
+    #[derive(Clone, Debug)]
+    pub struct DnsClient {
+        pub timeout: Duration,
+    }
+
+    impl Default for DnsClient {
+        fn default() -> Self {
+            DnsClient { timeout: Duration::from_secs(3) }
+        }
+    }
+
+    impl DnsClient {
+        #[must_use]
+        pub fn new(timeout: Duration) -> Self {
+            DnsClient { timeout }
+        }
+
+        /// Ask `server` one question. `None` on timeout, a transport error, an unparseable reply or
+        /// one that does not answer this question; otherwise the reply **whatever its rcode** (the
+        /// caller decides whether SERVFAIL or REFUSED matters — for a health check it does).
+        pub async fn query(&self, server: SocketAddr, name: &Name, qtype: RecordType, opts: QueryOptions) -> Option<Message> {
+            let id_bytes = hashtrinity::crypto::rand_bytes(2);
+            let id = u16::from_be_bytes([*id_bytes.first()?, *id_bytes.get(1)?]);
+            let mut query = Message {
+                id,
+                flags: Flags { recursion_desired: opts.recursion_desired, ..Flags::default() },
+                questions: vec![Question::new(name.clone(), qtype)],
+                ..Message::default()
+            };
+            if opts.dnssec_ok {
+                query.additionals.push(Record { name: Name::root(), class: EDNS_UDP_PAYLOAD, ttl: EDNS_DO_TTL, data: RData::Unknown(41, Vec::new()) });
+            }
+            let reply = match tokio::time::timeout(self.timeout, udp_exchange(server, &query)).await {
+                Ok(Some(m)) => m,
+                _ => return None,
+            };
+            let reply = if reply.flags.truncated {
+                tokio::time::timeout(self.timeout, tcp_exchange(server, &query)).await.ok()??
+            } else {
+                reply
+            };
+            answers_question(&query, &reply).then_some(reply)
+        }
+    }
 
     pub struct NativeProbe {
         resolvers: Vec<SocketAddr>,
@@ -168,44 +234,24 @@ mod native_probe {
         /// Ask each recursor in turn; the first usable (NOERROR / NXDOMAIN) answer wins.
         async fn query(&self, name: &str, qtype: RecordType) -> Option<Message> {
             let qname = Name::from_ascii(name).ok()?;
+            let client = DnsClient::new(self.timeout);
             for resolver in &self.resolvers {
-                if let Some(m) = self.query_one(*resolver, &qname, qtype).await {
-                    return Some(m);
+                let opts = QueryOptions { recursion_desired: true, dnssec_ok: false };
+                if let Some(m) = client.query(*resolver, &qname, qtype, opts).await {
+                    // Anything but a definitive answer (SERVFAIL, REFUSED...) tries the next recursor.
+                    if matches!(m.flags.response_code, ResponseCode::NoError | ResponseCode::NxDomain) {
+                        return Some(m);
+                    }
                 }
             }
             None
         }
-
-        async fn query_one(&self, resolver: SocketAddr, qname: &Name, qtype: RecordType) -> Option<Message> {
-            let id_bytes = hashtrinity::crypto::rand_bytes(2);
-            let id = u16::from_be_bytes([id_bytes[0], id_bytes[1]]);
-            let query = Message {
-                id,
-                flags: Flags { recursion_desired: true, ..Flags::default() },
-                questions: vec![Question::new(qname.clone(), qtype)],
-                ..Message::default()
-            };
-            let reply = match tokio::time::timeout(self.timeout, udp_exchange(resolver, &query)).await {
-                Ok(Some(m)) => m,
-                _ => return None,
-            };
-            let reply = if reply.flags.truncated {
-                tokio::time::timeout(self.timeout, tcp_exchange(resolver, &query)).await.ok()??
-            } else {
-                reply
-            };
-            acceptable(&query, &reply).then_some(reply)
-        }
     }
 
     /// A reply is usable only if it answers THIS question: id, QR bit and echoed question must
-    /// match, and the rcode must be a definitive one. Anything else is noise or an off-path
-    /// spoof attempt and is treated as no answer.
-    fn acceptable(query: &Message, reply: &Message) -> bool {
-        reply.flags.response
-            && reply.id == query.id
-            && reply.questions.first() == query.questions.first()
-            && matches!(reply.flags.response_code, ResponseCode::NoError | ResponseCode::NxDomain)
+    /// match. Anything else is noise or an off-path spoof attempt and is treated as no answer.
+    fn answers_question(query: &Message, reply: &Message) -> bool {
+        reply.flags.response && reply.id == query.id && reply.questions.first() == query.questions.first()
     }
 
     async fn udp_exchange(resolver: SocketAddr, query: &Message) -> Option<Message> {
@@ -418,6 +464,51 @@ mod native_probe {
         }
 
         #[tokio::test]
+        async fn the_client_asks_for_dnssec_records_only_when_told_to_and_surfaces_every_rcode() {
+            // The server reports back what it was sent: RD bit, whether an OPT record carried
+            // DO, and the advertised payload size, all in the answer's TXT strings.
+            let addr = serve(
+                |q| {
+                    let opt = q.additionals.iter().find(|r| r.data.record_type() == RecordType::Unknown(41));
+                    let describe = format!(
+                        "rd={} opt={} do={} size={}",
+                        q.flags.recursion_desired,
+                        opt.is_some(),
+                        opt.is_some_and(|o| o.ttl & 0x8000 != 0),
+                        opt.map_or(0, |o| o.class)
+                    );
+                    let mut r = reply_to(q, vec![Record::new(q.questions[0].name.clone(), 60, RData::Txt(vec![describe.into_bytes()]))]);
+                    if q.questions[0].name.to_ascii() == "refused.example." {
+                        r.answers.clear();
+                        r.flags.response_code = ResponseCode::Refused;
+                    }
+                    r
+                },
+                false,
+            )
+            .await;
+            let client = DnsClient::new(Duration::from_secs(2));
+            let ask = |name: &str, opts: QueryOptions| {
+                let name = Name::from_ascii(name).unwrap();
+                let client = client.clone();
+                async move { client.query(addr, &name, RecordType::Txt, opts).await }
+            };
+            let text = |m: &Message| match &m.answers[0].data {
+                RData::Txt(s) => String::from_utf8(s.concat()).unwrap(),
+                other => panic!("{other:?}"),
+            };
+            let plain = ask("x.example", QueryOptions { recursion_desired: true, dnssec_ok: false }).await.unwrap();
+            assert_eq!(text(&plain), "rd=true opt=false do=false size=0", "no EDNS unless asked");
+            let signed = ask("x.example", QueryOptions { recursion_desired: false, dnssec_ok: true }).await.unwrap();
+            assert_eq!(text(&signed), "rd=false opt=true do=true size=1232");
+            let refused = ask("refused.example", QueryOptions::default()).await.expect("a REFUSED reply is a reply");
+            assert_eq!(refused.flags.response_code, ResponseCode::Refused);
+            // ...while the proof-of-control probe still treats it as "try the next resolver".
+            let probe = NativeProbe::with_resolvers(vec![addr]);
+            assert!(probe.query("refused.example", RecordType::Txt).await.is_none());
+        }
+
+        #[tokio::test]
         async fn a_reply_with_the_wrong_question_is_not_believed() {
             let ch = challenge();
             let token = ch.token.clone();
@@ -437,7 +528,7 @@ mod native_probe {
 }
 
 #[cfg(feature = "native")]
-pub use native_probe::NativeProbe;
+pub use native_probe::{DnsClient, NativeProbe, QueryOptions};
 
 #[cfg(test)]
 mod tests {

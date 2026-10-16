@@ -14,7 +14,15 @@
 //!   afterwards under the new key validates, and the account is now bound to the new key;
 //! - ACME Renewal Information: the certificate ID we derive is one Pebble resolves, the window it
 //!   returns parses, and the engine renews early when the CA's window says to
-//!   (`/set-renewal-info/` makes Pebble advise it).
+//!   (`/set-renewal-info/` makes Pebble advise it);
+//! - revocation (RFC 8555 §7.6): Pebble marks a certificate revoked (checked at its management
+//!   `/cert-status-by-serial/`, with the reason) after a revocation signed by the account and
+//!   after one signed by the certificate's own key; a repeat is `alreadyRevoked` and is success; an
+//!   account that did not order the certificate is refused and `AcmeIssuer::revoke` then falls
+//!   back to the certificate's key;
+//! - `replaces` (RFC 9773 §5): a renewal order naming the previous certificate is accepted and
+//!   Pebble records the old one as replaced; replacing the same certificate twice is refused by
+//!   Pebble as `alreadyReplaced`, and the client's fallback to a plain order still yields a certificate.
 //!
 //! Skipped unless `PEBBLE_BIN` (the `pebble` binary) and `PEBBLE_SRC` (its source tree, for the
 //! test TLS certificate) are set:
@@ -35,8 +43,8 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use transport::acme::{AccountKey, AcmeClient, AcmeError, ExternalAccountBinding, Http01Responder};
-use transport::acme_renew::{cert_validity, AcmeIssuer, FileCertStore, RenewalEngine, RenewalPolicy};
+use transport::acme::{AccountKey, AcmeClient, AcmeError, ExternalAccountBinding, Http01Responder, RevocationOutcome, RevocationReason};
+use transport::acme_renew::{cert_validity, AcmeIssuer, CertIssuer, FileCertStore, RenewalEngine, RenewalPolicy};
 use transport::dns::{Flags, Message, Name, Question, RData, Record, RecordType, ResponseCode};
 use transport::edge::{CertSource, EdgeRegistry, HostnameState, Route, APEXES};
 use transport::edge_dns::{serve_tcp_with, serve_udp_with, Dns01Authority, DnsHandler, ZoneAuthority, ZoneConfig};
@@ -57,6 +65,8 @@ const ENGINE_PORTS: Ports = Ports { acme: 14500, mgmt: 14501, http01: 15002, tls
 const EAB_PORTS: Ports = Ports { acme: 14510, mgmt: 14511, http01: 15012, tls: 15011 };
 const ROLLOVER_PORTS: Ports = Ports { acme: 14520, mgmt: 14521, http01: 15022, tls: 15021 };
 const ARI_PORTS: Ports = Ports { acme: 14530, mgmt: 14531, http01: 15032, tls: 15031 };
+const REVOKE_PORTS: Ports = Ports { acme: 14540, mgmt: 14541, http01: 15042, tls: 15041 };
+const REPLACE_PORTS: Ports = Ports { acme: 14550, mgmt: 14551, http01: 15052, tls: 15051 };
 
 /// The tests share `SSL_CERT_FILE` (process-global, read once by the HTTP client's TLS config),
 /// so they run one at a time.
@@ -548,5 +558,116 @@ async fn the_engine_renews_early_when_pebbles_renewal_info_says_so() {
 
     // The replacement is a new certificate with its own (default) advice: quiet again.
     assert!(engine.run_once(after_retry + 60, &fx.registry).await.issued.is_empty());
+    let _ = std::fs::remove_dir_all(&fx.work);
+}
+
+/// Pebble's view of a certificate: `GET /cert-status-by-serial/<hex>` on the management port.
+/// `(status, reason)` — `status` is "Valid" or "Revoked".
+async fn pebble_cert_status(mgmt_port: u16, chain_pem: &str) -> (String, Option<u64>) {
+    let id = transport::acme::ari_cert_id(chain_pem).expect("an ARI id has the serial");
+    let serial_b64 = id.split_once('.').unwrap().1.replace('-', "+").replace('_', "/");
+    let serial = transport::pem::base64_decode(&serial_b64).unwrap();
+    let hex: String = serial.iter().map(|b| format!("{b:02x}")).collect();
+    let body = transport::http_client::Client::new()
+        .get(format!("https://localhost:{mgmt_port}/cert-status-by-serial/{hex}"))
+        .send()
+        .await
+        .expect("cert-status")
+        .text()
+        .await
+        .expect("status body");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap_or_else(|e| panic!("status {hex}: {e}: {body}"));
+    (v["Status"].as_str().unwrap().to_string(), v["Reason"].as_u64())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pebble_marks_certificates_revoked_by_the_account_and_by_the_certificates_own_key() {
+    let _serial = SERIAL.lock().await;
+    let Some(fx) = Fixture::start("revoke", REVOKE_PORTS, None).await else { return };
+    let http01 = fx.http01();
+    let client = AcmeClient::new(&fx.directory, AccountKey::generate().unwrap(), Some("ops@example.test")).await.unwrap();
+
+    // ── signed by the account (kid), reason cessationOfOperation
+    let a = client.issue(&["rev-a.example.com.au"], &http01).await.expect("issue A");
+    assert_eq!(pebble_cert_status(fx.ports.mgmt, &a.chain_pem).await, ("Valid".to_string(), None));
+    let outcome = client.revoke_certificate(a.chain_pem.as_bytes(), RevocationReason::CessationOfOperation).await.expect("Pebble accepts the account-signed revocation");
+    assert_eq!(outcome, RevocationOutcome::Revoked);
+    assert_eq!(pebble_cert_status(fx.ports.mgmt, &a.chain_pem).await, ("Revoked".to_string(), Some(5)), "Pebble forgot the certificate with the reason we sent");
+    // A second revoke is alreadyRevoked (a 400 problem), which is success.
+    assert_eq!(client.revoke_certificate(a.chain_pem.as_bytes(), RevocationReason::CessationOfOperation).await.unwrap(), RevocationOutcome::AlreadyRevoked);
+    // So is the repeat by the other route.
+    assert_eq!(
+        client.revoke_certificate_with_key(a.chain_pem.as_bytes(), &a.key_pem, RevocationReason::CessationOfOperation).await.unwrap(),
+        RevocationOutcome::AlreadyRevoked
+    );
+
+    // ── signed by the certificate's own key (JWK), reason keyCompromise
+    let b = client.issue(&["rev-b.example.com.au"], &http01).await.expect("issue B");
+    let outcome = client.revoke_certificate_with_key(b.chain_pem.as_bytes(), &b.key_pem, RevocationReason::KeyCompromise).await.expect("Pebble accepts the key-signed revocation");
+    assert_eq!(outcome, RevocationOutcome::Revoked);
+    assert_eq!(pebble_cert_status(fx.ports.mgmt, &b.chain_pem).await, ("Revoked".to_string(), Some(1)));
+
+    // ── a key that is not the certificate's cannot revoke it
+    let c = client.issue(&["rev-c.example.com.au"], &http01).await.expect("issue C");
+    let err = client.revoke_certificate_with_key(c.chain_pem.as_bytes(), &b.key_pem, RevocationReason::KeyCompromise).await.unwrap_err();
+    assert!(err.is_problem("unauthorized"), "{err}");
+    assert_eq!(pebble_cert_status(fx.ports.mgmt, &c.chain_pem).await.0, "Valid");
+
+    // ── an account that did not order the certificate: refused by kid; the issuer falls back to the key
+    let other = AcmeClient::new(&fx.directory, AccountKey::generate().unwrap(), None).await.unwrap();
+    let err = other.revoke_certificate(c.chain_pem.as_bytes(), RevocationReason::CessationOfOperation).await.unwrap_err();
+    assert!(err.is_problem("unauthorized"), "{err}");
+    let issuer = AcmeIssuer::new(other, Arc::new(Dns01Authority(fx.authority.clone())), Some(Arc::new(http01.clone())));
+    issuer.revoke(&c).await.expect("AcmeIssuer::revoke signs with the certificate key when the account cannot");
+    assert_eq!(pebble_cert_status(fx.ports.mgmt, &c.chain_pem).await, ("Revoked".to_string(), Some(5)));
+    issuer.revoke(&c).await.expect("and doing it again is still success");
+
+    // Garbage never reaches Pebble as a request.
+    assert!(client.revoke_certificate(b"junk", RevocationReason::Unspecified).await.is_err());
+    let _ = std::fs::remove_dir_all(&fx.work);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_renewal_order_names_the_certificate_it_replaces_and_pebble_records_it() {
+    let _serial = SERIAL.lock().await;
+    let Some(fx) = Fixture::start("replace", REPLACE_PORTS, None).await else { return };
+    let http01 = fx.http01();
+    let client = AcmeClient::new(&fx.directory, AccountKey::generate().unwrap(), Some("ops@example.test")).await.unwrap();
+    let log = || std::fs::read_to_string(fx.work.join("pebble.log")).unwrap_or_default();
+    let replaced_marks = || log().matches("has been marked as replaced in the DB").count();
+
+    let first = client.issue(&["repl.example.com.au"], &http01).await.expect("first issuance");
+    assert_eq!(replaced_marks(), 0, "a first issuance replaces nothing");
+
+    // The renewal names `first`; Pebble accepts it and marks `first` as replaced.
+    let second = client.issue_replacing(&["repl.example.com.au"], &http01, &first.chain_pem).await.expect("renewal with replaces");
+    assert_ne!(first.chain_pem, second.chain_pem);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while replaced_marks() < 1 && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(replaced_marks(), 1, "Pebble saw `replaces` and recorded the old certificate as replaced:\n{}", log());
+
+    // Replacing the same certificate again is refused by Pebble (alreadyReplaced, 409). The client
+    // falls back to a plain order: the renewal still produces a certificate.
+    let third = client.issue_replacing(&["repl.example.com.au"], &http01, &first.chain_pem).await.expect("falls back to a plain order");
+    assert!(cert_validity(&third.chain_pem).is_some());
+    // Had Pebble accepted the second `replaces` it would have marked the certificate replaced again
+    // (a second log line); it stays at one because the refused order was re-placed without it.
+    assert_eq!(replaced_marks(), 1, "Pebble refused the second replacement and the fallback order replaced nothing:\n{}", log());
+
+    // A certificate from some other CA has no ID Pebble recognises: `replaces` is malformed there, and
+    // the fallback again yields a certificate.
+    let foreign = {
+        let ca_key = rcgen::KeyPair::generate().unwrap();
+        let mut p = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        p.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let ca = p.self_signed(&ca_key).unwrap();
+        let k = rcgen::KeyPair::generate().unwrap();
+        let mut lp = rcgen::CertificateParams::new(vec!["x.example.test".to_string()]).unwrap();
+        lp.use_authority_key_identifier_extension = true;
+        lp.signed_by(&k, &ca, &ca_key).unwrap().pem()
+    };
+    client.issue_replacing(&["repl2.example.com.au"], &http01, &foreign).await.expect("a refused `replaces` never fails the renewal");
     let _ = std::fs::remove_dir_all(&fx.work);
 }

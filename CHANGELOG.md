@@ -48,6 +48,41 @@
   window still ahead leaves the percent-of-lifetime rule in charge; lookups are at most once per
   `Retry-After` (default 6 h) per name and never while a name is backing off. Pebble end-to-end tests
   cover all three features.
+- **ACME revocation (RFC 8555 §7.6)**: `AcmeClient::revoke_certificate(cert_der_or_pem, RevocationReason)`
+  signs with the account key; `revoke_certificate_with_key(.., certificate_key_pem, ..)` signs with the
+  certificate's own key (the key-compromise route, and the one that works when the ordering account is
+  gone). `Directory::revoke_cert`; `alreadyRevoked` is success (`RevocationOutcome::AlreadyRevoked`);
+  input is bounded and sanity-checked as DER/PEM before a request is made; `AcmeError::is_problem`.
+  Tested against the mock CA and Pebble (which marks the certificate revoked, with the reason).
+- **Revoke-on-release machinery in `acme_renew`**: `CertIssuer::revoke(&CertMaterial)` (default: no-op
+  success; `AcmeIssuer` revokes with reason `cessationOfOperation`, account first, then the certificate's
+  own key if the CA says the account has no claim). `RevocationQueue` is the durable pending queue
+  (`<id>.revoke`, 0600, fsynced, reloaded at boot) that keeps the key until the CA has revoked the
+  certificate or it has expired, and `process_revocations` retries with exponential backoff, honouring
+  `Retry-After`, never giving up on an unexpired certificate. `retire_for_revocation` is the one safe
+  ordering (queue entry durable, *then* out of the serving store; a shared `*.` wildcard is never
+  retired). `RenewalEngine::with_revocations` makes the prune revoke a dedicated certificate instead of
+  just deleting it, and keeps the certificate if it cannot be queued. `impl CertIssuer for Arc<T>`.
+- **RFC 9773 `replaces`**: `AcmeClient::{issue_replacing, issue_dns01_replacing}` put the previous
+  certificate's ARI ID in `newOrder` (only when the CA advertises `renewalInfo`; if the CA refuses it with
+  `alreadyReplaced`/`malformed`/`unauthorized` the order is placed again without it).
+  `CertIssuer::issue_replacing` (default: forwards to `issue`) is what the engine calls for a renewal or a
+  CA-suggested replacement, never for a first issuance or an expired certificate.
+- **New `dns_health`** (native): DNSSEC chain health per zone (DS recomputed over the DNSKEY with SHA-256/384
+  via aws-lc, SHA-1 flagged; earliest RRSIG expiry in seconds with 7d/3d/1d escalation; missing/expired/
+  not-yet-valid signatures; DNSKEY not signed by the DS key; per-server disagreement), RFC 8659 CAA
+  tree-climb policy evaluation (allow-list, `accounturi`, `validationmethods`, permissive extra entries,
+  `issuewild` precedence, customer names), NS/SOA sanity. Pure evaluators over injected observations
+  (`evaluate_zone`, `evaluate_caa`), collectors over a `DnsLookup` trait, `NetLookup` for real sockets.
+  RRSIG signatures are **not** cryptographically verified.
+- **`dns` codec**: `DS`, `DNSKEY`, `RRSIG`, `NSEC` records (`RecordType::{DS,DNSKEY,RRSIG,NSEC}` are
+  associated constants over `Unknown(code)` so exhaustive matches elsewhere keep compiling), bounds-checked
+  decode, `dnskey_key_tag`, `serial_secs_until` (RFC 1982 times), `nsec_types`, `Name::canonical_wire`.
+  `edge_verify::DnsClient` exposes the UDP/TCP/EDNS0 (DO) query transport the probe already used.
+
+- **New `zone_sync`**: owner-signed, `(epoch, version)`-ordered object replication over `native` (signed-DNS semantics
+  without the 1000-byte BEP44 cap): `SignedObject` (domain-separated Ed25519 preimage, verify-on-decode), a bounded
+  ROOT/LIST/GET/PUSH anti-entropy protocol, `PeerPolicy` (pinned peers/publishers, default deny), `SyncStore` seam; used by `tas-dns`.
 
 ### Crypto
 - **ACME account/certificate keys, JWS signing and CSR signing now use `aws-lc-rs`** instead of

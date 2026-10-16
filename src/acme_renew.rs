@@ -26,6 +26,10 @@
 //!   into the CA's duplicate-certificate limit.
 //! - **Not holding keys forever.** Certificates for names that stopped being required are
 //!   pruned after a grace period.
+//! - **Not leaving a live credential behind.** A dedicated certificate for a name that is
+//!   released is revoked ([`CertIssuer::revoke`], reason `cessationOfOperation`) — see
+//!   [`RevocationQueue`] for why that is a durable queue rather than a call — and a renewal names
+//!   the certificate it replaces ([`CertIssuer::issue_replacing`], RFC 9773 `replaces`).
 //!
 //! The registry lock is never held across CA I/O: [`RenewalEngine::run_once`] takes it for
 //! short reads and short state transitions only.
@@ -42,7 +46,7 @@ use std::sync::Arc;
 use hashtrinity::crypto::sha256;
 use hashtrinity::Table;
 
-use crate::acme::{days_from_civil, der, AcmeClient, AcmeError, Dns01Responder, Http01Responder, RenewalWindow};
+use crate::acme::{days_from_civil, der, AcmeClient, AcmeError, Dns01Responder, Http01Responder, RenewalWindow, RevocationReason};
 use crate::edge::{CertMaterial, CertSource, EdgeRegistry, APEXES};
 use crate::edge_proxy::MemoryCertSource;
 use crate::BoxFuture;
@@ -327,6 +331,369 @@ impl CertStore for FileCertStore {
     }
 }
 
+// ── Revocation ────────────────────────────────────────────────────────────────────────────
+
+/// A certificate waiting to be revoked. The key is held (0600) beside the chain until the
+/// revocation lands or the certificate expires — see [`RevocationQueue`].
+#[derive(Clone)]
+struct PendingRevocation {
+    id: String,
+    name: String,
+    material: CertMaterial,
+    enqueued_at: i64,
+    attempts: u32,
+    next_attempt: i64,
+    last_error: Option<String>,
+}
+
+// Manual: `material` holds a private key.
+impl std::fmt::Debug for PendingRevocation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingRevocation")
+            .field("id", &self.id)
+            .field("name", &self.name)
+            .field("attempts", &self.attempts)
+            .field("material", &"<redacted>")
+            .finish()
+    }
+}
+
+/// What the queue shows about one pending revocation (never the key).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RevocationStatus {
+    pub name: String,
+    /// SHA-256 prefix of the chain: the queue's identity for this certificate.
+    pub id: String,
+    pub enqueued_at: i64,
+    pub attempts: u32,
+    pub next_attempt: i64,
+    pub last_error: Option<String>,
+    /// When the certificate expires on its own, ending the need to revoke it.
+    pub not_after: Option<i64>,
+}
+
+/// Tunables for the revocation worker ([`process_revocations`]).
+#[derive(Clone, Copy, Debug)]
+pub struct RevocationPolicy {
+    /// First retry delay after a failed attempt; doubles per attempt.
+    pub retry_base_secs: u64,
+    /// Cap on the retry delay. A revocation is never abandoned while the certificate is valid
+    /// (its key is a live credential), so this bounds the polling rate, not the effort.
+    pub retry_max_secs: u64,
+    /// Most revocations attempted per pass.
+    pub max_per_pass: usize,
+}
+
+impl Default for RevocationPolicy {
+    fn default() -> Self {
+        RevocationPolicy { retry_base_secs: 60, retry_max_secs: 6 * 3600, max_per_pass: 50 }
+    }
+}
+
+/// The durable queue of certificates that must be revoked.
+///
+/// **Why a queue, and why the key stays in it.** When a customer hostname is released the
+/// certificate for it is a credential for a name we no longer serve, with a private key we hold:
+/// until it is revoked or expires, anyone who obtains that key can impersonate the name. So it
+/// is revoked promptly — but the CA can be unreachable, rate limiting or rejecting the
+/// account, and a release must not wait on any of that. The certificate is therefore *moved* out
+/// of the serving store into this queue (stopping service at once), and the revocation is retried
+/// with backoff until it succeeds. The key is kept, 0600 and fsynced, for exactly as long as a
+/// revocation might still be needed: it lets the certificate's own key sign the revocation when
+/// the account cannot (RFC 8555 §7.6), and it is destroyed (overwritten, then unlinked) only when
+/// the CA has revoked the certificate or the certificate has expired. The queue entry is written
+/// **before** the certificate leaves the store ([`retire_for_revocation`]), so no crash or disk
+/// error between the two can lose the key of a certificate that has not been revoked.
+///
+/// Entries live in `dir`, one `<id>.revoke` file each (`dir` is normally `<cert dir>/revocations`,
+/// which [`FileCertStore`] ignores), and are reloaded at boot.
+pub struct RevocationQueue {
+    dir: Option<PathBuf>,
+    entries: std::sync::Mutex<Vec<PendingRevocation>>,
+    wake: Arc<tokio::sync::Notify>,
+}
+
+fn revocation_id(chain_pem: &str) -> String {
+    sha256(chain_pem.as_bytes()).iter().take(16).map(|b| format!("{b:02x}")).collect()
+}
+
+/// Write `body` to `path` atomically (temp file, 0600, fsync, rename, fsync of the directory).
+fn write_private(path: &Path, body: &str) -> Result<(), String> {
+    use std::io::Write;
+    let tmp = path.with_extension("tmp");
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    {
+        let mut f = opts.open(&tmp).map_err(|e| format!("writing {}: {e}", tmp.display()))?;
+        f.write_all(body.as_bytes()).and_then(|()| f.sync_all()).map_err(|e| format!("writing {}: {e}", tmp.display()))?;
+    }
+    std::fs::rename(&tmp, path).map_err(|e| format!("installing {}: {e}", path.display()))?;
+    #[cfg(unix)]
+    if let Some(dir) = path.parent() {
+        std::fs::File::open(dir).and_then(|d| d.sync_all()).map_err(|e| format!("syncing {}: {e}", dir.display()))?;
+    }
+    Ok(())
+}
+
+/// Overwrite then unlink: the key does not linger in a freed block more than a file system lets us
+/// prevent (journalling and copy-on-write file systems can still keep old blocks; the directory is
+/// 0700 and the disk is expected to be encrypted).
+fn shred(path: &Path) {
+    if let Ok(meta) = std::fs::metadata(path) {
+        if let Ok(f) = std::fs::OpenOptions::new().write(true).open(path) {
+            use std::io::Write;
+            let mut f = f;
+            let zeros = vec![0u8; usize::try_from(meta.len()).unwrap_or(0)];
+            let _ = f.write_all(&zeros).and_then(|()| f.sync_all());
+        }
+    }
+    let _ = std::fs::remove_file(path);
+}
+
+impl PendingRevocation {
+    fn to_file(&self) -> String {
+        let error = self.last_error.as_deref().unwrap_or("").replace(['\n', '\r'], " ");
+        let mut body = format!(
+            "name={}\nenqueued_at={}\nattempts={}\nnext_attempt={}\nlast_error={error}\n",
+            self.name, self.enqueued_at, self.attempts, self.next_attempt
+        );
+        body.push_str(&self.material.chain_pem);
+        if !body.ends_with('\n') {
+            body.push('\n');
+        }
+        body.push_str(&self.material.key_pem);
+        body
+    }
+
+    fn from_file(text: &str) -> Option<Self> {
+        let split = text.find("-----BEGIN")?;
+        let (header, pems) = text.split_at(split);
+        let key_at = pems.find(KEY_BEGIN)?;
+        let material = CertMaterial { chain_pem: pems[..key_at].to_string(), key_pem: pems[key_at..].to_string() };
+        validate(&material).ok()?;
+        let mut lines = header.lines();
+        let mut field = |k: &str| lines.next().and_then(|l| l.strip_prefix(k)).map(str::to_string);
+        let name = field("name=")?;
+        let enqueued_at = field("enqueued_at=")?.parse().ok()?;
+        let attempts = field("attempts=")?.parse().ok()?;
+        let next_attempt = field("next_attempt=")?.parse().ok()?;
+        let last_error = field("last_error=").filter(|e| !e.is_empty());
+        Some(PendingRevocation { id: revocation_id(&material.chain_pem), name, material, enqueued_at, attempts, next_attempt, last_error })
+    }
+}
+
+impl RevocationQueue {
+    /// A queue that lives in memory only (tests, and hosts with no durable store). A restart
+    /// forgets it, so the production edge uses [`Self::open`].
+    #[must_use]
+    pub fn in_memory() -> Self {
+        RevocationQueue { dir: None, entries: std::sync::Mutex::new(Vec::new()), wake: Arc::new(tokio::sync::Notify::new()) }
+    }
+
+    /// Open (creating, 0700) `dir` and load every pending revocation in it. A file that does not
+    /// parse is left untouched on disk (it may hold the only copy of a key) and logged.
+    ///
+    /// # Errors
+    /// Only if the directory cannot be created or listed.
+    pub fn open(dir: impl Into<PathBuf>) -> std::io::Result<Self> {
+        let dir = dir.into();
+        std::fs::create_dir_all(&dir)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+        }
+        let mut entries = Vec::new();
+        for entry in std::fs::read_dir(&dir)? {
+            let path = entry?.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("revoke") {
+                continue;
+            }
+            match std::fs::read_to_string(&path).ok().and_then(|t| PendingRevocation::from_file(&t)) {
+                Some(p) => entries.push(p),
+                None => tracing::error!(path = %path.display(), "unreadable pending-revocation file; left in place"),
+            }
+        }
+        entries.sort_by(|a, b| (a.enqueued_at, &a.id).cmp(&(b.enqueued_at, &b.id)));
+        Ok(RevocationQueue { dir: Some(dir), entries: std::sync::Mutex::new(entries), wake: Arc::new(tokio::sync::Notify::new()) })
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<PendingRevocation>> {
+        self.entries.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn path_for(&self, id: &str) -> Option<PathBuf> {
+        self.dir.as_ref().map(|d| d.join(format!("{id}.revoke")))
+    }
+
+    /// Notified whenever something is enqueued — a worker sleeping between passes waits on this
+    /// too, so a release is revoked within moments rather than at the next tick.
+    #[must_use]
+    pub fn wakeup(&self) -> Arc<tokio::sync::Notify> {
+        self.wake.clone()
+    }
+
+    /// Queue `material` (for `name`) for revocation. **Durable before it returns**: `Err` means
+    /// nothing was recorded and the caller must keep the certificate where it is. Queueing the same
+    /// certificate twice is a no-op.
+    ///
+    /// # Errors
+    /// The material is unusable or the entry could not be written to disk.
+    pub fn enqueue(&self, name: &str, material: CertMaterial, now: i64) -> Result<(), String> {
+        validate(&material)?;
+        let id = revocation_id(&material.chain_pem);
+        if self.lock().iter().any(|e| e.id == id) {
+            return Ok(());
+        }
+        let entry = PendingRevocation { id: id.clone(), name: name.to_string(), material, enqueued_at: now, attempts: 0, next_attempt: now, last_error: None };
+        if let Some(path) = self.path_for(&id) {
+            write_private(&path, &entry.to_file())?;
+        }
+        self.lock().push(entry);
+        self.wake.notify_one();
+        Ok(())
+    }
+
+    /// Pending revocations, for status and metrics.
+    #[must_use]
+    pub fn status(&self) -> Vec<RevocationStatus> {
+        self.lock()
+            .iter()
+            .map(|e| RevocationStatus {
+                name: e.name.clone(),
+                id: e.id.clone(),
+                enqueued_at: e.enqueued_at,
+                attempts: e.attempts,
+                next_attempt: e.next_attempt,
+                last_error: e.last_error.clone(),
+                not_after: cert_validity(&e.material.chain_pem).map(|v| v.not_after),
+            })
+            .collect()
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.lock().len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.lock().is_empty()
+    }
+
+    fn due(&self, now: i64, limit: usize) -> Vec<PendingRevocation> {
+        self.lock().iter().filter(|e| e.next_attempt <= now).take(limit).cloned().collect()
+    }
+
+    /// Drop a finished entry (revoked, or expired) and destroy its key.
+    fn complete(&self, id: &str) {
+        self.lock().retain(|e| e.id != id);
+        if let Some(path) = self.path_for(id) {
+            shred(&path);
+        }
+    }
+
+    fn record_failure(&self, id: &str, error: &str, next_attempt: i64) {
+        let updated = {
+            let mut entries = self.lock();
+            entries.iter_mut().find(|e| e.id == id).map(|e| {
+                e.attempts = e.attempts.saturating_add(1);
+                e.next_attempt = next_attempt;
+                e.last_error = Some(error.to_string());
+                e.clone()
+            })
+        };
+        // Best effort: losing the retry counters costs one early retry, never the entry.
+        if let (Some(entry), Some(path)) = (updated, self.path_for(id)) {
+            if let Err(e) = write_private(&path, &entry.to_file()) {
+                tracing::warn!(error = %e, "could not persist revocation retry state");
+            }
+        }
+    }
+}
+
+/// What one [`process_revocations`] pass did.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RevocationReport {
+    /// Names whose certificate the CA has now revoked (including `alreadyRevoked`).
+    pub revoked: Vec<String>,
+    /// Names dropped because the certificate expired before it could be revoked: nothing is left
+    /// to revoke, and the key is destroyed.
+    pub expired: Vec<String>,
+    /// `(name, error)` for attempts that failed and will be retried.
+    pub failed: Vec<(String, String)>,
+    /// Entries still waiting after the pass.
+    pub pending: usize,
+}
+
+/// Try every due revocation once. A failure schedules a retry with exponential backoff
+/// (honouring the CA's `Retry-After`); an entry is only ever removed when the CA revoked the
+/// certificate or the certificate has expired.
+pub async fn process_revocations(queue: &RevocationQueue, issuer: &dyn CertIssuer, now: i64, policy: &RevocationPolicy) -> RevocationReport {
+    let mut report = RevocationReport::default();
+    for entry in queue.due(now, policy.max_per_pass) {
+        if cert_validity(&entry.material.chain_pem).is_some_and(|v| now >= v.not_after) {
+            queue.complete(&entry.id);
+            tracing::info!(cert = %entry.name, "certificate expired before it could be revoked; dropped");
+            report.expired.push(entry.name);
+            continue;
+        }
+        match issuer.revoke(&entry.material).await {
+            Ok(()) => {
+                queue.complete(&entry.id);
+                tracing::info!(cert = %entry.name, attempts = entry.attempts + 1, "certificate revoked");
+                report.revoked.push(entry.name);
+            }
+            Err(e) => {
+                let exp = entry.attempts.min(20);
+                let backoff = policy.retry_base_secs.saturating_mul(1u64 << exp).min(policy.retry_max_secs);
+                let wait = backoff.max(e.retry_after_secs().unwrap_or(0).min(policy.retry_max_secs.max(3600)));
+                let next = now.saturating_add(i64::try_from(wait).unwrap_or(i64::MAX / 4));
+                tracing::warn!(cert = %entry.name, attempts = entry.attempts + 1, error = %e, retry_in_secs = wait, "certificate revocation failed; will retry");
+                queue.record_failure(&entry.id, &e.to_string(), next);
+                report.failed.push((entry.name, e.to_string()));
+            }
+        }
+    }
+    report.pending = queue.len();
+    report
+}
+
+/// Why [`retire_for_revocation`] did nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Retired {
+    /// The certificate was queued for revocation and removed from the store.
+    Queued,
+    /// The store holds nothing under that name.
+    NotHeld,
+    /// A wildcard certificate: shared by every hostname under the apex, so it is **never**
+    /// revoked because one hostname went away.
+    SharedWildcard,
+}
+
+/// Stop serving `name`'s dedicated certificate and queue it for revocation, in the order that
+/// cannot lose the key: the queue entry is made durable first, and only then is the certificate
+/// removed from the store. If queueing fails the certificate stays where it is (and keeps being
+/// served — the caller has already stopped routing the name) so the next prune retries.
+///
+/// # Errors
+/// The revocation could not be recorded; nothing was changed.
+pub fn retire_for_revocation<S: CertStore + ?Sized>(store: &S, queue: &RevocationQueue, name: &str, now: i64) -> Result<Retired, String> {
+    if name.starts_with("*.") {
+        return Ok(Retired::SharedWildcard);
+    }
+    let Some(material) = store.cert_for(name) else { return Ok(Retired::NotHeld) };
+    queue.enqueue(name, material, now)?;
+    store.remove(name);
+    store.save_retry(name, None);
+    Ok(Retired::Queued)
+}
+
 // ── Issuance ──────────────────────────────────────────────────────────────────────────────
 
 /// Obtains a certificate for one certificate name. A trait so the engine is testable without a
@@ -341,6 +708,37 @@ pub trait CertIssuer: Send + Sync {
     /// polls at most once per [`RenewalWindow::retry_after_secs`] (default 6 h) per name.
     fn renewal_window<'a>(&'a self, _material: &'a CertMaterial) -> BoxFuture<'a, Option<RenewalWindow>> {
         Box::pin(async { None })
+    }
+
+    /// As [`Self::issue`], for a renewal of `previous`: an ACME issuer names it in the order
+    /// (`replaces`, RFC 9773 §5) so the CA can recognise the order as a renewal. The default
+    /// forwards to [`Self::issue`], so an issuer that has no use for it need not know it exists.
+    fn issue_replacing<'a>(&'a self, cert_name: &'a str, _previous: &'a CertMaterial) -> BoxFuture<'a, Result<CertMaterial, AcmeError>> {
+        self.issue(cert_name)
+    }
+
+    /// Revoke `material` at the CA (reason `cessationOfOperation`: the name is no longer ours to
+    /// serve). Must treat "already revoked" as success. The default does nothing and succeeds —
+    /// right for an issuer with no CA behind it, and the reason a caller that must know a
+    /// certificate is revoked has to use an issuer that implements this ([`AcmeIssuer`] does).
+    fn revoke<'a>(&'a self, _material: &'a CertMaterial) -> BoxFuture<'a, Result<(), AcmeError>> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+/// Lets one issuer serve the renewal engine and a separate revocation worker.
+impl<T: CertIssuer + ?Sized> CertIssuer for Arc<T> {
+    fn issue<'a>(&'a self, cert_name: &'a str) -> BoxFuture<'a, Result<CertMaterial, AcmeError>> {
+        (**self).issue(cert_name)
+    }
+    fn renewal_window<'a>(&'a self, material: &'a CertMaterial) -> BoxFuture<'a, Option<RenewalWindow>> {
+        (**self).renewal_window(material)
+    }
+    fn issue_replacing<'a>(&'a self, cert_name: &'a str, previous: &'a CertMaterial) -> BoxFuture<'a, Result<CertMaterial, AcmeError>> {
+        (**self).issue_replacing(cert_name, previous)
+    }
+    fn revoke<'a>(&'a self, material: &'a CertMaterial) -> BoxFuture<'a, Result<(), AcmeError>> {
+        (**self).revoke(material)
     }
 }
 
@@ -359,20 +757,35 @@ impl AcmeIssuer {
     }
 }
 
+impl AcmeIssuer {
+    async fn order(&self, cert_name: &str, previous: Option<&CertMaterial>) -> Result<CertMaterial, AcmeError> {
+        if let Some(apex) = cert_name.strip_prefix("*.") {
+            // The wildcard does not cover the bare apex, which we also serve; one certificate
+            // carries both names (two TXT values at the same `_acme-challenge` name).
+            let names = [cert_name, apex];
+            match previous {
+                Some(p) => self.client.issue_dns01_replacing(&names, self.dns01.as_ref(), &p.chain_pem).await,
+                None => self.client.issue_dns01(&names, self.dns01.as_ref()).await,
+            }
+        } else if let Some(http01) = &self.http01 {
+            match previous {
+                Some(p) => self.client.issue_replacing(&[cert_name], http01.as_ref(), &p.chain_pem).await,
+                None => self.client.issue(&[cert_name], http01.as_ref()).await,
+            }
+        } else {
+            // No way to prove control of a customer's name without an HTTP-01 listener.
+            Err(AcmeError::ChallengeSetup)
+        }
+    }
+}
+
 impl CertIssuer for AcmeIssuer {
     fn issue<'a>(&'a self, cert_name: &'a str) -> BoxFuture<'a, Result<CertMaterial, AcmeError>> {
-        Box::pin(async move {
-            if let Some(apex) = cert_name.strip_prefix("*.") {
-                // The wildcard does not cover the bare apex, which we also serve; one certificate
-                // carries both names (two TXT values at the same `_acme-challenge` name).
-                self.client.issue_dns01(&[cert_name, apex], self.dns01.as_ref()).await
-            } else if let Some(http01) = &self.http01 {
-                self.client.issue(&[cert_name], http01.as_ref()).await
-            } else {
-                // No way to prove control of a customer's name without an HTTP-01 listener.
-                Err(AcmeError::ChallengeSetup)
-            }
-        })
+        Box::pin(self.order(cert_name, None))
+    }
+
+    fn issue_replacing<'a>(&'a self, cert_name: &'a str, previous: &'a CertMaterial) -> BoxFuture<'a, Result<CertMaterial, AcmeError>> {
+        Box::pin(self.order(cert_name, Some(previous)))
     }
 
     fn renewal_window<'a>(&'a self, material: &'a CertMaterial) -> BoxFuture<'a, Option<RenewalWindow>> {
@@ -383,6 +796,25 @@ impl CertIssuer for AcmeIssuer {
                     tracing::debug!(error = %e, "ARI lookup failed; renewing on the percentage rule");
                     None
                 }
+            }
+        })
+    }
+
+    /// Signed by the account first (it ordered the certificate). If the CA says the account has no
+    /// claim to it — the account key was rotated onto a new account, or the certificate predates
+    /// this one — the certificate's own key signs instead, which the CA accepts from whoever holds
+    /// it. That is why the queue keeps the key until the revocation lands.
+    fn revoke<'a>(&'a self, material: &'a CertMaterial) -> BoxFuture<'a, Result<(), AcmeError>> {
+        Box::pin(async move {
+            let reason = RevocationReason::CessationOfOperation;
+            let by_account = self.client.revoke_certificate(material.chain_pem.as_bytes(), reason).await;
+            match by_account {
+                Ok(_) => Ok(()),
+                Err(e) if e.is_problem("unauthorized") || matches!(e, AcmeError::Rejected { status: 401 | 403, .. }) => {
+                    tracing::info!("account not authorised to revoke; signing the revocation with the certificate's key");
+                    self.client.revoke_certificate_with_key(material.chain_pem.as_bytes(), &material.key_pem, reason).await.map(|_| ())
+                }
+                Err(e) => Err(e),
             }
         })
     }
@@ -522,6 +954,10 @@ pub struct RunReport {
     pub activated: Vec<String>,
     pub gave_up: Vec<String>,
     pub pruned: Vec<String>,
+    /// Certificates the CA revoked this pass (see [`RevocationQueue`]).
+    pub revoked: Vec<String>,
+    /// Revocations that failed this pass and will be retried.
+    pub revocation_failed: Vec<(String, String)>,
 }
 
 /// Per-name operational status, for the portal and metrics.
@@ -541,6 +977,8 @@ pub struct RenewalEngine<S: CertStore, I: CertIssuer> {
     policy: RenewalPolicy,
     baseline: Vec<String>,
     state: Table<String, NameState>,
+    revocations: Option<Arc<RevocationQueue>>,
+    revocation_policy: RevocationPolicy,
 }
 
 /// Every apex wildcard — issue these at boot so a first claim never waits on a CA.
@@ -552,13 +990,23 @@ pub fn apex_wildcards() -> Vec<String> {
 impl<S: CertStore, I: CertIssuer> RenewalEngine<S, I> {
     #[must_use]
     pub fn new(store: Arc<S>, issuer: I, policy: RenewalPolicy) -> Self {
-        RenewalEngine { store, issuer, policy, baseline: Vec::new(), state: Table::new() }
+        RenewalEngine { store, issuer, policy, baseline: Vec::new(), state: Table::new(), revocations: None, revocation_policy: RevocationPolicy::default() }
     }
 
     /// Names to hold regardless of what the registry currently needs (see [`apex_wildcards`]).
     #[must_use]
     pub fn with_baseline(mut self, names: Vec<String>) -> Self {
         self.baseline = names;
+        self
+    }
+
+    /// Revoke through `queue`: a pruned dedicated certificate is queued instead of just deleted,
+    /// and every pass retries what is due. Without it the engine neither revokes nor needs to.
+    /// Share the queue with whatever releases names (`retire_for_revocation`) and, to revoke
+    /// within moments rather than at the next pass, with a worker running [`process_revocations`].
+    #[must_use]
+    pub fn with_revocations(mut self, queue: Arc<RevocationQueue>) -> Self {
+        self.revocations = Some(queue);
         self
     }
 
@@ -654,7 +1102,18 @@ impl<S: CertStore, I: CertIssuer> RenewalEngine<S, I> {
 
         // 3. Order them. No registry lock is held across the CA round trip.
         for (_, name, reason) in work.into_iter().take(self.policy.max_per_run) {
-            let outcome: Result<(), (String, Option<u64>)> = match self.issuer.issue(&name).await {
+            // A renewal names the certificate it replaces (RFC 9773) so the CA can treat it as one;
+            // a first issuance, or a replacement of something already expired or unreadable, has
+            // nothing to name.
+            let previous = match reason {
+                Reason::Renewal | Reason::CaSuggested => self.store.cert_for(&name),
+                Reason::Missing | Reason::Unreadable | Reason::Expired => None,
+            };
+            let ordered = match &previous {
+                Some(prev) => self.issuer.issue_replacing(&name, prev).await,
+                None => self.issuer.issue(&name).await,
+            };
+            let outcome: Result<(), (String, Option<u64>)> = match ordered {
                 Ok(material) => match validate(&material) {
                     // Never replace a held certificate with something the CA mangled or that
                     // is already dead: a bad order must leave last-known-good untouched.
@@ -691,13 +1150,42 @@ impl<S: CertStore, I: CertIssuer> RenewalEngine<S, I> {
             let mut s = self.st(&name);
             let since = *s.unrequired_since.get_or_insert(now);
             if now - since >= self.policy.prune_after_secs {
-                self.store.remove(&name);
-                self.store.save_retry(&name, None);
+                // A dedicated certificate is revoked, not just deleted: its key is a live
+                // credential for a name that is no longer ours until the certificate expires. The
+                // queue entry is durable before the certificate leaves the store; if it cannot be
+                // written the certificate stays and the next pass tries again. A shared wildcard
+                // is only removed (see `Retired::SharedWildcard`).
+                match &self.revocations {
+                    Some(queue) => match retire_for_revocation(self.store.as_ref(), queue, &name, now) {
+                        Ok(Retired::SharedWildcard) => {
+                            self.store.remove(&name);
+                            self.store.save_retry(&name, None);
+                        }
+                        Ok(Retired::Queued | Retired::NotHeld) => {}
+                        Err(e) => {
+                            tracing::error!(cert = %name, error = %e, "could not queue the certificate for revocation; keeping it");
+                            self.state.put(name, s);
+                            continue;
+                        }
+                    },
+                    None => {
+                        self.store.remove(&name);
+                        self.store.save_retry(&name, None);
+                    }
+                }
                 self.state.remove(&name);
                 report.pruned.push(name);
             } else {
                 self.state.put(name, s);
             }
+        }
+
+        // 5. Revocations that are due (the engine's pass is the backstop; a dedicated worker
+        //    makes them prompt).
+        if let Some(queue) = &self.revocations {
+            let done = process_revocations(queue, &self.issuer, now, &self.revocation_policy).await;
+            report.revoked = done.revoked;
+            report.revocation_failed = done.failed;
         }
         report
     }
@@ -1541,5 +2029,333 @@ PfFwXFUdKr72euUqW9E4wdcMVA==\n\
     async fn an_issuer_without_renewal_information_gives_no_advice() {
         let (iss, _) = issuer(|_, _| Ok(ninety_days(T0)));
         assert!(iss.renewal_window(&ninety_days(T0)).await.is_none());
+    }
+
+    // ── `replaces` (RFC 9773) through the engine ─────────────────────────────────────────
+
+    /// An issuer that records whether each order named a previous certificate, and what it
+    /// was asked to revoke (answering from a script, then "revoked").
+    #[derive(Default)]
+    struct SpyIssuer {
+        orders: Mutex<Vec<(String, Option<String>)>>,
+        revoke_script: Mutex<std::collections::VecDeque<Result<(), AcmeError>>>,
+        revoked: Mutex<Vec<String>>,
+        clock: std::sync::atomic::AtomicI64,
+    }
+
+    impl SpyIssuer {
+        fn at(now: i64) -> Arc<Self> {
+            let s = SpyIssuer::default();
+            s.clock.store(now, SeqCst);
+            Arc::new(s)
+        }
+        /// A 90-day certificate whose bytes differ per name (real certificates have distinct serials).
+        fn fresh(&self, cert_name: &str) -> CertMaterial {
+            let nb = self.clock.load(SeqCst) + i64::try_from(cert_name.len()).unwrap();
+            material(nb, nb + 90 * DAY)
+        }
+        fn script(&self, results: Vec<Result<(), AcmeError>>) {
+            *self.revoke_script.lock().unwrap() = results.into();
+        }
+    }
+
+    impl CertIssuer for SpyIssuer {
+        fn issue<'a>(&'a self, cert_name: &'a str) -> BoxFuture<'a, Result<CertMaterial, AcmeError>> {
+            Box::pin(async move {
+                self.orders.lock().unwrap().push((cert_name.to_string(), None));
+                Ok(self.fresh(cert_name))
+            })
+        }
+        fn issue_replacing<'a>(&'a self, cert_name: &'a str, previous: &'a CertMaterial) -> BoxFuture<'a, Result<CertMaterial, AcmeError>> {
+            Box::pin(async move {
+                self.orders.lock().unwrap().push((cert_name.to_string(), Some(previous.chain_pem.clone())));
+                Ok(self.fresh(cert_name))
+            })
+        }
+        fn revoke<'a>(&'a self, material: &'a CertMaterial) -> BoxFuture<'a, Result<(), AcmeError>> {
+            Box::pin(async move {
+                let next = self.revoke_script.lock().unwrap().pop_front();
+                let r = next.unwrap_or(Ok(()));
+                if r.is_ok() {
+                    self.revoked.lock().unwrap().push(material.chain_pem.clone());
+                }
+                r
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_renewal_names_the_certificate_it_replaces_and_a_first_issuance_does_not() {
+        let reg = registry();
+        let spy = SpyIssuer::at(T0);
+        let store = Arc::new(MemoryCertSource::new());
+        let mut eng = RenewalEngine::new(store.clone(), spy.clone(), RenewalPolicy::default());
+        eng.run_once(T0, &reg).await;
+        {
+            let orders = spy.orders.lock().unwrap();
+            assert_eq!(orders.len(), 2);
+            assert!(orders.iter().all(|(_, prev)| prev.is_none()), "first issuance replaces nothing: {orders:?}");
+        }
+        let held = store.cert_for("app.acme.com.au").unwrap().chain_pem;
+        spy.clock.store(T0 + 61 * DAY, SeqCst);
+        eng.run_once(T0 + 61 * DAY, &reg).await;
+        let orders = spy.orders.lock().unwrap().clone();
+        assert_eq!(orders.len(), 4);
+        let custom = orders[2..].iter().find(|(n, _)| n == "app.acme.com.au").unwrap();
+        assert_eq!(custom.1.as_deref(), Some(held.as_str()), "the renewal names the chain it replaces");
+        assert!(orders[2..].iter().all(|(_, prev)| prev.is_some()));
+    }
+
+    #[tokio::test]
+    async fn an_expired_or_unreadable_certificate_is_not_named_as_replaced() {
+        let reg = registry();
+        let spy = SpyIssuer::at(T0);
+        let store = Arc::new(MemoryCertSource::new());
+        let mut eng = RenewalEngine::new(store.clone(), spy.clone(), RenewalPolicy::default());
+        eng.run_once(T0, &reg).await;
+        spy.orders.lock().unwrap().clear();
+        spy.clock.store(T0 + 100 * DAY, SeqCst);
+        eng.run_once(T0 + 100 * DAY, &reg).await; // both expired
+        let orders = spy.orders.lock().unwrap().clone();
+        assert_eq!(orders.len(), 2);
+        assert!(orders.iter().all(|(_, prev)| prev.is_none()), "{orders:?}");
+    }
+
+    #[tokio::test]
+    async fn an_arc_wrapped_issuer_forwards_every_hook() {
+        let spy = SpyIssuer::at(T0);
+        let shared: Arc<dyn CertIssuer> = spy.clone();
+        let m = ninety_days(T0);
+        shared.issue("a.example").await.unwrap();
+        shared.issue_replacing("a.example", &m).await.unwrap();
+        shared.revoke(&m).await.unwrap();
+        assert_eq!(spy.orders.lock().unwrap().len(), 2);
+        assert_eq!(spy.revoked.lock().unwrap().len(), 1);
+        // and the default hooks of an issuer that implements neither are harmless
+        let (plain, calls) = issuer(|_, _| Ok(ninety_days(T0)));
+        plain.issue_replacing("b.example", &m).await.unwrap();
+        assert_eq!(calls.lock().unwrap().as_slice(), ["b.example"], "issue_replacing falls back to issue");
+        plain.revoke(&m).await.expect("the default revoke is a successful no-op");
+    }
+
+    // ── revocation queue ─────────────────────────────────────────────────────────────────
+
+    fn pending_files(dir: &Path) -> Vec<PathBuf> {
+        let mut v: Vec<PathBuf> = std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().path()).collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn a_queued_revocation_is_durable_private_and_reloaded_with_its_key() {
+        let dir = temp_dir("rq-durable");
+        let q = RevocationQueue::open(&dir).unwrap();
+        let m = ninety_days(T0);
+        q.enqueue("app.acme.com.au", m.clone(), T0).unwrap();
+        q.enqueue("app.acme.com.au", m.clone(), T0 + 5).unwrap(); // the same certificate again
+        assert_eq!(q.len(), 1, "idempotent");
+        let files = pending_files(&dir);
+        assert_eq!(files.len(), 1, "one file, no temp file left: {files:?}");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&files[0]).unwrap().permissions().mode() & 0o777, 0o600, "the file holds a private key");
+            assert_eq!(std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o700);
+        }
+        let on_disk = std::fs::read_to_string(&files[0]).unwrap();
+        assert!(on_disk.contains(&m.key_pem) && on_disk.contains("name=app.acme.com.au"));
+
+        // A restart: the entry, its state and (checked via a later revoke) its key come back.
+        let again = RevocationQueue::open(&dir).unwrap();
+        let st = again.status();
+        assert_eq!(st.len(), 1);
+        assert_eq!((st[0].name.as_str(), st[0].enqueued_at, st[0].attempts), ("app.acme.com.au", T0, 0));
+        assert_eq!(st[0].not_after, Some(T0 + 90 * DAY));
+        assert_eq!(again.due(T0, 10)[0].material.key_pem, m.key_pem);
+        assert!(!format!("{:?}", again.due(T0, 1)[0]).contains("PRIVATE"), "Debug redacts the key");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_corrupt_pending_file_is_left_alone_not_deleted_and_not_fatal() {
+        let dir = temp_dir("rq-corrupt");
+        {
+            let q = RevocationQueue::open(&dir).unwrap();
+            q.enqueue("good.example.com", ninety_days(T0), T0).unwrap();
+        }
+        std::fs::write(dir.join("broken.revoke"), "name=x\nnot a certificate").unwrap();
+        std::fs::write(dir.join("notes.txt"), "ignored").unwrap();
+        let q = RevocationQueue::open(&dir).unwrap();
+        assert_eq!(q.len(), 1);
+        assert!(dir.join("broken.revoke").exists(), "it may hold the only copy of a key");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn revocation_is_retried_with_backoff_keeps_the_key_and_ends_when_the_ca_revokes() {
+        let dir = temp_dir("rq-retry");
+        let q = RevocationQueue::open(&dir).unwrap();
+        let m = ninety_days(T0);
+        q.enqueue("app.acme.com.au", m.clone(), T0).unwrap();
+        let spy = SpyIssuer::at(T0);
+        spy.script(vec![
+            Err(AcmeError::Rejected { status: 500, detail: "boom".into() }),
+            Err(AcmeError::RateLimited { retry_after_secs: Some(1800), detail: "slow".into() }),
+        ]);
+        let policy = RevocationPolicy::default();
+
+        let r = process_revocations(&q, spy.as_ref(), T0, &policy).await;
+        assert_eq!((r.revoked.len(), r.failed.len(), r.pending), (0, 1, 1), "{r:?}");
+        assert!(r.failed[0].1.contains("boom"));
+        let st = &q.status()[0];
+        assert_eq!((st.attempts, st.next_attempt), (1, T0 + 60), "first retry after the base delay");
+        assert!(st.last_error.as_deref().unwrap().contains("boom"));
+        assert_eq!(pending_files(&dir).len(), 1, "the key is still on disk");
+
+        // Not due yet: no attempt (and the spy script is untouched).
+        let r = process_revocations(&q, spy.as_ref(), T0 + 30, &policy).await;
+        assert_eq!((r.revoked.len(), r.failed.len(), r.pending), (0, 0, 1));
+
+        // Second failure: backoff doubles, but the CA's longer Retry-After wins.
+        let r = process_revocations(&q, spy.as_ref(), T0 + 60, &policy).await;
+        assert_eq!(r.failed.len(), 1);
+        assert_eq!(q.status()[0].next_attempt, T0 + 60 + 1800, "Retry-After 1800 beats the 120 s backoff");
+        // The retry state survives a restart.
+        let reopened = RevocationQueue::open(&dir).unwrap();
+        assert_eq!((reopened.status()[0].attempts, reopened.status()[0].next_attempt), (2, T0 + 60 + 1800));
+
+        // Success: entry gone, file gone (shredded), CA saw the right chain.
+        let r = process_revocations(&reopened, spy.as_ref(), T0 + 60 + 1800, &policy).await;
+        assert_eq!((r.revoked.clone(), r.pending), (vec!["app.acme.com.au".to_string()], 0));
+        assert_eq!(spy.revoked.lock().unwrap().as_slice(), std::slice::from_ref(&m.chain_pem));
+        assert!(pending_files(&dir).is_empty(), "revoked: the key is destroyed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn the_retry_delay_is_capped_and_a_valid_certificate_is_never_given_up_on() {
+        let q = RevocationQueue::in_memory();
+        q.enqueue("x.example.com", ninety_days(T0), T0).unwrap();
+        let spy = SpyIssuer::at(T0);
+        spy.script((0..40).map(|_| Err(AcmeError::Rejected { status: 503, detail: "down".into() })).collect());
+        let policy = RevocationPolicy { retry_base_secs: 60, retry_max_secs: 3600, max_per_pass: 10 };
+        let mut now = T0;
+        let mut delays = Vec::new();
+        for _ in 0..30 {
+            process_revocations(&q, spy.as_ref(), now, &policy).await;
+            let next = q.status()[0].next_attempt;
+            assert!(next > now && next - now <= 3600, "delay within (0, cap]: {}", next - now);
+            delays.push(next - now);
+            now = next;
+        }
+        assert_eq!(delays[..7], [60, 120, 240, 480, 960, 1920, 3600], "doubles per failure, then holds at the cap");
+        assert!(delays[7..].iter().all(|d| *d == 3600));
+        assert_eq!((q.len(), q.status()[0].attempts), (1, 30), "still queued after thirty failures");
+    }
+
+    #[tokio::test]
+    async fn a_certificate_that_expires_before_it_is_revoked_is_dropped_without_calling_the_ca() {
+        let dir = temp_dir("rq-expire");
+        let q = RevocationQueue::open(&dir).unwrap();
+        q.enqueue("old.example.com", material(T0, T0 + 10 * DAY), T0).unwrap();
+        let spy = SpyIssuer::at(T0);
+        let r = process_revocations(&q, spy.as_ref(), T0 + 11 * DAY, &RevocationPolicy::default()).await;
+        assert_eq!((r.expired, r.revoked.len(), r.pending), (vec!["old.example.com".to_string()], 0, 0));
+        assert!(spy.revoked.lock().unwrap().is_empty());
+        assert!(pending_files(&dir).is_empty(), "nothing left to revoke, so the key goes too");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn retiring_stops_serving_only_after_the_revocation_is_durable_and_never_touches_a_wildcard() {
+        let cdir = temp_dir("rq-retire-certs");
+        let qdir = temp_dir("rq-retire-queue");
+        let store = FileCertStore::open(&cdir).unwrap();
+        let q = RevocationQueue::open(&qdir).unwrap();
+        store.put("app.acme.com.au", ninety_days(T0)).unwrap();
+        store.put("*.tascloud.app", ninety_days(T0)).unwrap();
+
+        assert_eq!(retire_for_revocation(&store, &q, "*.tascloud.app", T0), Ok(Retired::SharedWildcard));
+        assert!(store.cert_for("*.tascloud.app").is_some() && q.is_empty(), "the shared wildcard is untouched");
+        assert_eq!(retire_for_revocation(&store, &q, "nothing.example.com", T0), Ok(Retired::NotHeld));
+
+        assert_eq!(retire_for_revocation(&store, &q, "app.acme.com.au", T0), Ok(Retired::Queued));
+        assert!(store.cert_for("app.acme.com.au").is_none(), "no longer served");
+        assert!(!cdir.join("app.acme.com.au.pem").exists(), "nor on disk in the cert store");
+        assert_eq!(q.len(), 1, "but its key lives on in the queue");
+
+        // If the queue cannot be written, the certificate is NOT removed: the key is never dropped
+        // before a revocation is on record.
+        store.put("other.acme.com.au", material(T0 + 1, T0 + 91 * DAY)).unwrap();
+        let _ = std::fs::remove_dir_all(&qdir); // the queue's directory vanishes underneath it
+        let err = retire_for_revocation(&store, &q, "other.acme.com.au", T0).unwrap_err();
+        assert!(err.contains("writing"), "{err}");
+        assert!(store.cert_for("other.acme.com.au").is_some(), "still held");
+        assert!(cdir.join("other.acme.com.au.pem").exists());
+        assert_eq!(q.len(), 1, "and not recorded as queued");
+        let _ = std::fs::remove_dir_all(&cdir);
+    }
+
+    #[tokio::test]
+    async fn pruning_a_dedicated_certificate_revokes_it_but_a_wildcard_is_only_deleted() {
+        let reg = registry();
+        let spy = SpyIssuer::at(T0);
+        let store = Arc::new(MemoryCertSource::new());
+        let q = Arc::new(RevocationQueue::in_memory());
+        let mut eng = RenewalEngine::new(store.clone(), spy.clone(), RenewalPolicy::default()).with_revocations(q.clone());
+        eng.run_once(T0, &reg).await;
+        let custom = store.cert_for("app.acme.com.au").unwrap();
+        let wildcard = store.cert_for("*.tascloud.app").unwrap();
+        // Release both the custom name and the last managed hostname: nothing requires either cert.
+        reg.lock().await.release("acme", "app.acme.com.au").unwrap();
+        reg.lock().await.release("acme", "mine.tascloud.app").unwrap();
+
+        let r = eng.run_once(T0 + DAY, &reg).await;
+        assert!(r.pruned.is_empty() && r.revoked.is_empty(), "grace period: {r:?}");
+        let r = eng.run_once(T0 + 9 * DAY, &reg).await;
+        let mut pruned = r.pruned.clone();
+        pruned.sort();
+        assert_eq!(pruned, vec!["*.tascloud.app".to_string(), "app.acme.com.au".to_string()]);
+        assert_eq!(r.revoked, vec!["app.acme.com.au".to_string()], "the dedicated certificate was revoked in the same pass");
+        assert_eq!(spy.revoked.lock().unwrap().as_slice(), std::slice::from_ref(&custom.chain_pem));
+        assert!(!spy.revoked.lock().unwrap().contains(&wildcard.chain_pem), "the shared wildcard is never revoked");
+        assert!(q.is_empty());
+        assert!(store.cert_for("app.acme.com.au").is_none() && store.cert_for("*.tascloud.app").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_prune_that_cannot_queue_the_revocation_keeps_the_certificate_and_tries_again() {
+        let dir = temp_dir("rq-prune-fail");
+        let reg = registry();
+        let spy = SpyIssuer::at(T0);
+        let store = Arc::new(MemoryCertSource::new());
+        let q = Arc::new(RevocationQueue::open(&dir).unwrap());
+        let mut eng = RenewalEngine::new(store.clone(), spy.clone(), RenewalPolicy::default()).with_revocations(q.clone());
+        eng.run_once(T0, &reg).await;
+        reg.lock().await.release("acme", "app.acme.com.au").unwrap();
+        eng.run_once(T0 + DAY, &reg).await;
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        let r = eng.run_once(T0 + 9 * DAY, &reg).await;
+        assert!(!r.pruned.contains(&"app.acme.com.au".to_string()), "not pruned while it cannot be recorded: {r:?}");
+        assert!(store.cert_for("app.acme.com.au").is_some());
+        std::fs::create_dir_all(&dir).unwrap();
+        let r = eng.run_once(T0 + 9 * DAY + 3600, &reg).await;
+        assert!(r.pruned.contains(&"app.acme.com.au".to_string()) && r.revoked == vec!["app.acme.com.au".to_string()], "{r:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn an_engine_without_a_revocation_queue_prunes_exactly_as_before() {
+        let reg = registry();
+        let spy = SpyIssuer::at(T0);
+        let store = Arc::new(MemoryCertSource::new());
+        let mut eng = RenewalEngine::new(store.clone(), spy.clone(), RenewalPolicy::default());
+        eng.run_once(T0, &reg).await;
+        reg.lock().await.release("acme", "app.acme.com.au").unwrap();
+        eng.run_once(T0 + DAY, &reg).await;
+        let r = eng.run_once(T0 + 9 * DAY, &reg).await;
+        assert_eq!(r.pruned, vec!["app.acme.com.au".to_string()]);
+        assert!(r.revoked.is_empty() && spy.revoked.lock().unwrap().is_empty());
     }
 }

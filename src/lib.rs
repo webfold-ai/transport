@@ -80,6 +80,11 @@ pub mod acme;
 /// The certificate renewal engine: what to issue, when to renew, how to fail, how to persist.
 #[cfg(feature = "native")]
 pub mod acme_renew;
+/// DNS health findings for the zones and names the edge depends on: DNSSEC chain health
+/// (DS vs DNSKEY, RRSIG lifetime), RFC 8659 CAA policy, NS/SOA sanity. Pure evaluators over
+/// injected lookups; the live resolver is `edge_verify`'s DNS client.
+#[cfg(feature = "native")]
+pub mod dns_health;
 
 use std::future::Future;
 use std::io;

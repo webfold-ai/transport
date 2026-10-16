@@ -39,8 +39,13 @@
 //!
 //! **Beyond the basic order flow**: External Account Binding for CAs that require it
 //! ([`AcmeClient::new_with_eab`], RFC 8555 §7.3.4), account key rollover
-//! ([`AcmeClient::rollover_account_key`], §7.3.5) and ACME Renewal Information
-//! ([`AcmeClient::renewal_info`], RFC 9773 — consumed by [`crate::acme_renew`]'s engine).
+//! ([`AcmeClient::rollover_account_key`], §7.3.5), ACME Renewal Information
+//! ([`AcmeClient::renewal_info`], RFC 9773 — consumed by [`crate::acme_renew`]'s engine), the
+//! `replaces` member of `newOrder` so a renewal is recognised as one
+//! ([`AcmeClient::issue_replacing`], RFC 9773 §5) and certificate revocation
+//! ([`AcmeClient::revoke_certificate`], RFC 8555 §7.6) signed either by the account or — for the
+//! key-compromise case, or when the account that ordered the certificate is gone — by the
+//! certificate's own key ([`AcmeClient::revoke_certificate_with_key`]).
 //!
 //! **What's genuinely verified here vs. not**: every pure step (JWS/JWK construction, the
 //! flattened-JSON envelope ACME's wire format needs — not the compact `a.b.c` form
@@ -108,6 +113,13 @@ impl std::fmt::Display for AcmeError {
 impl std::error::Error for AcmeError {}
 
 impl AcmeError {
+    /// Whether the CA refused with the ACME problem `urn:ietf:params:acme:error:{kind}`
+    /// (RFC 8555 §6.7), e.g. `"unauthorized"` or `"alreadyReplaced"`.
+    #[must_use]
+    pub fn is_problem(&self, kind: &str) -> bool {
+        matches!(self, AcmeError::Rejected { detail, .. } if detail.contains(&format!("urn:ietf:params:acme:error:{kind}")))
+    }
+
     /// Seconds the CA asked us to wait, if it said.
     #[must_use]
     pub fn retry_after_secs(&self) -> Option<u64> {
@@ -154,6 +166,24 @@ impl AccountKey {
         let ec_private_key = der::seq(&[der::uint(&[1]), der::tlv(0x04, &secret)]);
         let pair = EcdsaKeyPair::from_private_key_der(&ECDSA_P256_SHA256_FIXED_SIGNING, &ec_private_key)
             .map_err(|e| AcmeError::BadResponse(format!("invalid P-256 account key: {e}")))?;
+        Ok(AccountKey { pair: std::sync::Arc::new(pair) })
+    }
+
+    /// Load a P-256 key from the PKCS#8 PEM this module writes for certificate keys
+    /// (`CertMaterial::key_pem`), so the certificate's own key can sign a revocation (RFC 8555
+    /// §7.6: the JWS is signed with the key of the certificate being revoked). Same type as an
+    /// account key because that is all a JWS signer is.
+    ///
+    /// # Errors
+    /// If `pem` holds no `PRIVATE KEY` block or the key is not ECDSA P-256. The error never
+    /// echoes key material.
+    pub fn from_pkcs8_pem(pem: &str) -> Result<Self, AcmeError> {
+        let der = crate::pem::blocks(pem, "PRIVATE KEY")
+            .into_iter()
+            .next()
+            .ok_or_else(|| AcmeError::BadResponse("no PKCS#8 private key in the certificate key PEM".into()))?;
+        let pair = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &der)
+            .map_err(|_| AcmeError::BadResponse("the certificate key is not an ECDSA P-256 PKCS#8 key".into()))?;
         Ok(AccountKey { pair: std::sync::Arc::new(pair) })
     }
 
@@ -276,6 +306,17 @@ fn flattened_jws(account: &AccountKey, protected: &Value, payload_json: &str) ->
     .to_string()
 }
 
+/// How a request identifies its signer (RFC 8555 §6.2: exactly one of `jwk`/`kid`).
+enum Auth<'a> {
+    /// The account's `kid`, signed by the account key — everything after `newAccount`.
+    Kid,
+    /// The account's public JWK, signed by the account key — `newAccount` itself.
+    AccountJwk,
+    /// A public JWK that is **not** the account's, signed by the matching private key — the
+    /// certificate's own key, for a revocation (RFC 8555 §7.6).
+    KeyJwk(&'a AccountKey),
+}
+
 /// The protected header for a request signed with the account's own key + `kid` (every request
 /// after `newAccount` succeeds).
 fn protected_header_kid(kid: &str, nonce: &str, url: &str) -> Value {
@@ -303,6 +344,48 @@ pub struct Directory {
     /// ACME Renewal Information base URL (RFC 9773); `None` for a CA without ARI.
     #[serde(rename = "renewalInfo", default)]
     pub renewal_info: Option<String>,
+    /// Certificate revocation endpoint (RFC 8555 §7.6); `None` makes
+    /// [`AcmeClient::revoke_certificate`] fail with an explanatory error.
+    #[serde(rename = "revokeCert", default)]
+    pub revoke_cert: Option<String>,
+}
+
+/// Why a certificate is being revoked — the RFC 5280 `CRLReason` subset that RFC 8555 §7.6 and
+/// the public CAs accept for a subscriber-initiated revocation. The wire value is the numeric code.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RevocationReason {
+    Unspecified,
+    /// The private key is, or may be, in someone else's hands. The CA may then revoke other
+    /// certificates sharing the key and blocks the key from future issuance.
+    KeyCompromise,
+    AffiliationChanged,
+    Superseded,
+    /// The name is no longer in service — what releasing a customer hostname is.
+    CessationOfOperation,
+}
+
+impl RevocationReason {
+    /// The RFC 5280 `CRLReason` code sent as `reason`.
+    #[must_use]
+    pub fn code(self) -> u8 {
+        match self {
+            RevocationReason::Unspecified => 0,
+            RevocationReason::KeyCompromise => 1,
+            RevocationReason::AffiliationChanged => 3,
+            RevocationReason::Superseded => 4,
+            RevocationReason::CessationOfOperation => 5,
+        }
+    }
+}
+
+/// What a revocation request achieved. Both are success: a certificate someone already revoked
+/// (a retry whose first attempt landed but whose answer was lost, or an operator who revoked it
+/// by hand) is exactly as revoked as one we just did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RevocationOutcome {
+    Revoked,
+    /// The CA answered `alreadyRevoked` (RFC 8555 §7.6).
+    AlreadyRevoked,
 }
 
 /// The CA's advice on when to renew one certificate (RFC 9773 `suggestedWindow`), unix seconds.
@@ -604,7 +687,7 @@ impl AcmeClient {
         }
         // Same nonce/rate-limit handling as every other request; the only difference is that the
         // account does not exist yet, so the JWS carries the public key (`jwk`) instead of a `kid`.
-        let (status, kid, body) = self.send_jws(&self.directory.new_account, &payload.to_string(), true).await?;
+        let (status, kid, body) = self.send_jws(&self.directory.new_account, &payload.to_string(), Auth::AccountJwk).await?;
         if !(200..300).contains(&status) {
             return Err(AcmeError::Rejected { status, detail: body });
         }
@@ -713,12 +796,13 @@ impl AcmeClient {
     /// - **rate limits**: surfaced as [`AcmeError::RateLimited`] with `Retry-After`, so the
     ///   renewal engine can back off for as long as the CA asked.
     async fn send_signed(&self, url: &str, payload_json: &str) -> Result<(u16, Option<String>, String), AcmeError> {
-        self.send_jws(url, payload_json, false).await
+        self.send_jws(url, payload_json, Auth::Kid).await
     }
 
-    /// [`Self::send_signed`] with the choice of key identification: `jwk` is for `newAccount`
-    /// (no account URL exists yet), everything else uses the account `kid`.
-    async fn send_jws(&self, url: &str, payload_json: &str, jwk: bool) -> Result<(u16, Option<String>, String), AcmeError> {
+    /// [`Self::send_signed`] with the choice of key identification: `AccountJwk` is for
+    /// `newAccount` (no account URL exists yet), `KeyJwk` for a revocation signed by the
+    /// certificate's key, everything else uses the account `kid`.
+    async fn send_jws(&self, url: &str, payload_json: &str, auth: Auth<'_>) -> Result<(u16, Option<String>, String), AcmeError> {
         const MAX_ATTEMPTS: usize = 3;
         for attempt in 1..=MAX_ATTEMPTS {
             let nonce = match self.take_nonce() {
@@ -730,12 +814,12 @@ impl AcmeClient {
                 Err(e) => return Err(e),
             };
             let account = self.account();
-            let protected = if jwk {
-                protected_header_jwk(&account, &nonce, url)
-            } else {
-                protected_header_kid(&self.kid()?, &nonce, url)
+            let (signer, protected) = match &auth {
+                Auth::AccountJwk => (account.clone(), protected_header_jwk(&account, &nonce, url)),
+                Auth::Kid => (account.clone(), protected_header_kid(&self.kid()?, &nonce, url)),
+                Auth::KeyJwk(key) => ((*key).clone(), protected_header_jwk(key, &nonce, url)),
             };
-            let jws = flattened_jws(&account, &protected, payload_json);
+            let jws = flattened_jws(&signer, &protected, payload_json);
             let resp = Client::new().post(url).header(header::CONTENT_TYPE, "application/jose+json").body(jws.into_bytes()).send().await?;
             self.store_nonce_from(&resp);
             let status = resp.status().as_u16();
@@ -760,18 +844,114 @@ impl AcmeClient {
     /// Any transport failure, a rejected order, an authorization that never validates, or the
     /// responder refusing to serve the challenge token.
     pub async fn issue(&self, domains: &[&str], responder: &dyn Http01Responder) -> Result<CertMaterial, AcmeError> {
-        self.issue_with(domains, ChallengeResponder::Http(responder)).await
+        self.issue_with(domains, ChallengeResponder::Http(responder), None).await
     }
 
     /// Issue a certificate via DNS-01, including wildcard names.
     pub async fn issue_dns01(&self, domains: &[&str], responder: &dyn Dns01Responder) -> Result<CertMaterial, AcmeError> {
-        self.issue_with(domains, ChallengeResponder::Dns(responder)).await
+        self.issue_with(domains, ChallengeResponder::Dns(responder), None).await
     }
 
-    async fn issue_with(&self, domains: &[&str], responder: ChallengeResponder<'_>) -> Result<CertMaterial, AcmeError> {
+    /// [`Self::issue`] for a renewal: the order names the certificate it replaces
+    /// (`replaces`, RFC 9773 §5), which CAs use to recognise a renewal — Let's Encrypt, for one,
+    /// exempts a replacement order from its new-order and duplicate-certificate rate limits.
+    /// `previous_chain_pem` is the chain being replaced (only the leaf is read).
+    ///
+    /// `replaces` is sent only when the CA advertises ARI in its directory and the previous leaf
+    /// has an ARI certificate ID ([`ari_cert_id`]); otherwise this is exactly [`Self::issue`].
+    /// If the CA refuses the order because of the `replaces` member (`alreadyReplaced` — a replacement
+    /// is already under way or done, `malformed`, `unauthorized` — the certificate belongs to
+    /// another account) the order is placed once more without it: a renewal that cannot claim the
+    /// rate-limit exemption is still a renewal.
+    ///
+    /// # Errors
+    /// As [`Self::issue`].
+    pub async fn issue_replacing(&self, domains: &[&str], responder: &dyn Http01Responder, previous_chain_pem: &str) -> Result<CertMaterial, AcmeError> {
+        self.issue_with(domains, ChallengeResponder::Http(responder), self.replaces_id(previous_chain_pem)).await
+    }
+
+    /// [`Self::issue_dns01`] for a renewal; see [`Self::issue_replacing`].
+    ///
+    /// # Errors
+    /// As [`Self::issue_dns01`].
+    pub async fn issue_dns01_replacing(&self, domains: &[&str], responder: &dyn Dns01Responder, previous_chain_pem: &str) -> Result<CertMaterial, AcmeError> {
+        self.issue_with(domains, ChallengeResponder::Dns(responder), self.replaces_id(previous_chain_pem)).await
+    }
+
+    /// The `replaces` value for an order replacing `previous_chain_pem`, if the CA supports it.
+    fn replaces_id(&self, previous_chain_pem: &str) -> Option<String> {
+        self.directory.renewal_info.as_ref()?;
+        ari_cert_id(previous_chain_pem)
+    }
+
+    /// Revoke `cert_der_or_pem` (a DER certificate, or PEM whose first `CERTIFICATE` block is
+    /// taken — pass the leaf or the whole chain) with the **account** key (RFC 8555 §7.6). The CA
+    /// accepts this only for a certificate issued to this account or for names the account holds
+    /// valid authorizations for. `AlreadyRevoked` is success, not an error.
+    ///
+    /// # Errors
+    /// The CA's directory has no `revokeCert`, the input is not a certificate, any transport
+    /// failure, or the CA refusing (`unauthorized` for a certificate this account has no claim
+    /// to; use [`Self::revoke_certificate_with_key`] if you hold its private key).
+    pub async fn revoke_certificate(&self, cert_der_or_pem: &[u8], reason: RevocationReason) -> Result<RevocationOutcome, AcmeError> {
+        self.revoke_with(cert_der_or_pem, reason, Auth::Kid).await
+    }
+
+    /// As [`Self::revoke_certificate`], but the request is signed with the **certificate's own
+    /// private key** (`certificate_key_pem`, the PKCS#8 PEM of `CertMaterial::key_pem`) and carries its
+    /// public key as the JWK. That proves possession of the key, so it needs no account at all:
+    /// the route for a key compromise (whoever holds the key can do this, which is why a
+    /// compromised key should be revoked at once) and for a certificate ordered by an account we no
+    /// longer hold the key of.
+    ///
+    /// # Errors
+    /// As [`Self::revoke_certificate`], plus a key that is not an ECDSA P-256 PKCS#8 key.
+    pub async fn revoke_certificate_with_key(
+        &self,
+        cert_der_or_pem: &[u8],
+        certificate_key_pem: &str,
+        reason: RevocationReason,
+    ) -> Result<RevocationOutcome, AcmeError> {
+        let key = AccountKey::from_pkcs8_pem(certificate_key_pem)?;
+        self.revoke_with(cert_der_or_pem, reason, Auth::KeyJwk(&key)).await
+    }
+
+    async fn revoke_with(&self, cert_der_or_pem: &[u8], reason: RevocationReason, auth: Auth<'_>) -> Result<RevocationOutcome, AcmeError> {
+        let url = self
+            .directory
+            .revoke_cert
+            .as_deref()
+            .ok_or_else(|| AcmeError::BadResponse("this CA's directory has no revokeCert URL, so it does not support revocation".to_string()))?;
+        let der = leaf_der(cert_der_or_pem)?;
+        let payload = json!({ "certificate": b64url(&der), "reason": reason.code() });
+        let (status, _, body) = self.send_jws(url, &payload.to_string(), auth).await?;
+        if (200..300).contains(&status) {
+            return Ok(RevocationOutcome::Revoked);
+        }
+        let err = AcmeError::Rejected { status, detail: body };
+        if err.is_problem("alreadyRevoked") {
+            return Ok(RevocationOutcome::AlreadyRevoked);
+        }
+        Err(err)
+    }
+
+    async fn issue_with(&self, domains: &[&str], responder: ChallengeResponder<'_>, replaces: Option<String>) -> Result<CertMaterial, AcmeError> {
         let identifiers: Vec<Value> = domains.iter().map(|d| json!({ "type": "dns", "value": d })).collect();
-        let (status, order_location, body) =
-            self.post_signed_with_location(&self.directory.new_order, &json!({ "identifiers": identifiers }).to_string()).await?;
+        let mut order_payload = json!({ "identifiers": identifiers });
+        if let Some(id) = &replaces {
+            order_payload["replaces"] = json!(id);
+        }
+        let (mut status, mut order_location, mut body) = self.post_signed_with_location(&self.directory.new_order, &order_payload.to_string()).await?;
+        if replaces.is_some() && !(200..300).contains(&status) {
+            let refused = AcmeError::Rejected { status, detail: body.clone() };
+            if refused.is_problem("alreadyReplaced") || refused.is_problem("malformed") || refused.is_problem("unauthorized") {
+                tracing::info!(status, "the CA refused the order's `replaces`; ordering without it");
+                if let Some(o) = order_payload.as_object_mut() {
+                    o.remove("replaces");
+                }
+                (status, order_location, body) = self.post_signed_with_location(&self.directory.new_order, &order_payload.to_string()).await?;
+            }
+        }
         if !(200..300).contains(&status) {
             return Err(AcmeError::Rejected { status, detail: body });
         }
@@ -872,6 +1052,28 @@ impl AcmeClient {
             }
         }
         Err(AcmeError::AuthorizationFailed(authz_url.to_string()))
+    }
+}
+
+/// The DER of the certificate in `input`: raw DER (a SEQUENCE, so it starts `0x30`) or PEM, whose
+/// first `CERTIFICATE` block is taken. Sanity-checked as one complete DER element and bounded, so
+/// a hostile or truncated input is refused before it is put in a request.
+fn leaf_der(input: &[u8]) -> Result<Vec<u8>, AcmeError> {
+    /// Real certificates are a few KiB; a chain PEM a few tens. Nothing legitimate is near this.
+    const MAX_INPUT: usize = 256 * 1024;
+    let bad = |m: &str| AcmeError::BadResponse(format!("not a certificate to revoke: {m}"));
+    if input.len() > MAX_INPUT {
+        return Err(bad("input is implausibly large"));
+    }
+    let der = if input.first() == Some(&0x30) {
+        input.to_vec()
+    } else {
+        let text = std::str::from_utf8(input).map_err(|_| bad("neither DER nor PEM"))?;
+        crate::pem::blocks(text, "CERTIFICATE").into_iter().next().ok_or_else(|| bad("no CERTIFICATE block"))?
+    };
+    match der::read(&der) {
+        Some((0x30, content, rest)) if rest.is_empty() && !content.is_empty() => Ok(der),
+        _ => Err(bad("malformed DER")),
     }
 }
 
@@ -1400,6 +1602,26 @@ mod tests {
             /// has no `renewalInfo`.
             pub ari: Option<(u16, Option<String>, String)>,
             pub ari_requests: Vec<String>,
+            /// The JWK public point of the most recent request if it was identified by `jwk`
+            /// (`None` when by `kid`).
+            pub last_jwk: Option<[u8; 64]>,
+            /// Leave `revokeCert` out of the directory.
+            pub no_revoke_cert: bool,
+            /// Certificate returned for every order (default: a placeholder that is not a real
+            /// certificate).
+            pub cert_pem: Option<String>,
+            /// Every `newOrder` payload received, failed attempts included.
+            pub orders: Vec<Value>,
+            /// Refuse a `newOrder` that has `replaces` with 409 `alreadyReplaced`.
+            pub already_replaced: bool,
+            /// DER certificates the CA will accept a `jwk`-signed revocation for, with the key
+            /// they carry (what a real CA reads out of the certificate itself).
+            pub cert_keys: Vec<(Vec<u8>, [u8; 64])>,
+            /// Refuse every `kid`-signed revocation as `unauthorized` (a certificate this
+            /// account has no claim to).
+            pub revoke_unauthorized_for_kid: bool,
+            /// `(der, reason, signed by the certificate key rather than the account)`.
+            pub revoked: Vec<(Vec<u8>, Option<u64>, bool)>,
         }
 
         fn fresh_nonce(st: &mut State) -> String {
@@ -1444,10 +1666,16 @@ mod tests {
                 let mut pk = [0u8; 64];
                 pk[..32].copy_from_slice(&b64url_decode_for_test(jwk["x"].as_str().unwrap()));
                 pk[32..].copy_from_slice(&b64url_decode_for_test(jwk["y"].as_str().unwrap()));
-                st.acct_pk = Some(pk);
+                // Only `newAccount` introduces the account key; any other `jwk` request (a revocation
+                // by the certificate's key) is signed by a key that is not the account's.
+                if url.ends_with("/new-acct") {
+                    st.acct_pk = Some(pk);
+                }
+                st.last_jwk = Some(pk);
                 pk
             } else {
                 assert_eq!(protected["kid"].as_str().unwrap(), format!("{}/acct/1", st.base));
+                st.last_jwk = None;
                 st.acct_pk.expect("account registered first")
             };
             let mut sig = [0u8; 64];
@@ -1560,6 +1788,9 @@ mod tests {
                             // Pebble-style: no trailing slash; the client adds it.
                             dir.push_str(&format!(r#","renewalInfo":"{b}/renewal-info""#));
                         }
+                        if !st.no_revoke_cert {
+                            dir.push_str(&format!(r#","revokeCert":"{b}/revoke-cert""#));
+                        }
                         dir.push('}');
                         dir
                     },
@@ -1611,6 +1842,10 @@ mod tests {
                             }
                             let ids: Value = serde_json::from_str(&payload).unwrap();
                             assert_eq!(ids["identifiers"].as_array().unwrap().len(), 2);
+                            st.orders.push(ids.clone());
+                            if st.already_replaced && ids.get("replaces").is_some() {
+                                return problem(409, "alreadyReplaced", st);
+                            }
                             let b = st.base.clone();
                             ok(
                                 st,
@@ -1640,7 +1875,30 @@ mod tests {
                             let b = st.base.clone();
                             ok(st, 200, vec![], format!(r#"{{"status":"valid","authorizations":[],"finalize":"{b}/finalize/1","certificate":"{b}/cert/1"}}"#))
                         }
-                        "/cert/1" => ok(st, 200, vec![], "-----BEGIN CERTIFICATE-----\nZmFrZQ==\n-----END CERTIFICATE-----\n".into()),
+                        "/cert/1" => {
+                            let pem = st.cert_pem.clone().unwrap_or_else(|| "-----BEGIN CERTIFICATE-----\nZmFrZQ==\n-----END CERTIFICATE-----\n".into());
+                            ok(st, 200, vec![], pem)
+                        }
+                        "/revoke-cert" => {
+                            let v: Value = serde_json::from_str(&payload).unwrap();
+                            assert_eq!(v.as_object().unwrap().len(), 2, "certificate and reason, nothing else: {v}");
+                            let der = b64url_decode_for_test(v["certificate"].as_str().unwrap());
+                            assert!(!v["certificate"].as_str().unwrap().contains(['=', '+', '/']), "base64url without padding");
+                            let reason = v["reason"].as_u64();
+                            if st.revoked.iter().any(|(d, _, _)| *d == der) {
+                                return problem(400, "alreadyRevoked", st);
+                            }
+                            let by_cert_key = st.last_jwk.is_some();
+                            let authorised = match st.last_jwk {
+                                None => !st.revoke_unauthorized_for_kid,
+                                Some(pk) => st.cert_keys.iter().any(|(d, k)| *d == der && *k == pk),
+                            };
+                            if !authorised {
+                                return problem(403, "unauthorized", st);
+                            }
+                            st.revoked.push((der, reason, by_cert_key));
+                            ok(st, 200, vec![], String::new())
+                        }
                         other => panic!("mock CA: unexpected POST {other}"),
                     }
                 }
@@ -2088,5 +2346,239 @@ mod tests {
         let err = client.renewal_info(&rcgen_leaf(&RFC9773_AKI, &[1, 2, 3], false)).await.unwrap_err();
         assert!(matches!(&err, AcmeError::BadResponse(m) if m.contains("Authority Key Identifier")), "{err}");
         assert!(state.lock().unwrap().ari_requests.is_empty());
+    }
+
+    // ── Revocation (RFC 8555 §7.6) ───────────────────────────────────────────────────────
+
+    /// A real leaf certificate together with its PKCS#8 key and the public point a CA would read
+    /// out of it, as `(chain_pem, key_pem, x‖y)`.
+    fn rcgen_leaf_with_key(serial: &[u8]) -> (String, String, [u8; 64]) {
+        let ca_key = rcgen::KeyPair::generate().unwrap();
+        let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        ca_params.key_identifier_method = rcgen::KeyIdMethod::PreSpecified(RFC9773_AKI.to_vec());
+        let ca = ca_params.self_signed(&ca_key).unwrap();
+        let leaf_key = rcgen::KeyPair::generate().unwrap();
+        let mut params = rcgen::CertificateParams::new(vec!["app.acme.com.au".to_string()]).unwrap();
+        params.serial_number = Some(rcgen::SerialNumber::from_slice(serial));
+        params.use_authority_key_identifier_extension = true;
+        let pem = params.signed_by(&leaf_key, &ca, &ca_key).unwrap().pem();
+        let mut point = [0u8; 64];
+        point.copy_from_slice(&leaf_key.public_key_raw()[1..]);
+        (pem, leaf_key.serialize_pem(), point)
+    }
+
+    fn der_of(pem: &str) -> Vec<u8> {
+        crate::pem::blocks(pem, "CERTIFICATE").remove(0)
+    }
+
+    #[test]
+    fn revocation_reasons_are_the_rfc_5280_codes_and_none_is_certificate_hold() {
+        let all = [
+            (RevocationReason::Unspecified, 0),
+            (RevocationReason::KeyCompromise, 1),
+            (RevocationReason::AffiliationChanged, 3),
+            (RevocationReason::Superseded, 4),
+            (RevocationReason::CessationOfOperation, 5),
+        ];
+        for (reason, code) in all {
+            assert_eq!(reason.code(), code);
+        }
+        // 2 (CA compromise), 6 (certificateHold, which ACME forbids) and 7 (unused) cannot be expressed.
+        assert!(![2u8, 6, 7].iter().any(|c| all.iter().any(|(r, _)| r.code() == *c)));
+    }
+
+    #[tokio::test]
+    async fn revoking_with_the_account_key_names_the_certificate_and_reason_and_a_repeat_is_success() {
+        let account = test_account();
+        let (dir, state, _dns) = mock_ca::start(&account).await;
+        let client = AcmeClient::new(&dir, account, None).await.unwrap();
+        let (pem, _key, _pk) = rcgen_leaf_with_key(&[1, 2, 3]);
+
+        let outcome = client.revoke_certificate(pem.as_bytes(), RevocationReason::CessationOfOperation).await.expect("revoked");
+        assert_eq!(outcome, RevocationOutcome::Revoked);
+        assert_eq!(state.lock().unwrap().revoked, vec![(der_of(&pem), Some(5), false)], "the CA saw this certificate, reason 5, signed by the account (kid)");
+        assert_eq!(state.lock().unwrap().bad_nonce_seen, 0);
+
+        // alreadyRevoked is success: the certificate is as revoked as we wanted.
+        let again = client.revoke_certificate(pem.as_bytes(), RevocationReason::CessationOfOperation).await.expect("alreadyRevoked is handled");
+        assert_eq!(again, RevocationOutcome::AlreadyRevoked);
+        assert_eq!(state.lock().unwrap().revoked.len(), 1);
+
+        // Raw DER is accepted too, and a whole chain revokes its leaf (the first block).
+        let (pem2, _, _) = rcgen_leaf_with_key(&[9]);
+        let chain = format!("{pem2}{pem}");
+        client.revoke_certificate(&der_of(&pem2), RevocationReason::Superseded).await.unwrap();
+        assert_eq!(client.revoke_certificate(chain.as_bytes(), RevocationReason::Superseded).await.unwrap(), RevocationOutcome::AlreadyRevoked);
+        assert_eq!(state.lock().unwrap().revoked[1], (der_of(&pem2), Some(4), false));
+    }
+
+    #[tokio::test]
+    async fn a_revocation_the_account_has_no_claim_to_is_refused_and_the_certificates_own_key_can_still_revoke_it() {
+        let account = test_account();
+        let (dir, state, _dns) = mock_ca::start(&account).await;
+        let client = AcmeClient::new(&dir, account.clone(), None).await.unwrap();
+        let (pem, key_pem, pk) = rcgen_leaf_with_key(&[4, 5, 6]);
+        {
+            let mut st = state.lock().unwrap();
+            st.revoke_unauthorized_for_kid = true;
+            st.cert_keys.push((der_of(&pem), pk));
+        }
+        let err = client.revoke_certificate(pem.as_bytes(), RevocationReason::KeyCompromise).await.unwrap_err();
+        assert!(err.is_problem("unauthorized") && matches!(err, AcmeError::Rejected { status: 403, .. }), "{err}");
+
+        // Signed with the certificate's own key, embedded as the JWK: no account needed.
+        let outcome = client.revoke_certificate_with_key(pem.as_bytes(), &key_pem, RevocationReason::KeyCompromise).await.expect("key-signed revocation");
+        assert_eq!(outcome, RevocationOutcome::Revoked);
+        {
+            let st = state.lock().unwrap();
+            assert_eq!(st.revoked, vec![(der_of(&pem), Some(1), true)], "reason keyCompromise, signed by the certificate key");
+            assert_eq!(st.last_jwk, Some(pk), "the JWK was the certificate's key, not the account's");
+            assert_ne!(Some(pk), st.acct_pk);
+        }
+        assert_eq!(
+            client.revoke_certificate_with_key(pem.as_bytes(), &key_pem, RevocationReason::KeyCompromise).await.unwrap(),
+            RevocationOutcome::AlreadyRevoked
+        );
+
+        // Someone else's key cannot revoke it: the CA compares the JWK with the certificate's key.
+        let (pem2, _own_key, pk2) = rcgen_leaf_with_key(&[7]);
+        state.lock().unwrap().cert_keys.push((der_of(&pem2), pk2));
+        let (_, other_key, _) = rcgen_leaf_with_key(&[8]);
+        let err = client.revoke_certificate_with_key(pem2.as_bytes(), &other_key, RevocationReason::KeyCompromise).await.unwrap_err();
+        assert!(err.is_problem("unauthorized"), "{err}");
+        // The account key is untouched by all of this.
+        assert_eq!(client.account().thumbprint(), account.thumbprint());
+    }
+
+    #[tokio::test]
+    async fn revocation_refuses_non_certificates_and_a_ca_without_revoke_cert_before_sending_anything() {
+        let account = test_account();
+        let (dir, state, _dns) = mock_ca::start(&account).await;
+        let client = AcmeClient::new(&dir, account.clone(), None).await.unwrap();
+        let (pem, key_pem, _) = rcgen_leaf_with_key(&[1]);
+        let der = der_of(&pem);
+        let mut chopped = der.clone();
+        chopped.truncate(der.len() - 5);
+        let mut trailing = der.clone();
+        trailing.extend_from_slice(b"junk");
+        let big = vec![0x30u8; 300 * 1024];
+        for (what, input) in [
+            ("empty", Vec::new()),
+            ("text", b"hello".to_vec()),
+            ("pem without a certificate", b"-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----\n".to_vec()),
+            ("truncated DER", chopped),
+            ("DER with trailing bytes", trailing),
+            ("oversized", big),
+            ("not UTF-8, not DER", vec![0xff, 0xfe, 0x00]),
+        ] {
+            let err = client.revoke_certificate(&input, RevocationReason::Unspecified).await.unwrap_err();
+            assert!(matches!(&err, AcmeError::BadResponse(m) if m.contains("not a certificate to revoke")), "{what}: {err}");
+        }
+        for bad_key in ["", "not a pem", "-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----\n"] {
+            let err = client.revoke_certificate_with_key(pem.as_bytes(), bad_key, RevocationReason::KeyCompromise).await.unwrap_err();
+            assert!(matches!(err, AcmeError::BadResponse(_)), "{bad_key:?}: {err}");
+            assert!(!err.to_string().contains("AAAA"), "key text is not echoed: {err}");
+        }
+        assert!(state.lock().unwrap().revoked.is_empty());
+
+        let (dir2, state2, _dns2) = mock_ca::start(&account).await;
+        state2.lock().unwrap().no_revoke_cert = true;
+        let client2 = AcmeClient::new(&dir2, account, None).await.unwrap();
+        let err = client2.revoke_certificate(pem.as_bytes(), RevocationReason::Unspecified).await.unwrap_err();
+        assert!(matches!(&err, AcmeError::BadResponse(m) if m.contains("revokeCert")), "{err}");
+        let err = client2.revoke_certificate_with_key(pem.as_bytes(), &key_pem, RevocationReason::Unspecified).await.unwrap_err();
+        assert!(matches!(&err, AcmeError::BadResponse(m) if m.contains("revokeCert")), "{err}");
+    }
+
+    #[test]
+    fn certificate_keys_load_as_signers_only_when_they_are_p256_pkcs8() {
+        let key = generate_cert_key();
+        let pem = p256_key_to_pkcs8_pem(&key);
+        let signer = AccountKey::from_pkcs8_pem(&pem).expect("the PEM this module writes loads");
+        assert_eq!(signer.xy().as_slice(), &key.public_key().as_ref()[1..], "same key");
+        let sig: [u8; 64] = signer.sign(b"m").try_into().unwrap();
+        assert!(hashtrinity::crypto::ecdsa_p256_verify(&signer.xy(), &sha256(b"m"), &sig));
+
+        let ed25519 = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap().serialize_pem();
+        assert!(AccountKey::from_pkcs8_pem(&ed25519).is_err(), "an Ed25519 key cannot sign ES256");
+        assert!(AccountKey::from_pkcs8_pem("").is_err());
+        assert!(AccountKey::from_pkcs8_pem("-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n").is_err());
+    }
+
+    // ── `replaces` (RFC 9773 §5) ─────────────────────────────────────────────────────────
+
+    /// A mock CA that advertises ARI and hands out one real certificate (with an AKI) for every order.
+    async fn replacing_ca() -> (String, std::sync::Arc<std::sync::Mutex<mock_ca::State>>, std::sync::Arc<mock_ca::FakeDns>, AccountKey, String) {
+        let account = test_account();
+        let (dir, state, dns) = mock_ca::start(&account).await;
+        let pem = rcgen_leaf(&RFC9773_AKI, &[0x87, 0x65, 0x43, 0x21], true);
+        {
+            let mut st = state.lock().unwrap();
+            st.ari = Some((200, None, ARI_BODY.to_string()));
+            st.cert_pem = Some(pem.clone());
+        }
+        (dir, state, dns, account, pem)
+    }
+
+    #[tokio::test]
+    async fn a_renewal_order_carries_the_certificate_it_replaces_and_a_first_issuance_does_not() {
+        let (dir, state, dns, account, _pem) = replacing_ca().await;
+        let client = AcmeClient::new(&dir, account, None).await.unwrap();
+
+        let first = client.issue_dns01(&ALL_NAMES, dns.as_ref()).await.expect("first issuance");
+        let renewed = client.issue_dns01_replacing(&ALL_NAMES, dns.as_ref(), &first.chain_pem).await.expect("renewal");
+        assert!(renewed.chain_pem.contains("BEGIN CERTIFICATE"));
+
+        let orders = state.lock().unwrap().orders.clone();
+        assert_eq!(orders.len(), 2);
+        assert!(orders[0].get("replaces").is_none(), "a first issuance replaces nothing: {}", orders[0]);
+        assert_eq!(orders[1]["replaces"], RFC9773_CERT_ID, "the renewal names the ARI certificate ID of the previous leaf: {}", orders[1]);
+        assert_eq!(orders[1]["identifiers"], orders[0]["identifiers"], "same names");
+        assert_eq!(orders[1].as_object().unwrap().len(), 2, "identifiers and replaces only");
+    }
+
+    #[tokio::test]
+    async fn replaces_is_left_out_where_it_cannot_help_and_a_refusal_of_it_falls_back_to_a_plain_order() {
+        // A CA without ARI never sees `replaces` (RFC 9773 §5: only if the directory has renewalInfo).
+        let (dir, state, dns, account, pem) = replacing_ca().await;
+        state.lock().unwrap().ari = None;
+        let client = AcmeClient::new(&dir, account.clone(), None).await.unwrap();
+        client.issue_dns01_replacing(&ALL_NAMES, dns.as_ref(), &pem).await.unwrap();
+        assert!(state.lock().unwrap().orders[0].get("replaces").is_none(), "no ARI in the directory");
+
+        // A previous certificate with no AKI has no certificate ID to name.
+        let (dir, state, dns, account2, _) = replacing_ca().await;
+        let client = AcmeClient::new(&dir, account2, None).await.unwrap();
+        client.issue_dns01_replacing(&ALL_NAMES, dns.as_ref(), &rcgen_leaf(&RFC9773_AKI, &[1], false)).await.unwrap();
+        client.issue_dns01_replacing(&ALL_NAMES, dns.as_ref(), "not a certificate").await.unwrap();
+        assert!(state.lock().unwrap().orders.iter().all(|o| o.get("replaces").is_none()));
+
+        // alreadyReplaced (a replacement is under way or done): ordered once more without it, and
+        // the renewal still succeeds.
+        let (dir, state, dns, _, pem) = replacing_ca().await;
+        state.lock().unwrap().already_replaced = true;
+        let client = AcmeClient::new(&dir, account, None).await.unwrap();
+        let cert = client.issue_dns01_replacing(&ALL_NAMES, dns.as_ref(), &pem).await.expect("falls back to a plain order");
+        assert!(cert.chain_pem.contains("BEGIN CERTIFICATE"));
+        let orders = state.lock().unwrap().orders.clone();
+        assert_eq!(orders.len(), 2, "the refused attempt and the retry");
+        assert!(orders[0].get("replaces").is_some() && orders[1].get("replaces").is_none(), "{orders:?}");
+
+        // Anything else a CA says about the order is not swallowed: a rate limit surfaces as such.
+        let (dir, state, dns, _, pem) = replacing_ca().await;
+        state.lock().unwrap().rate_limit_new_order = true;
+        let client = AcmeClient::new(&dir, test_account(), None).await.unwrap();
+        let err = client.issue_dns01_replacing(&ALL_NAMES, dns.as_ref(), &pem).await.unwrap_err();
+        assert!(matches!(err, AcmeError::RateLimited { .. }), "{err}");
+        assert_eq!(state.lock().unwrap().orders.len(), 0);
+    }
+
+    #[test]
+    fn directory_exposes_revoke_cert_when_offered() {
+        let d: Directory = serde_json::from_str(r#"{"newNonce":"https://x/n","newAccount":"https://x/a","newOrder":"https://x/o","revokeCert":"https://x/r"}"#).unwrap();
+        assert_eq!(d.revoke_cert.as_deref(), Some("https://x/r"));
+        let bare: Directory = serde_json::from_str(r#"{"newNonce":"https://x/n","newAccount":"https://x/a","newOrder":"https://x/o"}"#).unwrap();
+        assert_eq!(bare.revoke_cert, None);
     }
 }

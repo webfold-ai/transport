@@ -27,6 +27,14 @@
 //! SRV — plus [`RData::Unknown`], which round-trips any other type byte-for-byte rather than
 //! dropping it. An authority that silently discards records it does not model is worse than one
 //! that carries them through.
+//!
+//! **DNSSEC records** (RFC 4034): `DS`, `DNSKEY`, `RRSIG` and `NSEC` are modelled so the health
+//! checks in [`crate::dns_health`] can read a signed zone. They are *parsed and re-encoded*, not
+//! validated here: nothing in this module checks a signature. The record types are the associated
+//! constants [`RecordType::DS`] and friends rather than new enum variants (they are
+//! `Unknown(code)` underneath, so `from_code`/`code` stay a bijection and an exhaustive `match`
+//! on [`RecordType`] elsewhere keeps compiling); the payloads are real [`RData`] variants.
+//! Every length is bounds-checked against the record's own RDLENGTH before it is used.
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 
@@ -166,6 +174,19 @@ impl Name {
         out.push(0);
     }
 
+    /// The canonical wire form (RFC 4034 §6.2): uncompressed, every label lower-cased. This is
+    /// the owner-name encoding a DS digest is computed over (RFC 4034 §5.1.4).
+    #[must_use]
+    pub fn canonical_wire(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.labels.iter().map(|l| l.len() + 1).sum::<usize>() + 1);
+        for l in &self.labels {
+            out.push(u8::try_from(l.len()).unwrap_or(0));
+            out.extend(l.bytes().map(|b| b.to_ascii_lowercase()));
+        }
+        out.push(0);
+        out
+    }
+
     /// Decode at `pos`, following compression pointers. Returns the name and the offset just past
     /// the name **in the original stream** — which for a pointer is 2 bytes, not the length of
     /// what it pointed at.
@@ -236,6 +257,15 @@ pub enum RecordType {
 }
 
 impl RecordType {
+    /// DNSSEC delegation signer (RFC 4034 §5), held at the parent side of a zone cut.
+    pub const DS: RecordType = RecordType::Unknown(43);
+    /// DNSSEC signature over an RRset (RFC 4034 §3).
+    pub const RRSIG: RecordType = RecordType::Unknown(46);
+    /// DNSSEC authenticated denial of existence (RFC 4034 §4).
+    pub const NSEC: RecordType = RecordType::Unknown(47);
+    /// DNSSEC public key (RFC 4034 §2).
+    pub const DNSKEY: RecordType = RecordType::Unknown(48);
+
     /// The wire code.
     #[must_use]
     pub fn code(self) -> u16 {
@@ -299,8 +329,117 @@ pub enum RData {
         tag: String,
         value: Vec<u8>,
     },
+    /// DNSSEC delegation signer (RFC 4034 §5.1).
+    Ds {
+        key_tag: u16,
+        algorithm: u8,
+        digest_type: u8,
+        digest: Vec<u8>,
+    },
+    /// DNSSEC public key (RFC 4034 §2.1). `flags` bit 7 (`0x0100`) is the zone-key bit, bit 15
+    /// (`0x0001`) the secure-entry-point (KSK) bit.
+    Dnskey {
+        flags: u16,
+        protocol: u8,
+        algorithm: u8,
+        public_key: Vec<u8>,
+    },
+    /// DNSSEC signature (RFC 4034 §3.1). `expiration`/`inception` are 32-bit *serial-number
+    /// arithmetic* timestamps (RFC 4034 §3.1.5), not plain unix seconds past 2106 — see
+    /// [`serial_secs_until`].
+    Rrsig {
+        type_covered: RecordType,
+        algorithm: u8,
+        labels: u8,
+        original_ttl: u32,
+        expiration: u32,
+        inception: u32,
+        key_tag: u16,
+        signer: Name,
+        signature: Vec<u8>,
+    },
+    /// Authenticated denial (RFC 4034 §4.1): the next owner name and the raw type bit maps
+    /// (read them with [`nsec_types`]). Modelled only so a signed zone's negative answers parse.
+    Nsec { next: Name, type_bitmaps: Vec<u8> },
     /// A type this enum does not model, carried through verbatim.
     Unknown(u16, Vec<u8>),
+}
+
+/// DNSKEY flag: the key is a zone key (RFC 4034 §2.1.1).
+pub const DNSKEY_ZONE: u16 = 0x0100;
+/// DNSKEY flag: secure entry point, i.e. a KSK (RFC 4034 §2.1.1, RFC 3757).
+pub const DNSKEY_SEP: u16 = 0x0001;
+
+/// The RFC 4034 appendix B key tag of a DNSKEY — the 16-bit hint an RRSIG and a DS carry to say
+/// which key they refer to. Not a security property (collisions are easy); a DS match also checks
+/// the algorithm and the digest.
+#[must_use]
+pub fn dnskey_key_tag(flags: u16, protocol: u8, algorithm: u8, public_key: &[u8]) -> u16 {
+    let rdata = dnskey_rdata(flags, protocol, algorithm, public_key);
+    if algorithm == 1 {
+        // RSA/MD5 (long obsolete): the tag is the next-to-last 16 bits of the modulus.
+        return match rdata.len().checked_sub(3).and_then(|i| rdata.get(i..i + 2)) {
+            Some(b) => u16::from_be_bytes([b[0], b[1]]),
+            None => 0,
+        };
+    }
+    let mut acc: u32 = 0;
+    for (i, b) in rdata.iter().enumerate() {
+        acc = acc.wrapping_add(if i & 1 == 1 { u32::from(*b) } else { u32::from(*b) << 8 });
+    }
+    acc = acc.wrapping_add((acc >> 16) & 0xFFFF);
+    u16::try_from(acc & 0xFFFF).unwrap_or(0)
+}
+
+/// The DNSKEY RDATA wire form (`flags ‖ protocol ‖ algorithm ‖ public key`) — what a key tag and a
+/// DS digest are computed over.
+#[must_use]
+pub fn dnskey_rdata(flags: u16, protocol: u8, algorithm: u8, public_key: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(4 + public_key.len());
+    out.extend_from_slice(&flags.to_be_bytes());
+    out.push(protocol);
+    out.push(algorithm);
+    out.extend_from_slice(public_key);
+    out
+}
+
+/// Seconds from `now` (unix seconds) until the RRSIG timestamp `ts`, negative when it is in the
+/// past. RRSIG times are 32-bit serial numbers compared with RFC 1982 arithmetic, so the answer
+/// is right across the 2106 wrap as long as the two are within ±68 years — which any signature
+/// that matters is.
+#[must_use]
+pub fn serial_secs_until(ts: u32, now: i64) -> i64 {
+    // Truncation of `now` to 32 bits is the point: serial arithmetic works modulo 2^32.
+    let now32 = u32::try_from(now.rem_euclid(1 << 32)).unwrap_or(0);
+    i64::from(i32::from_ne_bytes(ts.wrapping_sub(now32).to_ne_bytes()))
+}
+
+/// The record types named by an NSEC/NSEC3 type bit map (RFC 4034 §4.1.2). `None` if the map is
+/// malformed (a window block that overruns, an empty or over-long block, or windows that do not
+/// strictly increase) — never a panic on hostile input.
+#[must_use]
+pub fn nsec_types(bitmaps: &[u8]) -> Option<Vec<u16>> {
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    let mut last_window: Option<u8> = None;
+    while i < bitmaps.len() {
+        let window = *bitmaps.get(i)?;
+        let len = usize::from(*bitmaps.get(i + 1)?);
+        if len == 0 || len > 32 || last_window.is_some_and(|w| window <= w) {
+            return None;
+        }
+        let block = bitmaps.get(i + 2..i + 2 + len)?;
+        for (byte_i, byte) in block.iter().enumerate() {
+            for bit in 0..8u16 {
+                if byte & (0x80 >> bit) != 0 {
+                    out.push(u16::from(window) * 256 + u16::try_from(byte_i).ok()? * 8 + bit);
+                }
+            }
+        }
+        last_window = Some(window);
+        i += 2 + len;
+    }
+    Some(out)
 }
 
 impl RData {
@@ -316,6 +455,10 @@ impl RData {
             RData::Txt(_) => RecordType::Txt,
             RData::Srv { .. } => RecordType::Srv,
             RData::Caa { .. } => RecordType::Caa,
+            RData::Ds { .. } => RecordType::DS,
+            RData::Dnskey { .. } => RecordType::DNSKEY,
+            RData::Rrsig { .. } => RecordType::RRSIG,
+            RData::Nsec { .. } => RecordType::NSEC,
             RData::Unknown(c, _) => RecordType::Unknown(*c),
         }
     }
@@ -349,6 +492,30 @@ impl RData {
                 out.push(u8::try_from(tag.len()).unwrap_or(0));
                 out.extend_from_slice(tag.as_bytes());
                 out.extend_from_slice(value);
+            }
+            RData::Ds { key_tag, algorithm, digest_type, digest } => {
+                out.extend_from_slice(&key_tag.to_be_bytes());
+                out.push(*algorithm);
+                out.push(*digest_type);
+                out.extend_from_slice(digest);
+            }
+            RData::Dnskey { flags, protocol, algorithm, public_key } => {
+                out.extend_from_slice(&dnskey_rdata(*flags, *protocol, *algorithm, public_key));
+            }
+            RData::Rrsig { type_covered, algorithm, labels, original_ttl, expiration, inception, key_tag, signer, signature } => {
+                out.extend_from_slice(&type_covered.code().to_be_bytes());
+                out.push(*algorithm);
+                out.push(*labels);
+                for v in [original_ttl, expiration, inception] {
+                    out.extend_from_slice(&v.to_be_bytes());
+                }
+                out.extend_from_slice(&key_tag.to_be_bytes());
+                signer.encode(out); // RFC 4034 §3.1.7: never compressed
+                out.extend_from_slice(signature);
+            }
+            RData::Nsec { next, type_bitmaps } => {
+                next.encode(out); // RFC 4034 §4.1.1: never compressed
+                out.extend_from_slice(type_bitmaps);
             }
             RData::Unknown(_, raw) => out.extend_from_slice(raw),
         }
@@ -425,6 +592,45 @@ impl RData {
                     tag: String::from_utf8_lossy(tag).into_owned(),
                     value: body.get(2 + tl..).unwrap_or(&[]).to_vec(),
                 }
+            }
+            RecordType::DS => RData::Ds {
+                key_tag: be16(body, 0)?,
+                algorithm: *body.get(2).ok_or(DnsError::Truncated)?,
+                digest_type: *body.get(3).ok_or(DnsError::Truncated)?,
+                digest: body.get(4..).ok_or(DnsError::Truncated)?.to_vec(),
+            },
+            RecordType::DNSKEY => RData::Dnskey {
+                flags: be16(body, 0)?,
+                protocol: *body.get(2).ok_or(DnsError::Truncated)?,
+                algorithm: *body.get(3).ok_or(DnsError::Truncated)?,
+                public_key: body.get(4..).ok_or(DnsError::Truncated)?.to_vec(),
+            },
+            RecordType::RRSIG => {
+                // type(2) alg(1) labels(1) ottl(4) exp(4) inc(4) tag(2) = 18 fixed bytes, then the
+                // signer name, then the signature to the end of the RDATA. The fixed part is
+                // checked first so the name is never read from outside the record.
+                if body.len() < 18 {
+                    return Err(DnsError::Truncated);
+                }
+                let (signer, after) = Name::decode(buf, pos + 18)?;
+                // The name must end inside this record, or its "signature" would be read out of
+                // the next record.
+                let signature = buf.get(after..pos + len).ok_or(DnsError::Truncated)?.to_vec();
+                RData::Rrsig {
+                    type_covered: RecordType::from_code(be16(body, 0)?),
+                    algorithm: *body.get(2).ok_or(DnsError::Truncated)?,
+                    labels: *body.get(3).ok_or(DnsError::Truncated)?,
+                    original_ttl: be32(body, 4)?,
+                    expiration: be32(body, 8)?,
+                    inception: be32(body, 12)?,
+                    key_tag: be16(body, 16)?,
+                    signer,
+                    signature,
+                }
+            }
+            RecordType::NSEC => {
+                let (next, after) = Name::decode(buf, pos)?;
+                RData::Nsec { next, type_bitmaps: buf.get(after..pos + len).ok_or(DnsError::Truncated)?.to_vec() }
             }
             RecordType::Unknown(c) => RData::Unknown(c, body.to_vec()),
         })
@@ -842,5 +1048,241 @@ mod tests {
         ));
         assert_eq!(m.to_bytes(), m.to_bytes());
         assert_eq!(Message::from_bytes(&m.to_bytes()).unwrap().to_bytes(), m.to_bytes());
+    }
+
+    // ── DNSSEC records (RFC 4034) ─────────────────────────────────────────────────────────
+
+    /// The DNSKEY from RFC 4034 §5.4 (`dskey.example.com`, key id 60485).
+    const RFC4034_KEY_B64: &str =
+        "AQOeiiR0GOMYkDshWoSKz9XzfwJr1AYtsmx3TGkJaNXVbfi/2pHm822aJ5iI9BMzNXxeYCmZDRD99WYwYqUSdjMmmAphXdvxegXd/M5+X7OrzKBaMbCVdFLUUh6DhweJBjEVv5f2wwjM9XzcnOf+EPbtG9DMBmADjFDc2w/rljwvFw==";
+
+    fn rfc4034_key() -> Vec<u8> {
+        crate::pem::base64_decode(RFC4034_KEY_B64).unwrap()
+    }
+
+    fn dnssec_samples() -> Vec<RData> {
+        vec![
+            RData::Ds { key_tag: 60485, algorithm: 5, digest_type: 2, digest: vec![0xd4; 32] },
+            RData::Ds { key_tag: 1, algorithm: 13, digest_type: 4, digest: Vec::new() },
+            RData::Dnskey { flags: 257, protocol: 3, algorithm: 13, public_key: vec![7; 64] },
+            RData::Dnskey { flags: 256, protocol: 3, algorithm: 15, public_key: Vec::new() },
+            RData::Rrsig {
+                type_covered: RecordType::DNSKEY,
+                algorithm: 13,
+                labels: 2,
+                original_ttl: 3600,
+                expiration: 1_800_000_000,
+                inception: 1_790_000_000,
+                key_tag: 4242,
+                signer: n("Example.COM"),
+                signature: vec![0xab; 64],
+            },
+            RData::Rrsig {
+                type_covered: RecordType::Unknown(999),
+                algorithm: 8,
+                labels: 0,
+                original_ttl: 0,
+                expiration: u32::MAX,
+                inception: 0,
+                key_tag: 0,
+                signer: Name::root(),
+                signature: Vec::new(),
+            },
+            RData::Nsec { next: n("b.example.com"), type_bitmaps: vec![0, 6, 0x40, 0x01, 0, 0, 0, 0x03] },
+            RData::Nsec { next: Name::root(), type_bitmaps: Vec::new() },
+        ]
+    }
+
+    #[test]
+    fn dnssec_records_round_trip_through_the_wire() {
+        for data in dnssec_samples() {
+            let mut m = Message::response(0x4242);
+            m.answers.push(Record::new(n("example.com"), 300, data.clone()));
+            // a record after it proves the RDLENGTH bookkeeping leaves the stream aligned
+            m.answers.push(Record::new(n("example.com"), 300, RData::A(Ipv4Addr::LOCALHOST)));
+            let back = Message::from_bytes(&m.to_bytes()).unwrap_or_else(|e| panic!("{data:?}: {e}"));
+            assert_eq!(back.answers.len(), 2, "{data:?}");
+            assert_eq!(back.answers[0].data, data);
+            assert_eq!(back.answers[1].data, RData::A(Ipv4Addr::LOCALHOST));
+            assert_eq!(back.to_bytes(), m.to_bytes(), "encoding is canonical for {data:?}");
+        }
+    }
+
+    #[test]
+    fn dnssec_record_types_are_the_unknown_codes_underneath() {
+        for (t, code) in [(RecordType::DS, 43), (RecordType::RRSIG, 46), (RecordType::NSEC, 47), (RecordType::DNSKEY, 48)] {
+            assert_eq!(t.code(), code);
+            assert_eq!(RecordType::from_code(code), t);
+        }
+        assert_eq!(RData::Ds { key_tag: 0, algorithm: 0, digest_type: 0, digest: vec![] }.record_type(), RecordType::DS);
+        assert_eq!(RData::Nsec { next: Name::root(), type_bitmaps: vec![] }.record_type(), RecordType::NSEC);
+        // A DS that arrives as a record this build does not recognise would be `Unknown(43, ..)`;
+        // the wire decoder must turn it into the typed payload.
+        let mut m = Message::response(1);
+        m.answers.push(Record::new(n("x.example"), 5, RData::Unknown(43, vec![0, 9, 13, 2, 0xaa])));
+        let back = Message::from_bytes(&m.to_bytes()).unwrap();
+        assert_eq!(back.answers[0].data, RData::Ds { key_tag: 9, algorithm: 13, digest_type: 2, digest: vec![0xaa] });
+    }
+
+    #[test]
+    fn key_tag_matches_the_rfc_4034_worked_example() {
+        assert_eq!(dnskey_key_tag(256, 3, 5, &rfc4034_key()), 60485);
+        // The tag depends on every byte of the key and on the flags.
+        let mut other = rfc4034_key();
+        other[10] ^= 1;
+        assert_ne!(dnskey_key_tag(256, 3, 5, &other), 60485);
+        assert_ne!(dnskey_key_tag(257, 3, 5, &rfc4034_key()), 60485);
+        // The obsolete RSA/MD5 form and degenerate input neither panic nor read out of range.
+        let _ = dnskey_key_tag(256, 3, 1, &rfc4034_key());
+        let _ = dnskey_key_tag(0, 0, 1, &[]);
+        let _ = dnskey_key_tag(0, 0, 8, &[]);
+    }
+
+    #[test]
+    fn canonical_wire_lowercases_and_never_compresses() {
+        assert_eq!(n("DsKey.Example.COM").canonical_wire(), b"\x05dskey\x07example\x03com\x00".to_vec());
+        assert_eq!(Name::root().canonical_wire(), vec![0]);
+    }
+
+    #[test]
+    fn rrsig_times_use_serial_arithmetic() {
+        let now = 1_800_000_000i64;
+        assert_eq!(serial_secs_until(1_800_000_100, now), 100);
+        assert_eq!(serial_secs_until(1_799_999_000, now), -1000);
+        assert_eq!(serial_secs_until(1_800_000_000, now), 0);
+        // Across the 2106 wrap: `now` just before 2^32, the signature expiring just after it.
+        let near_wrap = (1i64 << 32) - 10;
+        assert_eq!(serial_secs_until(5, near_wrap), 15, "expires 15 s after the 32-bit counter wraps");
+        assert_eq!(serial_secs_until(u32::MAX - 20, near_wrap), -11);
+        // And past the wrap on the clock side.
+        assert_eq!(serial_secs_until(100, (1i64 << 32) + 40), 60);
+    }
+
+    #[test]
+    fn nsec_type_bitmaps_decode_and_malformed_ones_are_none() {
+        // window 0: bits for A(1), MX(15), RRSIG(46)=window0 byte5 bit6, NSEC(47); window 1: CAA(257)
+        let bm = [0u8, 6, 0x40, 0x01, 0, 0, 0, 0x03, 1, 1, 0x40];
+        assert_eq!(nsec_types(&bm), Some(vec![1, 15, 46, 47, 257]));
+        assert_eq!(nsec_types(&[]), Some(vec![]));
+        for bad in [&[0u8][..], &[0, 0][..], &[0, 33, 1][..], &[0, 2, 1][..], &[1, 1, 0x80, 0, 1, 0x80][..], &[0, 1, 0x80, 0, 1, 0x80][..]] {
+            assert_eq!(nsec_types(bad), None, "{bad:?}");
+        }
+    }
+
+    /// Wire bytes of a message holding one record of `rtype` with a raw RDATA, for hand-built
+    /// malformed payloads.
+    fn raw_record_message(rtype: u16, rdata: &[u8], rdlen_override: Option<u16>) -> Vec<u8> {
+        let mut buf = vec![0u8; 12];
+        buf[7] = 1; // one answer
+        buf.extend_from_slice(b"\x01a\x00");
+        buf.extend_from_slice(&rtype.to_be_bytes());
+        buf.extend_from_slice(&1u16.to_be_bytes());
+        buf.extend_from_slice(&60u32.to_be_bytes());
+        buf.extend_from_slice(&rdlen_override.unwrap_or(u16::try_from(rdata.len()).unwrap()).to_be_bytes());
+        buf.extend_from_slice(rdata);
+        buf
+    }
+
+    #[test]
+    fn malformed_dnssec_rdata_is_an_error_not_a_panic() {
+        // Too short for the fixed part, for every type.
+        for rtype in [43u16, 46, 47, 48] {
+            for len in 0..20usize {
+                let rdata = vec![0u8; len];
+                let r = Message::from_bytes(&raw_record_message(rtype, &rdata, None));
+                // Whatever the outcome, it must not panic; the short ones must be refused.
+                if (rtype == 43 || rtype == 48) && len < 4 || rtype == 46 && len < 19 {
+                    assert!(r.is_err(), "type {rtype} len {len} must be refused: {r:?}");
+                }
+            }
+        }
+        // RDLENGTH larger than the packet.
+        assert!(Message::from_bytes(&raw_record_message(48, &[1, 1, 3, 13], Some(500))).is_err());
+        // An RRSIG whose signer name runs past the end of its own RDATA into the bytes after it.
+        let mut rdata = vec![0u8; 18];
+        rdata.extend_from_slice(b"\x05abcde"); // a label that the RDATA ends in the middle of
+        let mut wire = raw_record_message(46, &rdata, None);
+        wire.extend_from_slice(b"\x00tail-bytes-that-are-not-part-of-the-record");
+        assert!(Message::from_bytes(&wire).is_err(), "the signer name must end inside its record");
+        // A signer name that is a self pointer (header 12 + owner 3 + record header 10 + 18 fixed = 43).
+        let mut rdata = vec![0u8; 18];
+        rdata.extend_from_slice(&[0xC0, 43]);
+        assert_eq!(Message::from_bytes(&raw_record_message(46, &rdata, None)), Err(DnsError::BadPointer));
+        // NSEC with an unterminated next-name.
+        assert!(Message::from_bytes(&raw_record_message(47, b"\x03abc", None)).is_err());
+        // RRSIG with a pointer in the signer name is accepted (resolvers may compress it).
+        let mut m = Message::response(3);
+        m.questions.push(Question::new(n("example.com"), RecordType::DNSKEY));
+        let mut wire = m.to_bytes();
+        wire[7] = 1; // ancount = 1
+        wire.extend_from_slice(&[0xC0, 12]); // owner: pointer to the question name
+        wire.extend_from_slice(&46u16.to_be_bytes());
+        wire.extend_from_slice(&1u16.to_be_bytes());
+        wire.extend_from_slice(&60u32.to_be_bytes());
+        let mut rd = vec![0u8, 48, 13, 2, 0, 0, 0x0e, 0x10, 0x6b, 0x49, 0xd2, 0, 0x6a, 0xfc, 0xe9, 0x00, 0x10, 0x92];
+        rd.extend_from_slice(&[0xC0, 12]); // signer: pointer
+        rd.extend_from_slice(&[9u8; 8]);
+        wire.extend_from_slice(&u16::try_from(rd.len()).unwrap().to_be_bytes());
+        wire.extend_from_slice(&rd);
+        let back = Message::from_bytes(&wire).expect("compressed signer name");
+        match &back.answers[0].data {
+            RData::Rrsig { signer, signature, type_covered, .. } => {
+                assert_eq!(*signer, n("example.com"));
+                assert_eq!(signature, &vec![9u8; 8]);
+                assert_eq!(*type_covered, RecordType::DNSKEY);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// A tiny deterministic generator, so the fuzz-style tests are reproducible.
+    struct XorShift(u64);
+    impl XorShift {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+    }
+
+    #[test]
+    fn garbage_and_mutated_dnssec_messages_never_panic() {
+        let mut rng = XorShift(0x9e37_79b9_7f4a_7c15);
+        // Pure noise, with the header's section counts forced high so the record parser runs.
+        for _ in 0..20_000 {
+            let len = usize::try_from(rng.next() % 200).unwrap();
+            let mut buf: Vec<u8> = (0..len).map(|_| u8::try_from(rng.next() & 0xff).unwrap()).collect();
+            if buf.len() >= 12 {
+                buf[4] = 0;
+                buf[5] = 1;
+                buf[6] = 0;
+                buf[7] = u8::try_from(1 + rng.next() % 4).unwrap();
+            }
+            let _ = Message::from_bytes(&buf);
+        }
+        // Valid messages carrying every DNSSEC type, with random bit flips, truncation and
+        // length-field corruption.
+        let mut m = Message::response(9);
+        m.questions.push(Question::new(n("example.com"), RecordType::DNSKEY));
+        for data in dnssec_samples() {
+            m.answers.push(Record::new(n("example.com"), 1, data));
+        }
+        let good = m.to_bytes();
+        assert_eq!(Message::from_bytes(&good).unwrap().answers.len(), m.answers.len());
+        for _ in 0..30_000 {
+            let mut buf = good.clone();
+            for _ in 0..(1 + rng.next() % 4) {
+                let at = usize::try_from(rng.next()).unwrap() % buf.len();
+                buf[at] ^= u8::try_from(1 + rng.next() % 255).unwrap();
+            }
+            if rng.next().is_multiple_of(3) {
+                buf.truncate(usize::try_from(rng.next()).unwrap() % (buf.len() + 1));
+            }
+            let _ = Message::from_bytes(&buf);
+        }
+        for cut in 0..good.len() {
+            let _ = Message::from_bytes(&good[..cut]);
+        }
     }
 }
