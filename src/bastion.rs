@@ -168,7 +168,7 @@ pub fn next_session_id() -> u64 {
 }
 
 fn random_bytes_32() -> [u8; 32] {
-    let v = hashtrinity::crypto::rand_bytes(32);
+    let v = crate::prim::random_bytes(32);
     let mut out = [0u8; 32];
     out.copy_from_slice(&v);
     out

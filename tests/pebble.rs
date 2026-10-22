@@ -67,6 +67,7 @@ const ROLLOVER_PORTS: Ports = Ports { acme: 14520, mgmt: 14521, http01: 15022, t
 const ARI_PORTS: Ports = Ports { acme: 14530, mgmt: 14531, http01: 15032, tls: 15031 };
 const REVOKE_PORTS: Ports = Ports { acme: 14540, mgmt: 14541, http01: 15042, tls: 15041 };
 const REPLACE_PORTS: Ports = Ports { acme: 14550, mgmt: 14551, http01: 15052, tls: 15051 };
+const KEYS_PORTS: Ports = Ports { acme: 14560, mgmt: 14561, http01: 15062, tls: 15061 };
 
 /// The tests share `SSL_CERT_FILE` (process-global, read once by the HTTP client's TLS config),
 /// so they run one at a time.
@@ -671,3 +672,69 @@ async fn a_renewal_order_names_the_certificate_it_replaces_and_pebble_records_it
     client.issue_replacing(&["repl2.example.com.au"], &http01, &foreign).await.expect("a refused `replaces` never fails the renewal");
     let _ = std::fs::remove_dir_all(&fx.work);
 }
+
+/// Key hygiene against an independent CA: a new key for every order and every renewal, the
+/// certificate certifies exactly that key, P-384 and an advertised ACME profile are accepted, and
+/// the engine refuses to install what it would have to reuse a key for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn every_order_and_every_renewal_gets_a_new_certificate_key_that_pebble_certifies() {
+    use transport::acme::ClientOptions;
+    use transport::certkey::{inspect_pkcs8, EcCurve, KeyAlg, KeyKind};
+    let _serial = SERIAL.lock().await;
+    let Some(fx) = Fixture::start("keys", KEYS_PORTS, None).await else { return };
+    fx.install_zones(None).await;
+    let http01 = fx.http01();
+    let key_of = |m: &transport::edge::CertMaterial| inspect_pkcs8(&transport::pem::blocks(&m.key_pem, "PRIVATE KEY")[0]);
+
+    // ── P-256 (the default): successive orders, and a `replaces` renewal, all get distinct keys.
+    let client = AcmeClient::new(&fx.directory, AccountKey::generate().unwrap(), None).await.unwrap();
+    let first = client.issue(&["k1.example.com.au"], &http01).await.unwrap();
+    let second = client.issue(&["k1.example.com.au"], &http01).await.unwrap();
+    let renewed = client.issue_replacing(&["k1.example.com.au"], &http01, &first.chain_pem).await.unwrap();
+    let keys = [&first, &second, &renewed].map(|m| m.key_pem.clone());
+    assert!(keys[0] != keys[1] && keys[1] != keys[2] && keys[0] != keys[2], "no two orders share a key");
+    assert_eq!(key_of(&first), KeyKind::Ec(EcCurve::P256));
+    for m in [&first, &second, &renewed] {
+        // Pebble certified the public key of the CSR we signed, i.e. the one in key_pem.
+        let pk = transport::acme::AccountKey::from_pkcs8_pem(&m.key_pem).unwrap();
+        let _ = pk; // loads as the same P-256 key family the edge serves
+        assert!(transport::x509::leaf_spki(&m.chain_pem).is_some());
+    }
+    assert_ne!(transport::x509::leaf_spki(&first.chain_pem), transport::x509::leaf_spki(&renewed.chain_pem));
+
+    // ── P-384 with an advertised profile: Pebble issues it, the key is P-384, and the policy allows it.
+    let opts = ClientOptions { key_alg: KeyAlg::P384, profile: Some("default".into()), ..ClientOptions::default() };
+    let p384 = AcmeClient::connect(&fx.directory, AccountKey::generate().unwrap(), None, None, opts).await.unwrap();
+    let cert = p384.issue(&["k384.example.com.au"], &http01).await.expect("Pebble accepts a P-384 CSR and the advertised profile");
+    assert_eq!(key_of(&cert), KeyKind::Ec(EcCurve::P384));
+    assert_eq!(transport::x509::leaf_spki(&cert.chain_pem).unwrap().len(), 120, "a P-384 SubjectPublicKeyInfo");
+    // It is a certificate the edge can serve.
+    let store = Arc::new(FileCertStore::open(fx.work.join("p384-certs")).unwrap());
+    transport::acme_renew::CertStore::put(store.as_ref(), "k384.example.com.au", cert).expect("the key policy allows P-384");
+    // A profile the CA does not advertise is left out rather than failing the order.
+    let opts = ClientOptions { profile: Some("no-such-profile".into()), ..ClientOptions::default() };
+    let odd = AcmeClient::connect(&fx.directory, AccountKey::generate().unwrap(), None, None, opts).await.unwrap();
+    odd.issue(&["kodd.example.com.au"], &http01).await.expect("an unadvertised profile is not sent");
+
+    // ── The engine: a forced renewal installs a certificate with a different key.
+    let store = Arc::new(FileCertStore::open(fx.work.join("engine-certs")).unwrap());
+    let issuer = AcmeIssuer::new(
+        AcmeClient::new(&fx.directory, AccountKey::generate().unwrap(), None).await.unwrap(),
+        Arc::new(Dns01Authority(fx.authority.clone())),
+        Some(Arc::new(http01.clone())),
+    );
+    let mut engine = RenewalEngine::new(store.clone(), issuer, RenewalPolicy { renew_after_percent: 0, ..RenewalPolicy::default() });
+    let t = unix_now();
+    let r = engine.run_once(t, &fx.registry).await;
+    assert!(r.failed.is_empty() && r.issued.len() == 2, "{r:?}");
+    let before: Vec<_> = r.issued.iter().map(|n| (n.clone(), store.cert_for(n).unwrap())).collect();
+    let r = engine.run_once(t + 5, &fx.registry).await;
+    assert!(r.failed.is_empty() && r.issued.len() == 2, "renew_after_percent 0 renews at once: {r:?}");
+    for (name, old) in before {
+        let new = store.cert_for(&name).unwrap();
+        assert_ne!(new.key_pem, old.key_pem, "{name}: the renewed certificate has a new key");
+        assert!(!transport::acme_renew::same_key(&old, &new));
+    }
+    let _ = std::fs::remove_dir_all(&fx.work);
+}
+

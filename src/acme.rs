@@ -56,7 +56,8 @@
 //! listener, and no real DNS-01 resolver are available here. That is a real, disclosed gap,
 //! not a silently-assumed one.
 
-use std::sync::Mutex as StdMutex;
+use std::sync::{Arc, Mutex as StdMutex};
+use std::time::Duration;
 
 use hashtrinity::crypto::acme::{acme_key_authorization, b64url, jwk_thumbprint_ec_p256};
 use aws_lc_rs::hmac;
@@ -65,6 +66,7 @@ use aws_lc_rs::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_FIXED_SIGNIN
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use crate::certkey::{CertKeyGen, KeyAlg, KeyPolicy, OsCertKeyGen};
 use crate::edge::CertMaterial;
 use crate::http_client::Client;
 use crate::http_types::header;
@@ -90,6 +92,31 @@ pub enum AcmeError {
     AuthorizationFailed(String),
     OrderNotValid,
     ChallengeSetup,
+    /// Something on our side stopped the order before or after the CA was involved: the system
+    /// RNG failed generating the certificate key, the key was refused by the key policy, the CSR
+    /// could not be signed. Never a reason to try another CA.
+    Local(String),
+    /// The CA answered, but with a certificate or response that cannot be right: the issued
+    /// certificate does not certify the key we asked for, or lacks the names we asked for.
+    CaMisbehaved(String),
+}
+
+/// What kind of failure an [`AcmeError`] is — the input to the CA fail-over decision
+/// ([`crate::ca_resilience`]). The classes are deliberately few: the engine's only questions are
+/// "would another CA help?" and "does this count against this CA's health?".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FailureClass {
+    /// The CA is rate limiting this account or name set. Waiting is the answer; another CA is
+    /// not (and moving a rate-limited renewal elsewhere would hide the problem).
+    RateLimited,
+    /// Our side failed. Another CA cannot help and the CA's health is not in question.
+    Local,
+    /// The CA is unreachable, timing out, erroring (5xx, `serverInternal`) or returning junk.
+    CaSide,
+    /// The CA answered and refused: a 4xx problem, a failed authorization, an order that went
+    /// invalid. Might be our configuration (DNS, CAA) or the CA's policy; counts against the CA
+    /// after repeated occurrences, and a standby may be tried for the order.
+    Refused,
 }
 
 impl std::fmt::Display for AcmeError {
@@ -106,6 +133,8 @@ impl std::fmt::Display for AcmeError {
             AcmeError::AuthorizationFailed(url) => write!(f, "authorization {url} did not reach the valid state"),
             AcmeError::OrderNotValid => write!(f, "order did not reach the valid state after finalization"),
             AcmeError::ChallengeSetup => write!(f, "ACME challenge responder rejected publishing the proof"),
+            AcmeError::Local(s) => write!(f, "local failure before the CA could issue: {s}"),
+            AcmeError::CaMisbehaved(s) => write!(f, "the CA returned something that cannot be right: {s}"),
         }
     }
 }
@@ -118,6 +147,19 @@ impl AcmeError {
     #[must_use]
     pub fn is_problem(&self, kind: &str) -> bool {
         matches!(self, AcmeError::Rejected { detail, .. } if detail.contains(&format!("urn:ietf:params:acme:error:{kind}")))
+    }
+
+    /// How to treat this failure when deciding whether to change CA (see [`FailureClass`]).
+    #[must_use]
+    pub fn class(&self) -> FailureClass {
+        match self {
+            AcmeError::RateLimited { .. } => FailureClass::RateLimited,
+            AcmeError::ChallengeSetup | AcmeError::Local(_) => FailureClass::Local,
+            AcmeError::Http(_) | AcmeError::BadResponse(_) | AcmeError::MissingNonce | AcmeError::CaMisbehaved(_) => FailureClass::CaSide,
+            AcmeError::Rejected { status, .. } if *status >= 500 => FailureClass::CaSide,
+            AcmeError::Rejected { .. } if self.is_problem("serverInternal") => FailureClass::CaSide,
+            AcmeError::Rejected { .. } | AcmeError::AuthorizationFailed(_) | AcmeError::OrderNotValid => FailureClass::Refused,
+        }
     }
 
     /// Seconds the CA asked us to wait, if it said.
@@ -154,7 +196,16 @@ impl AccountKey {
     /// # Errors
     /// Only if the system RNG fails.
     pub fn generate() -> Result<Self, AcmeError> {
-        Ok(AccountKey { pair: std::sync::Arc::new(generate_ec_key()?) })
+        Self::generate_with(&OsCertKeyGen)
+    }
+
+    /// [`Self::generate`] through an explicit generator (the test seam; production is [`OsCertKeyGen`]).
+    ///
+    /// # Errors
+    /// If the generator fails.
+    pub fn generate_with(keygen: &dyn CertKeyGen) -> Result<Self, AcmeError> {
+        let pair = keygen.generate(KeyAlg::P256).map_err(|e| AcmeError::Local(e.to_string()))?;
+        Ok(AccountKey { pair: std::sync::Arc::new(pair) })
     }
 
     /// Wrap an existing 32-byte P-256 private scalar (e.g. loaded from a sealed store).
@@ -207,11 +258,11 @@ impl AccountKey {
     }
 
     /// ES256 over `message` (SHA-256 is applied inside), raw `r‖s` as JWS requires.
-    fn sign(&self, message: &[u8]) -> Vec<u8> {
+    fn sign(&self, message: &[u8]) -> Result<Vec<u8>, AcmeError> {
         self.pair
             .sign(&SystemRandom::new(), message)
             .map(|sig| sig.as_ref().to_vec())
-            .expect("ECDSA signing fails only on RNG/internal failure")
+            .map_err(|_| AcmeError::Local("ECDSA signing failed (system RNG or crypto module)".into()))
     }
 
     /// The JWK this key presents in `newAccount`'s protected header (no `kid` yet — the CA
@@ -236,6 +287,37 @@ impl AccountKey {
         xb.copy_from_slice(&xy[..32]);
         yb.copy_from_slice(&xy[32..]);
         jwk_thumbprint_ec_p256(&xb, &yb)
+    }
+}
+
+/// Load the 32-byte ACME account key at `path`, creating it (0600, atomically, from the system
+/// RNG) on first run. One account key per CA.
+///
+/// # Errors
+/// I/O failure, a malformed file, or an RNG failure. A damaged key is **never** silently replaced:
+/// a new key is a new ACME account, which would orphan the CAA `accounturi` published for the old.
+pub fn load_or_create_account_key(path: &std::path::Path) -> Result<AccountKey, AcmeError> {
+    load_or_create_account_key_with(path, &OsCertKeyGen)
+}
+
+/// [`load_or_create_account_key`] through an explicit generator (the test seam).
+///
+/// # Errors
+/// As [`load_or_create_account_key`].
+pub fn load_or_create_account_key_with(path: &std::path::Path, keygen: &dyn CertKeyGen) -> Result<AccountKey, AcmeError> {
+    let local = |m: String| AcmeError::Local(m);
+    match std::fs::read(path) {
+        Ok(bytes) => {
+            let arr: [u8; 32] = bytes.try_into().map_err(|_| local(format!("{} must be exactly 32 bytes", path.display())))?;
+            AccountKey::from_bytes(arr).map_err(|e| local(format!("{}: {e}", path.display())))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let key = AccountKey::generate_with(keygen)?;
+            let bytes = key.to_bytes()?;
+            crate::certkey::write_private_atomic(path, &bytes).map_err(|e| local(format!("{}: {e}", path.display())))?;
+            Ok(key)
+        }
+        Err(e) => Err(local(format!("{}: {e}", path.display()))),
     }
 }
 
@@ -294,16 +376,16 @@ impl std::fmt::Debug for ExternalAccountBinding {
 ///
 /// `payload_json` is `""` for a POST-as-GET (RFC 8555 §6.3) — the empty string, not `"{}"` or
 /// `null`, per the spec's own worked examples.
-fn flattened_jws(account: &AccountKey, protected: &Value, payload_json: &str) -> String {
+fn flattened_jws(account: &AccountKey, protected: &Value, payload_json: &str) -> Result<String, AcmeError> {
     let protected_b64 = b64url(protected.to_string().as_bytes());
     let payload_b64 = b64url(payload_json.as_bytes());
-    let sig = account.sign(format!("{protected_b64}.{payload_b64}").as_bytes());
-    json!({
+    let sig = account.sign(format!("{protected_b64}.{payload_b64}").as_bytes())?;
+    Ok(json!({
         "protected": protected_b64,
         "payload": payload_b64,
         "signature": b64url(&sig),
     })
-    .to_string()
+    .to_string())
 }
 
 /// How a request identifies its signer (RFC 8555 §6.2: exactly one of `jwk`/`kid`).
@@ -348,6 +430,17 @@ pub struct Directory {
     /// [`AcmeClient::revoke_certificate`] fail with an explanatory error.
     #[serde(rename = "revokeCert", default)]
     pub revoke_cert: Option<String>,
+    /// The CA's `meta` object: terms of service, and the ACME profiles it offers.
+    #[serde(default)]
+    pub meta: DirectoryMeta,
+}
+
+/// The parts of a directory's `meta` this client reads.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct DirectoryMeta {
+    /// Certificate profiles the CA offers (draft-ietf-acme-profiles): name -> description.
+    #[serde(default)]
+    pub profiles: std::collections::HashMap<String, String>,
 }
 
 /// Why a certificate is being revoked — the RFC 5280 `CRLReason` subset that RFC 8555 §7.6 and
@@ -509,9 +602,52 @@ fn header_str(resp: &crate::http_types::Response, name: &str) -> Option<String> 
     resp.headers().get(name).and_then(|v| v.to_str().ok()).map(str::to_string)
 }
 
+/// How an [`AcmeClient`] generates certificate keys and bounds its requests.
+#[derive(Clone)]
+pub struct ClientOptions {
+    /// Where certificate keys come from. Production: [`OsCertKeyGen`]; tests inject a failing one.
+    pub keygen: Arc<dyn CertKeyGen>,
+    /// The algorithm of the certificate key generated for each order.
+    pub key_alg: KeyAlg,
+    /// What a certificate key may be. Applied to the algorithm before generating and to the key
+    /// after.
+    pub key_policy: KeyPolicy,
+    /// How long one request to the CA (connect, send, read the whole answer) may take. The HTTP
+    /// client has no deadline of its own; without this a CA that accepts the connection and then
+    /// says nothing would hang issuance forever, which is the failure a CA-fail-over exists for.
+    pub request_timeout: Duration,
+    /// The ACME profile to request in `newOrder` (draft-ietf-acme-profiles) -- e.g. a CA's
+    /// `tlsserver` profile, which drops client-auth EKU and the subject common name. Sent only
+    /// when the CA's directory advertises that profile; otherwise the order is placed without it
+    /// (a CA that does not know a profile rejects the order, which would be worse than the default).
+    pub profile: Option<String>,
+}
+
+impl Default for ClientOptions {
+    fn default() -> Self {
+        ClientOptions { keygen: Arc::new(OsCertKeyGen), key_alg: KeyAlg::P256, key_policy: KeyPolicy::default(), request_timeout: Duration::from_secs(60), profile: None }
+    }
+}
+
+impl std::fmt::Debug for ClientOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClientOptions").field("key_alg", &self.key_alg).field("key_policy", &self.key_policy).field("request_timeout", &self.request_timeout).field("profile", &self.profile).finish_non_exhaustive()
+    }
+}
+
+/// `fut`, abandoned with an [`AcmeError::Http`] if it takes longer than `limit`.
+async fn bounded<T>(limit: Duration, what: &str, fut: impl std::future::Future<Output = Result<T, AcmeError>>) -> Result<T, AcmeError> {
+    match tokio::time::timeout(limit, fut).await {
+        Ok(r) => r,
+        Err(_) => Err(AcmeError::Http(crate::http_types::Error::Http(format!("{what} timed out after {}s", limit.as_secs())))),
+    }
+}
+
 /// One ACME account + its live nonce, driving the order/authorization/challenge/finalize state
 /// machine against a real ACME server via [`crate::http_client::Client`].
 pub struct AcmeClient {
+    directory_url: String,
+    opts: ClientOptions,
     directory: Directory,
     /// Behind a lock because [`Self::rollover_account_key`] swaps it; every request snapshots it
     /// (`AccountKey` is a cheap `Arc` clone), so a request is always signed by one whole key.
@@ -573,7 +709,7 @@ pub(crate) fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
 /// fraction truncated. Strict: fixed-width fields, a real calendar date, `T` between date and
 /// time, and a mandatory `Z`/`±HH:MM` offset — what ACME servers emit for RFC 9773's
 /// `suggestedWindow`, with nothing lenient to mis-parse a hostile response.
-fn parse_rfc3339(s: &str) -> Option<i64> {
+pub(crate) fn parse_rfc3339(s: &str) -> Option<i64> {
     let b = s.as_bytes();
     if !s.is_ascii() {
         return None;
@@ -645,13 +781,51 @@ impl AcmeClient {
         contact_email: Option<&str>,
         eab: Option<ExternalAccountBinding>,
     ) -> Result<Self, AcmeError> {
-        let body = Client::new().get(directory_url).send().await?.text().await?;
+        Self::connect(directory_url, account, contact_email, eab, ClientOptions::default()).await
+    }
+
+    /// [`Self::new_with_eab`] with explicit [`ClientOptions`]: the certificate key algorithm and
+    /// generator, the key policy and the per-request deadline.
+    ///
+    /// # Errors
+    /// As [`Self::new_with_eab`], plus a key algorithm the policy refuses.
+    pub async fn connect(
+        directory_url: &str,
+        account: AccountKey,
+        contact_email: Option<&str>,
+        eab: Option<ExternalAccountBinding>,
+        opts: ClientOptions,
+    ) -> Result<Self, AcmeError> {
+        opts.key_policy.check_alg(opts.key_alg).map_err(|e| AcmeError::Local(e.to_string()))?;
+        let body = bounded(opts.request_timeout, "fetching the ACME directory", async {
+            Ok(Client::new().get(directory_url).send().await?.text().await?)
+        })
+        .await?;
         let directory: Directory = serde_json::from_str(&body).map_err(|e| AcmeError::BadResponse(e.to_string()))?;
 
-        let client = AcmeClient { directory, account: StdMutex::new(account), kid: StdMutex::new(None), nonce: StdMutex::new(None) };
+        let client = AcmeClient {
+            directory_url: directory_url.to_string(),
+            opts,
+            directory,
+            account: StdMutex::new(account),
+            kid: StdMutex::new(None),
+            nonce: StdMutex::new(None),
+        };
         client.refresh_nonce().await?;
         client.create_account(contact_email, eab.as_ref()).await?;
         Ok(client)
+    }
+
+    /// The directory URL this client was created against.
+    #[must_use]
+    pub fn directory_url(&self) -> &str {
+        &self.directory_url
+    }
+
+    /// Whether the CA's directory advertises ACME Renewal Information (RFC 9773).
+    #[must_use]
+    pub fn supports_ari(&self) -> bool {
+        self.directory.renewal_info.is_some()
     }
 
     /// The key requests are signed with right now.
@@ -660,7 +834,7 @@ impl AcmeClient {
     }
 
     async fn refresh_nonce(&self) -> Result<(), AcmeError> {
-        let resp = Client::new().head(&self.directory.new_nonce).send().await?;
+        let resp = bounded(self.opts.request_timeout, "fetching an ACME nonce", async { Ok(Client::new().head(&self.directory.new_nonce).send().await?) }).await?;
         let nonce = header_str(&resp, "replay-nonce").ok_or(AcmeError::MissingNonce)?;
         *self.nonce.lock().unwrap() = Some(nonce);
         Ok(())
@@ -736,7 +910,7 @@ impl AcmeClient {
         }
         let inner_payload = json!({ "account": self.kid()?, "oldKey": old_key.jwk() });
         let inner_protected = json!({ "alg": "ES256", "jwk": new_key.jwk(), "url": url });
-        let inner = flattened_jws(&new_key, &inner_protected, &inner_payload.to_string());
+        let inner = flattened_jws(&new_key, &inner_protected, &inner_payload.to_string())?;
         // The outer JWS is built by `send_jws` like any kid-authenticated request, so it gets the
         // same nonce, `badNonce` and rate-limit handling, signed by the still-current old key.
         let (status, _, body) = self.send_signed(url, &inner).await?;
@@ -763,10 +937,13 @@ impl AcmeClient {
         let Some(base) = self.directory.renewal_info.as_deref() else { return Ok(None) };
         let id = ari_cert_id(chain_pem)
             .ok_or_else(|| AcmeError::BadResponse("certificate has no Authority Key Identifier keyIdentifier, so it has no ARI certificate ID".to_string()))?;
-        let resp = Client::new().get(format!("{}/{id}", base.trim_end_matches('/'))).send().await?;
-        let status = resp.status().as_u16();
-        let retry_after_secs = header_str(&resp, "retry-after").and_then(|v| parse_retry_after(&v, unix_now()));
-        let body = resp.text().await?;
+        let (status, retry_after_secs, body) = bounded(self.opts.request_timeout, "fetching renewal information", async {
+            let resp = Client::new().get(format!("{}/{id}", base.trim_end_matches('/'))).send().await?;
+            let status = resp.status().as_u16();
+            let retry_after_secs = header_str(&resp, "retry-after").and_then(|v| parse_retry_after(&v, unix_now()));
+            Ok((status, retry_after_secs, resp.text().await?))
+        })
+        .await?;
         match status {
             200 => parse_renewal_info(&body, retry_after_secs).map(Some),
             404 => Ok(None),
@@ -819,13 +996,16 @@ impl AcmeClient {
                 Auth::Kid => (account.clone(), protected_header_kid(&self.kid()?, &nonce, url)),
                 Auth::KeyJwk(key) => ((*key).clone(), protected_header_jwk(key, &nonce, url)),
             };
-            let jws = flattened_jws(&signer, &protected, payload_json);
-            let resp = Client::new().post(url).header(header::CONTENT_TYPE, "application/jose+json").body(jws.into_bytes()).send().await?;
-            self.store_nonce_from(&resp);
-            let status = resp.status().as_u16();
-            let location = header_str(&resp, header::LOCATION);
-            let retry_after_secs = header_str(&resp, "retry-after").and_then(|v| parse_retry_after(&v, unix_now()));
-            let body = resp.text().await?;
+            let jws = flattened_jws(&signer, &protected, payload_json)?;
+            let (status, location, retry_after_secs, body) = bounded(self.opts.request_timeout, "an ACME request", async {
+                let resp = Client::new().post(url).header(header::CONTENT_TYPE, "application/jose+json").body(jws.into_bytes()).send().await?;
+                self.store_nonce_from(&resp);
+                let status = resp.status().as_u16();
+                let location = header_str(&resp, header::LOCATION);
+                let retry_after_secs = header_str(&resp, "retry-after").and_then(|v| parse_retry_after(&v, unix_now()));
+                Ok((status, location, retry_after_secs, resp.text().await?))
+            })
+            .await?;
             if status == 429 || body.contains("urn:ietf:params:acme:error:rateLimited") {
                 return Err(AcmeError::RateLimited { retry_after_secs, detail: body });
             }
@@ -936,8 +1116,30 @@ impl AcmeClient {
     }
 
     async fn issue_with(&self, domains: &[&str], responder: ChallengeResponder<'_>, replaces: Option<String>) -> Result<CertMaterial, AcmeError> {
+        if domains.is_empty() || domains.len() > 100 {
+            return Err(AcmeError::Local(format!("an order needs between 1 and 100 names, not {}", domains.len())));
+        }
+        // The certificate key comes first, before the CA is asked for anything. A new one per
+        // order -- a renewal never reuses the key of the certificate it replaces -- generated by
+        // the injected generator and checked against the key policy. If the system RNG fails the
+        // order stops here: no authorization has been spent and no certificate for a predictable
+        // key can exist.
+        let alg = self.opts.key_alg;
+        self.opts.key_policy.check_alg(alg).map_err(|e| AcmeError::Local(e.to_string()))?;
+        let cert_key = self.opts.keygen.generate(alg).map_err(|e| AcmeError::Local(e.to_string()))?;
+        let key_pem = key_to_pkcs8_pem(&cert_key, alg)?;
+        self.opts.key_policy.check_pkcs8_pem(&key_pem).map_err(|e| AcmeError::Local(format!("the generated certificate key is refused: {e}")))?;
+        let csr_b64 = b64url(&csr(&cert_key, alg, domains)?);
+
         let identifiers: Vec<Value> = domains.iter().map(|d| json!({ "type": "dns", "value": d })).collect();
         let mut order_payload = json!({ "identifiers": identifiers });
+        if let Some(profile) = &self.opts.profile {
+            if self.directory.meta.profiles.contains_key(profile) {
+                order_payload["profile"] = json!(profile);
+            } else {
+                tracing::warn!(profile = %profile, "the CA does not advertise this ACME profile; ordering without one");
+            }
+        }
         if let Some(id) = &replaces {
             order_payload["replaces"] = json!(id);
         }
@@ -961,9 +1163,6 @@ impl AcmeClient {
             self.complete_authorization(authz_url, &responder).await?;
         }
 
-        let cert_key = generate_cert_key();
-        let csr = csr_p256(&cert_key, domains);
-        let csr_b64 = b64url(&csr);
         let (status, body) = self.post_signed(&order.finalize, &json!({ "csr": csr_b64 }).to_string()).await?;
         if !(200..300).contains(&status) {
             return Err(AcmeError::Rejected { status, detail: body });
@@ -991,7 +1190,8 @@ impl AcmeClient {
             return Err(AcmeError::Rejected { status, detail: chain_pem });
         }
 
-        Ok(CertMaterial { chain_pem, key_pem: p256_key_to_pkcs8_pem(&cert_key) })
+        verify_issued(&chain_pem, &cert_key, alg, domains)?;
+        Ok(CertMaterial { chain_pem, key_pem })
     }
 
     async fn complete_authorization(&self, authz_url: &str, responder: &ChallengeResponder<'_>) -> Result<(), AcmeError> {
@@ -1215,64 +1415,89 @@ pub(crate) mod der {
 }
 
 // OID contents (without tag/length).
-const OID_EC_PUBLIC_KEY: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01]; // 1.2.840.10045.2.1
-const OID_PRIME256V1: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07]; // 1.2.840.10045.3.1.7
+#[cfg(test)]
 const OID_ECDSA_SHA256: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02]; // 1.2.840.10045.4.3.2
 const OID_EXTENSION_REQUEST: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x09, 0x0e]; // 1.2.840.113549.1.9.14
 const OID_SUBJECT_ALT_NAME: &[u8] = &[0x55, 0x1d, 0x11]; // 2.5.29.17
 const OID_AUTHORITY_KEY_IDENTIFIER: &[u8] = &[0x55, 0x1d, 0x23]; // 2.5.29.35
 
-fn generate_ec_key() -> Result<EcdsaKeyPair, AcmeError> {
-    EcdsaKeyPair::generate(&ECDSA_P256_SHA256_FIXED_SIGNING)
-        .map_err(|_| AcmeError::BadResponse("system RNG failed generating a P-256 key".into()))
-}
-
-/// A fresh certificate private key (a new one per order: a renewal must not reuse the key of the
-/// certificate it replaces).
-pub(crate) fn generate_cert_key() -> EcdsaKeyPair {
-    generate_ec_key().expect("system RNG available")
-}
-
-/// SEC1 uncompressed point `04 ‖ x ‖ y`.
-fn p256_point(pair: &EcdsaKeyPair) -> Vec<u8> {
+/// The SEC1 uncompressed point `04 ‖ x ‖ y`.
+fn ec_point(pair: &EcdsaKeyPair) -> Vec<u8> {
     pair.public_key().as_ref().to_vec()
 }
 
-fn ec_algorithm_identifier() -> Vec<u8> {
-    der::seq(&[der::tlv(0x06, OID_EC_PUBLIC_KEY), der::tlv(0x06, OID_PRIME256V1)])
-}
-
 /// Raw `r‖s` -> DER `SEQUENCE { INTEGER r, INTEGER s }` (what X.509/PKCS#10 carry).
-fn ecdsa_sig_der(raw: &[u8; 64]) -> Vec<u8> {
-    der::seq(&[der::uint(&raw[..32]), der::uint(&raw[32..])])
+fn ecdsa_sig_der(raw: &[u8]) -> Vec<u8> {
+    let (r, s) = raw.split_at(raw.len() / 2);
+    der::seq(&[der::uint(r), der::uint(s)])
 }
 
-/// A PKCS#10 CSR (ECDSA P-256 / SHA-256) with `domains` as dNSName SANs and an empty subject —
-/// the ACME `finalize` request body. CAs take the identifiers from the SAN, not the subject.
-pub(crate) fn csr_p256(pair: &EcdsaKeyPair, domains: &[&str]) -> Vec<u8> {
+/// A PKCS#10 CSR (ECDSA / SHA-2 matching the key's curve) with `domains` as dNSName SANs and an
+/// empty subject — the ACME `finalize` request body. CAs take the identifiers from the SAN, not
+/// the subject.
+pub(crate) fn csr(pair: &EcdsaKeyPair, alg: KeyAlg, domains: &[&str]) -> Result<Vec<u8>, AcmeError> {
     let names: Vec<Vec<u8>> = domains.iter().map(|d| der::tlv(0x82, d.as_bytes())).collect(); // [2] dNSName
     let san_ext = der::seq(&[der::tlv(0x06, OID_SUBJECT_ALT_NAME), der::tlv(0x04, &der::seq(&names))]);
     let ext_req = der::seq(&[der::tlv(0x06, OID_EXTENSION_REQUEST), der::tlv(0x31, &der::seq(&[san_ext]))]);
-    let spki = der::seq(&[ec_algorithm_identifier(), der::bit_string(&p256_point(pair))]);
+    let spki = crate::certkey::spki_der(pair, alg);
     let cri = der::seq(&[der::uint(&[0]), der::seq(&[]), spki, der::tlv(0xA0, &ext_req)]);
-    let sig = pair.sign(&SystemRandom::new(), &cri).expect("ECDSA signing fails only on RNG/internal failure");
-    let raw: [u8; 64] = sig.as_ref().try_into().expect("fixed-format P-256 signature is 64 bytes");
-    der::seq(&[cri, der::seq(&[der::tlv(0x06, OID_ECDSA_SHA256)]), der::bit_string(&ecdsa_sig_der(&raw))])
+    let sig = pair.sign(&SystemRandom::new(), &cri).map_err(|_| AcmeError::Local("could not sign the CSR (system RNG or crypto module)".into()))?;
+    if sig.as_ref().len() != 2 * alg.component_len() {
+        return Err(AcmeError::Local("the CSR signature has an unexpected length".into()));
+    }
+    Ok(der::seq(&[cri, der::seq(&[der::tlv(0x06, alg.signature_oid())]), der::bit_string(&ecdsa_sig_der(sig.as_ref()))]))
 }
 
-/// PKCS#8 `PrivateKeyInfo` for a P-256 key, PEM-wrapped, in the shape `openssl genpkey` emits
-/// (the SEC1 `ECPrivateKey` carries the public point) — what `CertMaterial::key_pem` promises
-/// and what `servelet_tls::tls_server_config` / `hashtrinity::rustls` load.
-pub(crate) fn p256_key_to_pkcs8_pem(pair: &EcdsaKeyPair) -> String {
+/// PKCS#8 `PrivateKeyInfo` for an EC key, PEM-wrapped, in the shape `openssl genpkey` emits (the
+/// SEC1 `ECPrivateKey` carries the public point) — what `CertMaterial::key_pem` promises and what
+/// the serving provider loads.
+pub(crate) fn key_to_pkcs8_pem(pair: &EcdsaKeyPair, alg: KeyAlg) -> Result<String, AcmeError> {
     use aws_lc_rs::encoding::{AsBigEndian, EcPrivateKeyBin};
-    let sk: EcPrivateKeyBin<'static> = pair.private_key().as_be_bytes().expect("export P-256 scalar");
+    let sk: EcPrivateKeyBin<'static> = pair.private_key().as_be_bytes().map_err(|_| AcmeError::Local("could not export the certificate key".into()))?;
     let ec_private_key = der::seq(&[
         der::uint(&[1]),
         der::tlv(0x04, sk.as_ref()),
-        der::tlv(0xA1, &der::bit_string(&p256_point(pair))), // [1] publicKey
+        der::tlv(0xA1, &der::bit_string(&ec_point(pair))), // [1] publicKey
     ]);
-    let pkcs8 = der::seq(&[der::uint(&[0]), ec_algorithm_identifier(), der::tlv(0x04, &ec_private_key)]);
-    pem_wrap("PRIVATE KEY", &pkcs8)
+    let pkcs8 = der::seq(&[der::uint(&[0]), crate::certkey::ec_algorithm_identifier(alg), der::tlv(0x04, &ec_private_key)]);
+    Ok(pem_wrap("PRIVATE KEY", &pkcs8))
+}
+
+/// What a CA's answer must satisfy before it is believed: the leaf certifies **the key we
+/// generated for this order** (a CA that certifies some other key has either mis-issued or been
+/// confused with another order, and a certificate for a key we do not hold is useless at best),
+/// and it covers every name we asked for. A failure is [`AcmeError::CaMisbehaved`]: it is the CA's
+/// output that is wrong, and the engine counts it against the CA.
+pub(crate) fn verify_issued(chain_pem: &str, pair: &EcdsaKeyPair, alg: KeyAlg, domains: &[&str]) -> Result<(), AcmeError> {
+    let leaf = crate::x509::leaf_der(chain_pem).ok_or_else(|| AcmeError::CaMisbehaved("the issued chain has no certificate".into()))?;
+    let cert = crate::x509::parse(&leaf).ok_or_else(|| AcmeError::CaMisbehaved("the issued leaf is not a parsable certificate".into()))?;
+    if cert.spki != crate::certkey::spki_der(pair, alg).as_slice() {
+        return Err(AcmeError::CaMisbehaved("the issued certificate does not certify the key generated for this order".into()));
+    }
+    let have = cert.dns_names();
+    for want in domains {
+        if !have.iter().any(|h| h.eq_ignore_ascii_case(want)) {
+            return Err(AcmeError::CaMisbehaved(format!("the issued certificate does not cover {want}")));
+        }
+    }
+    Ok(())
+}
+
+/// Test helpers: a P-256 key, its CSR and PKCS#8 PEM. The production path is
+/// [`AcmeClient`]'s `issue_with`, which goes through [`ClientOptions::keygen`].
+#[cfg(test)]
+pub(crate) fn generate_cert_key() -> EcdsaKeyPair {
+    EcdsaKeyPair::generate(&ECDSA_P256_SHA256_FIXED_SIGNING).unwrap()
+}
+
+#[cfg(test)]
+pub(crate) fn csr_p256(pair: &EcdsaKeyPair, domains: &[&str]) -> Vec<u8> {
+    csr(pair, KeyAlg::P256, domains).unwrap()
+}
+
+#[cfg(test)]
+pub(crate) fn p256_key_to_pkcs8_pem(pair: &EcdsaKeyPair) -> String {
+    key_to_pkcs8_pem(pair, KeyAlg::P256).unwrap()
 }
 
 pub(crate) fn pem_wrap(label: &str, der: &[u8]) -> String {
@@ -1332,7 +1557,7 @@ mod tests {
     fn flattened_jws_has_three_string_fields_not_the_compact_dot_form() {
         let account = test_account();
         let protected = protected_header_jwk(&account, "test-nonce", "https://example.test/new-account");
-        let jws = flattened_jws(&account, &protected, "{}");
+        let jws = flattened_jws(&account, &protected, "{}").unwrap();
         let parsed: Value = serde_json::from_str(&jws).unwrap();
         assert!(parsed["protected"].is_string());
         assert!(parsed["payload"].is_string());
@@ -1515,7 +1740,7 @@ mod tests {
         assert_ne!(generated.thumbprint(), fixed.thumbprint());
         // What aws-lc signs, the (independent) verifier in hashtrinity accepts: r||s over SHA-256.
         let msg = b"protected.payload";
-        let sig: [u8; 64] = generated.sign(msg).try_into().unwrap();
+        let sig: [u8; 64] = generated.sign(msg).unwrap().try_into().unwrap();
         assert!(hashtrinity::crypto::ecdsa_p256_verify(&generated.xy(), &sha256(msg), &sig));
         assert!(!hashtrinity::crypto::ecdsa_p256_verify(&fixed.xy(), &sha256(msg), &sig));
     }
@@ -1586,6 +1811,12 @@ mod tests {
             pub rate_limit_new_order: bool,
             pub challenged: Vec<u32>,
             pub finalized_csr_ok: bool,
+            /// The public point `x‖y` of the CSR the CA last finalized, which the certificate it
+            /// hands out then certifies (a real CA certifies the CSR's key).
+            pub csr_point: Option<[u8; 64]>,
+            /// Serial number content octets of issued leaves (default: a counter).
+            pub leaf_serial: Option<Vec<u8>>,
+            pub issued: u32,
             pub bad_nonce_seen: u32,
             pub dns: Option<Arc<FakeDns>>,
             /// `(kid, hmac key)` of the one external account this CA knows.
@@ -1607,6 +1838,8 @@ mod tests {
             pub last_jwk: Option<[u8; 64]>,
             /// Leave `revokeCert` out of the directory.
             pub no_revoke_cert: bool,
+            /// Profiles advertised in the directory's `meta`.
+            pub profiles: Vec<String>,
             /// Certificate returned for every order (default: a placeholder that is not a real
             /// certificate).
             pub cert_pem: Option<String>,
@@ -1791,6 +2024,10 @@ mod tests {
                         if !st.no_revoke_cert {
                             dir.push_str(&format!(r#","revokeCert":"{b}/revoke-cert""#));
                         }
+                        if !st.profiles.is_empty() {
+                            let list: Vec<String> = st.profiles.iter().map(|p| format!(r#""{p}":"{p} profile""#)).collect();
+                            dir.push_str(&format!(r#","meta":{{"profiles":{{{}}}}}"#, list.join(",")));
+                        }
                         dir.push('}');
                         dir
                     },
@@ -1870,13 +2107,14 @@ mod tests {
                             let v: Value = serde_json::from_str(&payload).unwrap();
                             let csr = b64url_decode_for_test(v["csr"].as_str().unwrap());
                             let (cri, pk, sig) = split_csr(&csr);
+                            st.csr_point = Some(pk);
                             st.finalized_csr_ok = hashtrinity::crypto::ecdsa_p256_verify(&pk, &sha256(&cri), &sig)
                                 && cri.windows(14).any(|w| w == b"*.tascloud.app");
                             let b = st.base.clone();
                             ok(st, 200, vec![], format!(r#"{{"status":"valid","authorizations":[],"finalize":"{b}/finalize/1","certificate":"{b}/cert/1"}}"#))
                         }
                         "/cert/1" => {
-                            let pem = st.cert_pem.clone().unwrap_or_else(|| "-----BEGIN CERTIFICATE-----\nZmFrZQ==\n-----END CERTIFICATE-----\n".into());
+                            let pem = st.cert_pem.clone().unwrap_or_else(|| issue_for_csr(st));
                             ok(st, 200, vec![], pem)
                         }
                         "/revoke-cert" => {
@@ -1945,6 +2183,40 @@ mod tests {
                 out.push_str(&reply.body);
             }
             let _ = conn.write_all(out.as_bytes()).await;
+        }
+
+        /// A real certificate (AKI = the RFC 9773 vector's, so it has an ARI ID) for the key in the
+        /// CSR the CA last finalized and the names of the order it last accepted — what a CA does.
+        fn issue_for_csr(st: &mut State) -> String {
+            struct CsrKey(Vec<u8>);
+            impl rcgen::PublicKeyData for CsrKey {
+                fn der_bytes(&self) -> &[u8] {
+                    &self.0
+                }
+                fn algorithm(&self) -> &rcgen::SignatureAlgorithm {
+                    &rcgen::PKCS_ECDSA_P256_SHA256
+                }
+            }
+            let names: Vec<String> = st
+                .orders
+                .last()
+                .and_then(|o| o["identifiers"].as_array().cloned())
+                .map(|a| a.iter().filter_map(|i| i["value"].as_str().map(str::to_string)).collect())
+                .unwrap_or_default();
+            let point = st.csr_point.expect("a certificate is fetched only after finalize");
+            let mut sec1 = vec![0x04];
+            sec1.extend_from_slice(&point);
+            st.issued += 1;
+            let ca_key = rcgen::KeyPair::generate().unwrap();
+            let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+            ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+            ca_params.key_identifier_method = rcgen::KeyIdMethod::PreSpecified(super::RFC9773_AKI.to_vec());
+            let ca = ca_params.self_signed(&ca_key).unwrap();
+            let mut params = rcgen::CertificateParams::new(names).unwrap();
+            let serial = st.leaf_serial.clone().unwrap_or_else(|| st.issued.to_be_bytes().to_vec());
+            params.serial_number = Some(rcgen::SerialNumber::from_slice(&serial));
+            params.use_authority_key_identifier_extension = true;
+            params.signed_by(&CsrKey(sec1), &ca, &ca_key).unwrap().pem()
         }
 
         pub async fn start(account: &AccountKey) -> (String, Arc<Mutex<State>>, Arc<FakeDns>) {
@@ -2497,7 +2769,7 @@ mod tests {
         let pem = p256_key_to_pkcs8_pem(&key);
         let signer = AccountKey::from_pkcs8_pem(&pem).expect("the PEM this module writes loads");
         assert_eq!(signer.xy().as_slice(), &key.public_key().as_ref()[1..], "same key");
-        let sig: [u8; 64] = signer.sign(b"m").try_into().unwrap();
+        let sig: [u8; 64] = signer.sign(b"m").unwrap().try_into().unwrap();
         assert!(hashtrinity::crypto::ecdsa_p256_verify(&signer.xy(), &sha256(b"m"), &sig));
 
         let ed25519 = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap().serialize_pem();
@@ -2516,7 +2788,7 @@ mod tests {
         {
             let mut st = state.lock().unwrap();
             st.ari = Some((200, None, ARI_BODY.to_string()));
-            st.cert_pem = Some(pem.clone());
+            st.leaf_serial = Some(vec![0x87, 0x65, 0x43, 0x21]);
         }
         (dir, state, dns, account, pem)
     }
@@ -2580,5 +2852,186 @@ mod tests {
         assert_eq!(d.revoke_cert.as_deref(), Some("https://x/r"));
         let bare: Directory = serde_json::from_str(r#"{"newNonce":"https://x/n","newAccount":"https://x/a","newOrder":"https://x/o"}"#).unwrap();
         assert_eq!(bare.revoke_cert, None);
+    }
+
+    // ── Entropy, key policy and CA-output checks ─────────────────────────────────────────
+
+    /// A key generator whose RNG has failed.
+    #[derive(Debug)]
+    struct FailingKeyGen;
+    impl CertKeyGen for FailingKeyGen {
+        fn generate(&self, _: KeyAlg) -> Result<EcdsaKeyPair, crate::certkey::KeyGenError> {
+            Err(crate::certkey::KeyGenError("injected RNG failure".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn issuance_fails_closed_before_the_ca_is_asked_for_anything_when_the_rng_fails() {
+        let account = test_account();
+        let (dir, state, dns) = mock_ca::start(&account).await;
+        let opts = ClientOptions { keygen: Arc::new(FailingKeyGen), ..ClientOptions::default() };
+        let client = AcmeClient::connect(&dir, account, None, None, opts).await.expect("registering the account needs no certificate key");
+        let err = client.issue_dns01(&ALL_NAMES, dns.as_ref()).await.expect_err("no key, no certificate");
+        assert!(matches!(&err, AcmeError::Local(m) if m.contains("injected RNG failure")), "{err}");
+        assert_eq!(err.class(), FailureClass::Local, "our failure is never held against the CA");
+        let st = state.lock().unwrap();
+        assert!(st.orders.is_empty(), "no order was placed, so no authorization was spent: {:?}", st.orders);
+        assert!(st.challenged.is_empty());
+        assert_eq!(st.issued, 0);
+    }
+
+    #[test]
+    fn an_account_key_is_not_generated_when_the_rng_fails() {
+        assert!(matches!(AccountKey::generate_with(&FailingKeyGen), Err(AcmeError::Local(_))));
+    }
+
+    #[tokio::test]
+    async fn every_order_gets_a_new_key_and_the_certificate_certifies_it() {
+        let account = test_account();
+        let (dir, _state, dns) = mock_ca::start(&account).await;
+        let client = AcmeClient::new(&dir, account, None).await.unwrap();
+        let a = client.issue_dns01(&ALL_NAMES, dns.as_ref()).await.unwrap();
+        let b = client.issue_dns01_replacing(&ALL_NAMES, dns.as_ref(), &a.chain_pem).await.unwrap();
+        assert_ne!(a.key_pem, b.key_pem, "a renewal must not reuse the key of the certificate it replaces");
+        assert_ne!(crate::x509::leaf_spki(&a.chain_pem), crate::x509::leaf_spki(&b.chain_pem));
+        for m in [&a, &b] {
+            let key = AccountKey::from_pkcs8_pem(&m.key_pem).unwrap();
+            let spki = crate::x509::leaf_spki(&m.chain_pem).unwrap();
+            let pk = key.pair.public_key().as_ref().to_vec();
+            assert!(spki.ends_with(&pk), "the leaf certifies the key in key_pem");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_ca_that_certifies_some_other_key_or_other_names_is_refused() {
+        let account = test_account();
+        let (dir, state, dns) = mock_ca::start(&account).await;
+        let client = AcmeClient::new(&dir, account, None).await.unwrap();
+        // A well-formed certificate for a different key.
+        let (other_chain, _, _) = rcgen_leaf_with_key(&[9]);
+        state.lock().unwrap().cert_pem = Some(other_chain);
+        let err = client.issue_dns01(&ALL_NAMES, dns.as_ref()).await.expect_err("the key is not ours");
+        assert!(matches!(&err, AcmeError::CaMisbehaved(m) if m.contains("does not certify the key")), "{err}");
+        assert_eq!(err.class(), FailureClass::CaSide, "mis-issuance counts against the CA");
+        // A certificate for the right key family but a name we did not ask for, and no certificate at all.
+        let pair = generate_cert_key();
+        let (chain, _, _) = rcgen_leaf_with_key(&[1]);
+        let err = verify_issued(&chain, &pair, KeyAlg::P256, &["app.acme.com.au"]).unwrap_err();
+        assert!(matches!(&err, AcmeError::CaMisbehaved(m) if m.contains("does not certify the key")), "{err}");
+        assert!(verify_issued("garbage", &pair, KeyAlg::P256, &["x.test"]).is_err());
+    }
+
+    #[test]
+    fn a_p384_csr_and_key_are_well_formed_and_the_policy_gate_applies() {
+        use aws_lc_rs::signature::{UnparsedPublicKey, ECDSA_P384_SHA384_ASN1};
+        let pair = OsCertKeyGen.generate(KeyAlg::P384).unwrap();
+        let csr_der = csr(&pair, KeyAlg::P384, &["a.example.test"]).unwrap();
+        let (_, csr_body, _) = der::read(&csr_der).unwrap();
+        let (t, _, rest) = der::read(csr_body).unwrap();
+        assert_eq!(t, 0x30);
+        let cri = &csr_body[..csr_body.len() - rest.len()];
+        let (_, alg, rest) = der::read(rest).unwrap();
+        assert_eq!(der::read(alg).unwrap().1, KeyAlg::P384.signature_oid());
+        let (bit_tag, bits, _) = der::read(rest).unwrap();
+        assert_eq!(bit_tag, 0x03);
+        // The signature (a DER ECDSA-Sig-Value after the unused-bits octet) verifies under the CSR's public key.
+        UnparsedPublicKey::new(&ECDSA_P384_SHA384_ASN1, pair.public_key().as_ref()).verify(cri, &bits[1..]).expect("P-384 CSR signature");
+        let pem = key_to_pkcs8_pem(&pair, KeyAlg::P384).unwrap();
+        assert_eq!(KeyPolicy::default().check_pkcs8_pem(&pem).unwrap(), crate::certkey::KeyKind::Ec(crate::certkey::EcCurve::P384));
+        assert!(KeyPolicy { allow_p384: false, ..KeyPolicy::default() }.check_pkcs8_pem(&pem).is_err());
+    }
+
+    #[tokio::test]
+    async fn a_client_configured_with_a_refused_key_algorithm_does_not_start() {
+        let account = test_account();
+        let (dir, _state, _dns) = mock_ca::start(&account).await;
+        let opts = ClientOptions { key_alg: KeyAlg::P384, key_policy: KeyPolicy { allow_p384: false, ..KeyPolicy::default() }, ..ClientOptions::default() };
+        let err = AcmeClient::connect(&dir, account, None, None, opts).await.err().expect("P-384 is not allowed by this policy");
+        assert!(matches!(err, AcmeError::Local(_)), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_ca_that_accepts_the_connection_and_says_nothing_times_out_as_a_ca_side_failure() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/directory", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((c, _)) = listener.accept().await {
+                held.push(c); // never answers
+            }
+        });
+        let opts = ClientOptions { request_timeout: Duration::from_millis(300), ..ClientOptions::default() };
+        let started = std::time::Instant::now();
+        let err = AcmeClient::connect(&url, test_account(), None, None, opts).await.err().expect("must not hang");
+        assert!(started.elapsed() < Duration::from_secs(5), "took {:?}", started.elapsed());
+        assert!(err.to_string().contains("timed out"), "{err}");
+        assert_eq!(err.class(), FailureClass::CaSide);
+    }
+
+    #[test]
+    fn failures_are_classed_for_the_fail_over_decision() {
+        use FailureClass::*;
+        let rejected = |status, detail: &str| AcmeError::Rejected { status, detail: detail.into() };
+        assert_eq!(AcmeError::RateLimited { retry_after_secs: None, detail: String::new() }.class(), RateLimited);
+        assert_eq!(rejected(503, "").class(), CaSide);
+        assert_eq!(rejected(500, "").class(), CaSide);
+        assert_eq!(rejected(200, r#"{"type":"urn:ietf:params:acme:error:serverInternal"}"#).class(), CaSide);
+        assert_eq!(rejected(403, r#"{"type":"urn:ietf:params:acme:error:unauthorized"}"#).class(), Refused);
+        assert_eq!(rejected(400, r#"{"type":"urn:ietf:params:acme:error:rejectedIdentifier"}"#).class(), Refused);
+        assert_eq!(AcmeError::AuthorizationFailed("x".into()).class(), Refused);
+        assert_eq!(AcmeError::OrderNotValid.class(), Refused);
+        assert_eq!(AcmeError::MissingNonce.class(), CaSide);
+        assert_eq!(AcmeError::BadResponse("x".into()).class(), CaSide);
+        assert_eq!(AcmeError::CaMisbehaved("x".into()).class(), CaSide);
+        assert_eq!(AcmeError::Http(crate::http_types::Error::Http("x".into())).class(), CaSide);
+        assert_eq!(AcmeError::ChallengeSetup.class(), Local);
+        assert_eq!(AcmeError::Local("x".into()).class(), Local);
+    }
+
+    #[test]
+    fn certificate_material_never_prints_its_key() {
+        let pair = generate_cert_key();
+        let material = CertMaterial { chain_pem: "chain".into(), key_pem: p256_key_to_pkcs8_pem(&pair) };
+        let shown = format!("{material:?}");
+        assert!(!shown.contains("PRIVATE") && !shown.contains(&material.key_pem[28..60]), "{shown}");
+        assert!(shown.contains("<redacted>"));
+    }
+
+    #[test]
+    fn the_account_key_is_created_0600_once_and_a_damaged_one_is_never_replaced() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("acct-key-{}", crate::entropy::random_hex(6).unwrap()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("acct.key");
+        // RNG failure: nothing is written.
+        assert!(matches!(load_or_create_account_key_with(&path, &FailingKeyGen), Err(AcmeError::Local(_))));
+        assert!(!path.exists());
+        let first = load_or_create_account_key(&path).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(std::fs::read(&path).unwrap().len(), 32);
+        let again = load_or_create_account_key(&path).unwrap();
+        assert_eq!(first.thumbprint(), again.thumbprint(), "the same account on every start");
+        std::fs::write(&path, b"short").unwrap();
+        assert!(load_or_create_account_key(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"short", "a damaged key is left alone, not replaced");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_profile_is_requested_only_when_the_ca_advertises_it() {
+        let account = test_account();
+        let (dir, state, dns) = mock_ca::start(&account).await;
+        state.lock().unwrap().profiles = vec!["tlsserver".into(), "classic".into()];
+        let with = |profile: &str| ClientOptions { profile: Some(profile.into()), ..ClientOptions::default() };
+        let client = AcmeClient::connect(&dir, account.clone(), None, None, with("tlsserver")).await.unwrap();
+        client.issue_dns01(&ALL_NAMES, dns.as_ref()).await.unwrap();
+        let client = AcmeClient::connect(&dir, account.clone(), None, None, with("shortlived")).await.unwrap();
+        client.issue_dns01(&ALL_NAMES, dns.as_ref()).await.unwrap();
+        let client = AcmeClient::connect(&dir, account, None, None, ClientOptions::default()).await.unwrap();
+        client.issue_dns01(&ALL_NAMES, dns.as_ref()).await.unwrap();
+        let orders = state.lock().unwrap().orders.clone();
+        assert_eq!(orders[0]["profile"], "tlsserver");
+        assert!(orders[1].get("profile").is_none(), "an unadvertised profile is left out rather than failing the order: {}", orders[1]);
+        assert!(orders[2].get("profile").is_none());
     }
 }

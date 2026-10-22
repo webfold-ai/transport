@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.4.0 — CA trust resilience, certificate-key hygiene
+
+**BREAKING** (additive types, but struct literals break): `CertStatus` gains `ca`/`migration`;
+`RenewalPolicy` gains `migration_per_run`; `ZoneConfig` gains `caa_records`; `dns_health::CaaPolicy` gains
+`issuers`; `AcmeError` gains `Local`/`CaMisbehaved`; `AcmeClient` internals take `ClientOptions`;
+`CertMaterial`'s `Debug` no longer prints the key.
+
+### Multiple CAs
+- **`ca_policy`**: an operator-configured allow-list of CAs (directory, CAA domain, account, EAB, status
+  `active|standby|retiring|distrusted`). Issuance only from active/standby; `CaPolicy::admit` refuses a CA not on
+  the list. CAA is the union of the CAs that may issue, each bound to its own account, with `issuewild`
+  (`edge_dns::CaaRecords`, `ZoneConfig::with_caa_records`, `dns_health::IssuerExpectation`).
+- **`ca_resilience`**: `MultiCaIssuer` (a `CertIssuer`): per-order fall-back to the next CA on CA-side failures
+  (never on rate limits or our own failures), bench with doubling and cap, daily fall-back budget, journal,
+  ledger of who issued what, account book, alerts; `AcmeCaConnector`.
+- **`acme_renew`**: certificates from a retiring/distrusted CA are renewed early / first with their own budget;
+  replaced certificates of a distrusted CA are queued for revocation at that CA. `CertIssuer::{migration,ca_name}`.
+- **`ca_trust`**: Mozilla CCADB (CSV) and Chrome Root Store (text-proto) parsers and the distrust evaluation
+  (`trusted | distrust_pending | distrusted | unknown`); fetches are HTTPS, bounded, no redirects; a failure is
+  `unknown`, never an action.
+- **`ct_monitor`**: certificates for our names in CT (crt.sh JSON behind `CtSource`) that we did not order;
+  SCT presence in what we obtained.
+- `AcmeClient`: request deadlines, ACME profile (`meta.profiles`), `ClientOptions`, `AcmeError::class()`.
+
+### Keys and entropy
+- **`entropy`**: OS CSPRNG through aws-lc-rs, the start-up self-check, weak-secret gate. **`certkey`**: key policy
+  (P-256/P-384; RSA >= 3072 imported only), `CertKeyGen` seam, `write_private_atomic` (exclusive, 0600, fsync,
+  rename). **`x509`**: a small certificate reader.
+- A new key per order, generated before the order; the CA's certificate must certify that key and the names; a
+  renewal that reuses the previous key is refused; P-384 CSRs; `FileCertStore` shreds stale temp files and
+  restricts loosened key files; `prim::random_bytes` replaces `hashtrinity::crypto::rand_bytes` in handshakes.
+
 ## 0.3.0 — certificate lifecycle, edge admission, aws-lc-rs
 
 **BREAKING** (see "Migration" at the end).

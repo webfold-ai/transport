@@ -394,6 +394,45 @@ pub struct CaaPolicy {
     /// The validation method we use for customer names (`http-01`): a customer CAA whose
     /// `validationmethods` excludes it blocks us.
     pub customer_method: Option<String>,
+    /// Per-CA expectations, for a platform with more than one CA. When an issuer domain appears
+    /// here, entries for it are checked against *these* accounts and methods instead of
+    /// `account_uri`/`validation_methods`; the domain is also allowed without being listed in
+    /// `allowed_issuers`. Several rows may share a domain (two accounts at one CA).
+    pub issuers: Vec<IssuerExpectation>,
+}
+
+/// What the CAA entries for one issuer domain should look like.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct IssuerExpectation {
+    pub domain: String,
+    /// The account URL entries for this issuer must be bound to (one of several rows if more
+    /// than one account is expected at this CA).
+    pub account_uri: Option<String>,
+    pub validation_methods: Vec<String>,
+}
+
+impl CaaPolicy {
+    fn expects(&self, issuer: &str) -> Vec<&IssuerExpectation> {
+        self.issuers.iter().filter(|i| i.domain.eq_ignore_ascii_case(issuer)).collect()
+    }
+
+    fn is_allowed(&self, issuer: &str) -> bool {
+        self.allowed_issuers.iter().any(|a| a.eq_ignore_ascii_case(issuer)) || !self.expects(issuer).is_empty()
+    }
+
+    /// The account URLs an entry for `issuer` may be bound to.
+    fn accounts_for(&self, issuer: &str) -> Vec<&str> {
+        let per_issuer: Vec<&str> = self.expects(issuer).into_iter().filter_map(|i| i.account_uri.as_deref()).collect();
+        if per_issuer.is_empty() { self.account_uri.as_deref().into_iter().collect() } else { per_issuer }
+    }
+
+    /// The validation methods entries for `issuer` should carry (empty = not checked).
+    fn methods_for(&self, issuer: &str) -> &[String] {
+        match self.expects(issuer).into_iter().find(|i| !i.validation_methods.is_empty()) {
+            Some(i) => &i.validation_methods,
+            None => &self.validation_methods,
+        }
+    }
 }
 
 /// What to check.
@@ -1066,22 +1105,25 @@ pub fn evaluate_caa(obs: &CaaObservation, target: &CaaTarget, policy: &CaaPolicy
         return out;
     }
 
-    let allowed = |issuer: &str| policy.allowed_issuers.iter().any(|a| a.eq_ignore_ascii_case(issuer));
+    let allowed = |issuer: &str| policy.is_allowed(issuer);
     let ours: Vec<&CaaIssue> = entries.iter().filter(|e| allowed(&e.issuer)).collect();
     let blocks_sev = if own { Severity::Critical } else { Severity::Warning };
 
     if own {
         for e in entries.iter().filter(|e| !e.issuer.is_empty() && !allowed(&e.issuer)) {
-            out.push(finding(Severity::Error, FindingKind::CaaUnknownCa, &subject, format!("CAA at {at} permits '{}', which is not in the allow-list {:?}", e.issuer, policy.allowed_issuers)));
+            out.push(finding(Severity::Error, FindingKind::CaaUnknownCa, &subject, format!("CAA at {at} permits '{}', which is not in the allow-list {:?}", e.issuer, policy.allowed_issuers.iter().cloned().chain(policy.issuers.iter().map(|i| i.domain.clone())).collect::<Vec<_>>())));
         }
     }
 
     // Can we issue under this policy at all?
     let usable_for_us: Vec<&&CaaIssue> = ours
         .iter()
-        .filter(|e| match (&policy.account_uri, e.param("accounturi")) {
-            (Some(ours), Some(theirs)) => theirs == ours,
-            _ => true,
+        .filter(|e| {
+            let ours = policy.accounts_for(&e.issuer);
+            match e.param("accounturi") {
+                Some(theirs) if !ours.is_empty() => ours.contains(&theirs),
+                _ => true,
+            }
         })
         .filter(|e| match (&policy.customer_method, e.param("validationmethods")) {
             (Some(m), Some(list)) if !own => list.split(',').any(|x| x.trim().eq_ignore_ascii_case(m)),
@@ -1100,10 +1142,14 @@ pub fn evaluate_caa(obs: &CaaObservation, target: &CaaTarget, policy: &CaaPolicy
     }
 
     if own {
-        let pinned = |e: &CaaIssue| policy.account_uri.as_deref().is_some_and(|u| e.param("accounturi") == Some(u));
-        let any_pinned = ours.iter().any(|e| pinned(e));
-        if let Some(uri) = &policy.account_uri {
-            for e in ours.iter().filter(|e| !pinned(e)) {
+        let pinned = |e: &CaaIssue| e.param("accounturi").is_some_and(|theirs| policy.accounts_for(&e.issuer).contains(&theirs));
+        for e in ours.iter().filter(|e| !pinned(e)) {
+            let expected = policy.accounts_for(&e.issuer);
+            let Some(uri) = expected.first() else { continue };
+            {
+                // Another entry for the same issuer *is* bound to our account: this unbound one
+                // makes the binding meaningless.
+                let any_pinned = ours.iter().any(|o| o.issuer == e.issuer && pinned(o));
                 match e.param("accounturi") {
                     _ if any_pinned => out.push(finding(
                         Severity::Critical,
@@ -1116,15 +1162,17 @@ pub fn evaluate_caa(obs: &CaaObservation, target: &CaaTarget, policy: &CaaPolicy
                 }
             }
         }
-        if !policy.validation_methods.is_empty() {
-            for e in &ours {
-                match e.param("validationmethods") {
-                    None => out.push(finding(Severity::Warning, FindingKind::CaaMissingValidationMethods, &subject, format!("CAA at {at}: the '{}' entry has no validationmethods (expected {:?})", e.issuer, policy.validation_methods))),
-                    Some(list) => {
-                        let extra: Vec<&str> = list.split(',').map(str::trim).filter(|m| !policy.validation_methods.iter().any(|p| p.eq_ignore_ascii_case(m))).collect();
-                        if !extra.is_empty() {
-                            out.push(finding(Severity::Warning, FindingKind::CaaValidationMethodsMismatch, &subject, format!("CAA at {at}: the '{}' entry also allows {:?}, beyond the expected {:?}", e.issuer, extra, policy.validation_methods)));
-                        }
+        for e in &ours {
+            let expected_methods = policy.methods_for(&e.issuer);
+            if expected_methods.is_empty() {
+                continue;
+            }
+            match e.param("validationmethods") {
+                None => out.push(finding(Severity::Warning, FindingKind::CaaMissingValidationMethods, &subject, format!("CAA at {at}: the '{}' entry has no validationmethods (expected {:?})", e.issuer, expected_methods))),
+                Some(list) => {
+                    let extra: Vec<&str> = list.split(',').map(str::trim).filter(|m| !expected_methods.iter().any(|p| p.eq_ignore_ascii_case(m))).collect();
+                    if !extra.is_empty() {
+                        out.push(finding(Severity::Warning, FindingKind::CaaValidationMethodsMismatch, &subject, format!("CAA at {at}: the '{}' entry also allows {:?}, beyond the expected {:?}", e.issuer, extra, expected_methods)));
                     }
                 }
             }
@@ -1575,6 +1623,7 @@ mod tests {
             account_uri: Some(ACCT.into()),
             validation_methods: vec!["dns-01".into()],
             customer_method: Some("http-01".into()),
+            issuers: Vec::new(),
         }
     }
 
@@ -2044,5 +2093,70 @@ mod tests {
             }
         });
         addr
+    }
+
+    // ── more than one CA ──
+
+    const GTS_ACCT: &str = "https://dv.acme-v02.api.pki.goog/acme/acct/ZZ";
+
+    /// Two CAs, each with its own account: Let's Encrypt (active) and a standby.
+    fn multi_policy() -> CaaPolicy {
+        CaaPolicy {
+            allowed_issuers: Vec::new(),
+            account_uri: None,
+            validation_methods: Vec::new(),
+            customer_method: Some("http-01".into()),
+            issuers: vec![
+                IssuerExpectation { domain: "letsencrypt.org".into(), account_uri: Some(ACCT.into()), validation_methods: vec!["dns-01".into()] },
+                IssuerExpectation { domain: "pki.goog".into(), account_uri: Some(GTS_ACCT.into()), validation_methods: vec!["dns-01".into()] },
+            ],
+        }
+    }
+
+    fn entry_for(domain: &str, acct: &str) -> String {
+        format!("{domain}; accounturi={acct}; validationmethods=dns-01")
+    }
+
+    #[test]
+    fn a_union_of_two_cas_each_bound_to_its_own_account_is_clean() {
+        let o = caa_obs("tascloud.app", Some("tascloud.app"), vec![rec("issue", &entry_for("letsencrypt.org", ACCT)), rec("issue", &entry_for("pki.goog", GTS_ACCT)), rec("issuewild", &entry_for("letsencrypt.org", ACCT)), rec("issuewild", &entry_for("pki.goog", GTS_ACCT))]);
+        assert_eq!(evaluate_caa(&o, &own("tascloud.app", true), &multi_policy()), vec![]);
+        assert_eq!(evaluate_caa(&o, &own("tascloud.app", false), &multi_policy()), vec![]);
+    }
+
+    #[test]
+    fn a_ca_bound_to_the_wrong_account_or_unbound_is_flagged_per_issuer() {
+        // The standby's entry carries the *other* CA's account: foreign for pki.goog.
+        let o = caa_obs("tascloud.app", Some("tascloud.app"), vec![rec("issue", &entry_for("letsencrypt.org", ACCT)), rec("issue", &entry_for("pki.goog", ACCT))]);
+        let f = evaluate_caa(&o, &own("tascloud.app", false), &multi_policy());
+        assert!(f.iter().any(|x| x.kind == FindingKind::CaaForeignAccount && x.detail.contains("pki.goog")), "{f:?}");
+        // An unbound extra entry for an issuer that also has a bound one makes the binding pointless.
+        let o = caa_obs("tascloud.app", Some("tascloud.app"), vec![rec("issue", &entry_for("letsencrypt.org", ACCT)), rec("issue", "letsencrypt.org"), rec("issue", &entry_for("pki.goog", GTS_ACCT))]);
+        let f = evaluate_caa(&o, &own("tascloud.app", false), &multi_policy());
+        assert!(f.iter().any(|x| x.kind == FindingKind::CaaPermissiveIssuer && x.severity == Severity::Critical), "{f:?}");
+        // A CA that is no longer ours (a distrusted one still in DNS) is unknown.
+        let o = caa_obs("tascloud.app", Some("tascloud.app"), vec![rec("issue", &entry_for("letsencrypt.org", ACCT)), rec("issue", "oldca.example")]);
+        let f = evaluate_caa(&o, &own("tascloud.app", false), &multi_policy());
+        assert!(f.iter().any(|x| x.kind == FindingKind::CaaUnknownCa && x.detail.contains("oldca.example")), "{f:?}");
+    }
+
+    #[test]
+    fn issuewild_governs_wildcards_independently_of_issue() {
+        // issue lists both CAs, issuewild only the standby (which is the only wildcard-capable one).
+        let o = caa_obs("tascloud.app", Some("tascloud.app"), vec![rec("issue", &entry_for("letsencrypt.org", ACCT)), rec("issue", &entry_for("pki.goog", GTS_ACCT)), rec("issuewild", &entry_for("pki.goog", GTS_ACCT))]);
+        assert_eq!(evaluate_caa(&o, &own("tascloud.app", true), &multi_policy()), vec![], "a wildcard may still be issued by the standby");
+        // A wildcard-forbidding issuewild blocks the wildcard but not the bare name.
+        let o = caa_obs("tascloud.app", Some("tascloud.app"), vec![rec("issue", &entry_for("letsencrypt.org", ACCT)), rec("issuewild", ";")]);
+        let f = evaluate_caa(&o, &own("tascloud.app", true), &multi_policy());
+        assert!(f.iter().any(|x| x.kind == FindingKind::CaaBlocksIssuance), "{f:?}");
+        assert!(!evaluate_caa(&o, &own("tascloud.app", false), &multi_policy()).iter().any(|x| x.kind == FindingKind::CaaBlocksIssuance));
+    }
+
+    #[test]
+    fn two_accounts_at_one_ca_are_both_expected() {
+        let mut p = multi_policy();
+        p.issuers.push(IssuerExpectation { domain: "letsencrypt.org".into(), account_uri: Some("https://acme-v02.api.letsencrypt.org/acme/acct/99".into()), validation_methods: vec!["dns-01".into()] });
+        let o = caa_obs("tascloud.app", Some("tascloud.app"), vec![rec("issue", &entry_for("letsencrypt.org", ACCT)), rec("issue", &entry_for("letsencrypt.org", "https://acme-v02.api.letsencrypt.org/acme/acct/99"))]);
+        assert_eq!(evaluate_caa(&o, &own("tascloud.app", false), &p), vec![]);
     }
 }
