@@ -28,13 +28,13 @@
 //! - **B/U** = the round-robin cursor (the accumulator that picks among them)
 //! - **self** = the decision (the request inspected to decide whether to carry the request)
 
-use super::edge::{normalize, EdgeRegistry, HostnameState, Route};
+use super::edge::{normalize, EdgeRegistry, HostnameRecord, HostnameState, Route, TlsMode};
 use super::load_balance::HealthEstimator;
 use super::{Connection, PeerId};
 use hashtrinity::Table;
 use hashtrinity::crypto::to_hex;
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::Arc;
 
 /// What the edge should do with one inbound request.
@@ -90,21 +90,67 @@ pub fn decide(
     let Some(record) = registry.lookup(&host) else {
         return Decision::Unknown;
     };
-    match &record.state {
-        HostnameState::Suspended => return Decision::Suspended,
-        HostnameState::PendingDns | HostnameState::Failed(_) => {
-            return Decision::NotValidated(record.state.clone())
-        }
-        HostnameState::PendingCert => return Decision::CertPending,
-        HostnameState::Active => {}
+    if let Some(blocked) = state_gate(record) {
+        return blocked;
     }
-    if !have_cert && record.requires_tls() {
+    if !have_cert && record.tls_mode == TlsMode::Terminate && record.requires_tls() {
         return Decision::CertPending;
     }
     if !pool.is_online(record.route.peer) {
         return Decision::NoConnector;
     }
     Decision::Serve(record.route.clone())
+}
+
+/// What the listener should do with a connection whose ClientHello named `sni`
+/// (see [`crate::tls_hello::peek_sni`]): splice it through, or terminate it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SniRoute {
+    /// An admitted hostname the tenant terminates themselves: splice, do not terminate.
+    Passthrough,
+    /// Everything else — including unknown names, which the certificate resolver then refuses
+    /// (no certificate => no handshake). Unknown names are never spliced anywhere.
+    Terminate,
+}
+
+/// The first routing decision on a new TLS connection, made from the SNI alone.
+#[must_use]
+pub fn sni_route(registry: &EdgeRegistry, sni: &str) -> SniRoute {
+    match registry.lookup(sni) {
+        Some(r) if r.tls_mode == TlsMode::Passthrough => SniRoute::Passthrough,
+        _ => SniRoute::Terminate,
+    }
+}
+
+/// Admission for a **passthrough** connection. There is no HTTP `Host` to compare (it is inside
+/// the encrypted stream), so the SNI is the only name and the checks are the state gates plus
+/// connector presence. `Misdirected` means the name exists but is not a passthrough name: the
+/// caller must terminate instead of splicing — splicing a terminate-mode name would hand the
+/// connector a connection the platform promised to terminate.
+#[must_use]
+pub fn decide_passthrough(registry: &EdgeRegistry, pool: &ConnectorPool, sni: Option<&str>) -> Decision {
+    let Some(sni) = sni else { return Decision::Unknown };
+    let Some(record) = registry.lookup(sni) else { return Decision::Unknown };
+    if record.tls_mode != TlsMode::Passthrough {
+        return Decision::Misdirected;
+    }
+    if let Some(blocked) = state_gate(record) {
+        return blocked;
+    }
+    if !pool.is_online(record.route.peer) {
+        return Decision::NoConnector;
+    }
+    Decision::Serve(record.route.clone())
+}
+
+/// The lifecycle gates shared by terminated and passthrough admission.
+fn state_gate(record: &HostnameRecord) -> Option<Decision> {
+    match &record.state {
+        HostnameState::Suspended => Some(Decision::Suspended),
+        HostnameState::PendingDns | HostnameState::Failed(_) => Some(Decision::NotValidated(record.state.clone())),
+        HostnameState::PendingCert => Some(Decision::CertPending),
+        HostnameState::Active => None,
+    }
 }
 
 /// Strip a `:port` suffix from a `Host` header value, leaving IPv6 literals alone.
@@ -127,7 +173,8 @@ impl Decision {
             Decision::Misdirected => 421,
             Decision::Unknown => 404,
             Decision::Suspended | Decision::NotValidated(_) => 403,
-            Decision::CertPending | Decision::NoConnector => 503,
+            Decision::CertPending => 503,
+            Decision::NoConnector => 502,
         }
     }
 
@@ -641,10 +688,14 @@ pub mod flow_count {
 pub mod sni {
     use crate::edge::{cert_name_for, CertMaterial, CertSource};
     use hashtrinity::Table;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+    use rustls::server::{ClientHello, ResolvesServerCert};
+    use rustls::sign::CertifiedKey;
+    use rustls::ServerConfig;
     use std::sync::{Arc, Mutex};
 
     /// A [`CertSource`] holding already-loaded PEM material in memory, keyed by certificate
-    /// name (`*.twnstack.app`, `app.acme.com.au`). This is what an ACME client, a Vault
+    /// name (`*.tascloud.app`, `app.acme.com.au`). This is what an ACME client, a Vault
     /// reader, or a file loader all populate — the edge does not care which.
     pub struct MemoryCertSource {
         certs: Mutex<Table<String, CertMaterial>>,
@@ -669,6 +720,14 @@ pub mod sni {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .put(cert_name.into(), material);
+        }
+
+        /// Forget the certificate for `cert_name`.
+        pub fn remove(&self, cert_name: &str) {
+            self.certs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&cert_name.to_string());
         }
 
         /// Whether we hold a certificate covering `fqdn`.
@@ -697,15 +756,30 @@ pub mod sni {
         }
     }
 
-    /// Resolve the certificate for a ClientHello's SNI. Wraps any [`CertSource`].
+    /// Resolve the certificate for a ClientHello's SNI. Wraps any [`CertSource`], and is a real
+    /// `rustls::server::ResolvesServerCert`: hand [`EdgeCertResolver::server_config`] to
+    /// `servelet_tls::serve_tls` and one listener serves every tenant's certificate.
+    ///
+    /// Parsed `CertifiedKey`s are cached per certificate name and rebuilt only when the
+    /// source's material changes (compared by digest), so a renewal installed into the source
+    /// is picked up by the very next handshake with no restart and no per-handshake parse.
+    /// Material that fails to parse is NOT cached and not served: a bad install resolves to
+    /// "no certificate" for that name rather than evicting a good one elsewhere.
     pub struct EdgeCertResolver {
         source: Arc<dyn CertSource>,
+        cache: Mutex<Table<String, ([u8; 32], Arc<CertifiedKey>)>>,
+    }
+
+    impl std::fmt::Debug for EdgeCertResolver {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("EdgeCertResolver").finish_non_exhaustive()
+        }
     }
 
     impl EdgeCertResolver {
         #[must_use]
         pub fn new(source: Arc<dyn CertSource>) -> Self {
-            EdgeCertResolver { source }
+            EdgeCertResolver { source, cache: Mutex::new(Table::new()) }
         }
 
         /// The PEM material to present for `sni`, or `None` to refuse the handshake.
@@ -717,6 +791,85 @@ pub mod sni {
         pub fn material_for(&self, sni: &str) -> Option<CertMaterial> {
             self.source.cert_for(&cert_name_for(sni))
         }
+
+        /// The parsed key to present for `sni` (cached; see the type doc).
+        #[must_use]
+        pub fn certified_key_for(&self, sni: &str) -> Option<Arc<CertifiedKey>> {
+            let name = cert_name_for(sni);
+            let material = self.source.cert_for(&name)?;
+            let mut digest_input = material.chain_pem.clone().into_bytes();
+            digest_input.extend_from_slice(material.key_pem.as_bytes());
+            let digest = hashtrinity::crypto::sha256(&digest_input);
+
+            let mut cache = self.cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some((d, key)) = cache.get(&name) {
+                if *d == digest {
+                    return Some(key.clone());
+                }
+            }
+            let key = Arc::new(certified_key(&material)?);
+            cache.put(name, (digest, key.clone()));
+            Some(key)
+        }
+
+        /// A server config (TLS 1.3 and 1.2, per the platform's "1.3 preferred, 1.2 minimum"
+        /// policy) that resolves its certificate per-SNI through this resolver. Hand it to
+        /// `servelet_tls::serve_tls`, which takes a ready `Arc<ServerConfig>`.
+        ///
+        /// # Errors
+        /// If the provider cannot negotiate TLS 1.3 (never in practice).
+        pub fn server_config(self: &Arc<Self>) -> Result<Arc<ServerConfig>, String> {
+            let config = ServerConfig::builder_with_provider(Arc::new(provider()))
+                .with_safe_default_protocol_versions()
+                .map_err(|e| e.to_string())?
+                .with_no_client_auth()
+                .with_cert_resolver(self.clone());
+            Ok(Arc::new(config))
+        }
+    }
+
+    impl ResolvesServerCert for EdgeCertResolver {
+        fn resolve(&self, hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+            // No SNI => no certificate. There is deliberately no default certificate: serving
+            // one would tell a scanner which platform name sits on every IP.
+            self.certified_key_for(hello.server_name()?)
+        }
+    }
+
+    /// The crypto provider the edge terminates TLS with: `aws-lc-rs`, FIPS-approved suites only
+    /// when built with the `fips` feature. This replaces the hand-written
+    /// `hashtrinity::rustls` provider for serving — a widely reviewed, FIPS-validated library
+    /// for the one place attacker-controlled bytes meet long-lived private keys.
+    #[must_use]
+    pub fn provider() -> rustls::crypto::CryptoProvider {
+        #[cfg(feature = "fips")]
+        {
+            rustls::crypto::default_fips_provider()
+        }
+        #[cfg(not(feature = "fips"))]
+        {
+            rustls::crypto::aws_lc_rs::default_provider()
+        }
+    }
+
+    /// Parse PEM chain + PKCS#8 key into something rustls can present. `None` if either half is
+    /// missing/corrupt or the key type is not one the serving provider loads.
+    fn certified_key(material: &CertMaterial) -> Option<CertifiedKey> {
+        let chain: Vec<CertificateDer<'static>> =
+            crate::pem::blocks(&material.chain_pem, "CERTIFICATE").into_iter().map(CertificateDer::from).collect();
+        if chain.is_empty() {
+            return None;
+        }
+        let key_der = crate::pem::blocks(&material.key_pem, "PRIVATE KEY").into_iter().next()?;
+        let key = provider()
+            .key_provider
+            .load_private_key(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_der)))
+            .ok()?;
+        let certified = CertifiedKey::new(chain, key);
+        // A chain whose leaf does not belong to the private key can only ever fail handshakes
+        // (or, worse, mask a mixed-up install): refuse it here rather than serve it.
+        certified.keys_match().ok()?;
+        Some(certified)
     }
 }
 
@@ -764,7 +917,7 @@ mod tests {
     /// A registry with one live managed hostname on a `.cloud` apex, plus a pool with its
     /// connector online.
     fn live() -> (EdgeRegistry, ConnectorPool, String) {
-        let apex = APEXES.iter().find(|a| a.zone == "twnstack.cloud").unwrap();
+        let apex = APEXES.iter().find(|a| a.zone == "tasmanian.cloud").unwrap();
         let mut reg = EdgeRegistry::new(b"s".to_vec());
         let rec = reg.claim_managed(apex, "dk-1", route("acme", "tun-1")).unwrap();
         let mut pool = ConnectorPool::new();
@@ -788,7 +941,7 @@ mod tests {
         let (reg, pool, fqdn) = live();
         // A reused connection addressing a different tenant's hostname. Serving this would
         // let one tenant's TLS session reach another tenant's origin.
-        let decision = decide(&reg, &pool, Some(&fqdn), "someone-else.twnstack.cloud", true);
+        let decision = decide(&reg, &pool, Some(&fqdn), "someone-else.tasmanian.cloud", true);
         assert_eq!(decision, Decision::Misdirected);
         assert_eq!(decision.status(), 421);
     }
@@ -799,8 +952,8 @@ mod tests {
         // mismatched request for an existing one would answer 421 — a probe that reveals
         // which hostnames exist.
         let (reg, pool, fqdn) = live();
-        let real = decide(&reg, &pool, Some(&fqdn), "definitely-not-registered.twnstack.cloud", true);
-        let fake = decide(&reg, &pool, Some("also-not-registered.twnstack.cloud"), "other.twnstack.cloud", true);
+        let real = decide(&reg, &pool, Some(&fqdn), "definitely-not-registered.tasmanian.cloud", true);
+        let fake = decide(&reg, &pool, Some("also-not-registered.tasmanian.cloud"), "other.tasmanian.cloud", true);
         assert_eq!(real, fake, "a mismatch must answer identically either way");
     }
 
@@ -814,7 +967,7 @@ mod tests {
     #[test]
     fn an_unknown_hostname_is_404() {
         let (reg, pool, _) = live();
-        let d = decide(&reg, &pool, None, "nothing-here.twnstack.cloud", true);
+        let d = decide(&reg, &pool, None, "nothing-here.tasmanian.cloud", true);
         assert_eq!(d, Decision::Unknown);
         assert_eq!(d.status(), 404);
     }
@@ -848,8 +1001,10 @@ mod tests {
     #[test]
     fn an_unvalidated_custom_hostname_is_never_served() {
         let mut reg = EdgeRegistry::new(b"s".to_vec());
+        let apex = APEXES.iter().find(|a| a.zone == "tasmanian.cloud").unwrap();
+        let target = reg.claim_managed(apex, "dk-t", route("acme", "tun-1")).unwrap();
         let rec = reg
-            .add_custom("app.example.com.au", "x.twnstack.cloud", route("acme", "tun-1"))
+            .add_custom("app.example.com.au", &target.fqdn, route("acme", "tun-1"))
             .unwrap();
         let mut pool = ConnectorPool::new();
         let peer = rec.route.peer;
@@ -861,8 +1016,14 @@ mod tests {
     }
 
     #[test]
+    fn a_dialled_out_connector_being_offline_is_502_matching_the_doc_comment() {
+        assert_eq!(Decision::NoConnector.status(), 502);
+        assert_eq!(Decision::CertPending.status(), 503);
+    }
+
+    #[test]
     fn a_live_hostname_without_a_certificate_is_503_not_a_plaintext_serve() {
-        let apex = APEXES.iter().find(|a| a.zone == "twnstack.app").unwrap();
+        let apex = APEXES.iter().find(|a| a.zone == "tascloud.app").unwrap();
         let mut reg = EdgeRegistry::new(b"s".to_vec());
         let rec = reg.claim_managed(apex, "dk-1", route("acme", "tun-1")).unwrap();
         let mut pool = ConnectorPool::new();
@@ -920,5 +1081,264 @@ mod tests {
         pool.register(impostor, Arc::new(StubConnection { peer: impostor, label: "x" }));
 
         assert_eq!(decide(&reg, &pool, Some(&fqdn), &fqdn, true), Decision::NoConnector);
+    }
+}
+
+#[cfg(all(test, feature = "native"))]
+mod sni_tests {
+    use super::sni::{EdgeCertResolver, MemoryCertSource};
+    use crate::edge::CertMaterial;
+    use std::sync::Arc;
+
+    /// A real self-signed P-256 certificate + PKCS#8 key for `name` (a wildcard name becomes a
+    /// wildcard SAN). Real material matters: the resolver refuses chains whose leaf does not
+    /// belong to the key.
+    fn material(name: &str) -> CertMaterial {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let params = rcgen::CertificateParams::new(vec![name.to_string()]).unwrap();
+        let cert = params.self_signed(&key).unwrap();
+        CertMaterial { chain_pem: cert.pem(), key_pem: key.serialize_pem() }
+    }
+
+    fn resolver() -> (Arc<MemoryCertSource>, Arc<EdgeCertResolver>) {
+        let source = Arc::new(MemoryCertSource::new());
+        (source.clone(), Arc::new(EdgeCertResolver::new(source)))
+    }
+
+    #[test]
+    fn managed_names_get_the_apex_wildcard_and_custom_names_their_own_cert() {
+        let (src, r) = resolver();
+        src.install("*.tascloud.app", material("*.tascloud.app"));
+        src.install("app.acme.com.au", material("app.acme.com.au"));
+        assert!(r.certified_key_for("amber-wren-1a2b3c.tascloud.app").is_some());
+        assert!(r.certified_key_for("app.acme.com.au").is_some());
+        assert!(r.certified_key_for("AMBER-wren-1a2b3c.TASCLOUD.app.").is_some(), "SNI is case-insensitive");
+    }
+
+    #[test]
+    fn names_the_wildcard_does_not_cover_are_refused_not_served_a_wrong_cert() {
+        let (src, r) = resolver();
+        src.install("*.tascloud.app", material("*.tascloud.app"));
+        assert!(r.certified_key_for("deep.nested.tascloud.app").is_none(), "wildcard covers one label");
+        // The bare apex shares the wildcard's certificate: the issuer orders `*.zone` + `zone` as
+        // one certificate, so the apex is looked up under the wildcard's name.
+        assert!(r.certified_key_for("tascloud.app").is_some(), "the bare apex resolves to the wildcard certificate");
+        assert!(r.certified_key_for("tascloud.dev").is_none(), "another apex has its own certificate");
+        assert!(r.certified_key_for("other.example.org").is_none());
+        assert!(r.certified_key_for("app.acme.com.au").is_none());
+    }
+
+    #[test]
+    fn a_renewal_installed_into_the_source_is_served_by_the_next_handshake() {
+        let (src, r) = resolver();
+        src.install("app.acme.com.au", material("app.acme.com.au"));
+        let a = r.certified_key_for("app.acme.com.au").unwrap();
+        let again = r.certified_key_for("app.acme.com.au").unwrap();
+        assert!(Arc::ptr_eq(&a, &again), "unchanged material is parsed once, not per handshake");
+        src.install("app.acme.com.au", material("app.acme.com.au"));
+        let b = r.certified_key_for("app.acme.com.au").unwrap();
+        assert!(!Arc::ptr_eq(&a, &b), "renewed material replaces the cached key");
+    }
+
+    #[test]
+    fn corrupt_material_resolves_to_no_certificate_without_poisoning_other_names() {
+        let (src, r) = resolver();
+        src.install("good.example.com", material("good.example.com"));
+        src.install("bad.example.com", CertMaterial { chain_pem: "garbage".into(), key_pem: "garbage".into() });
+        src.install("nokey.example.com", CertMaterial { chain_pem: material("nokey.example.com").chain_pem, key_pem: String::new() });
+        assert!(r.certified_key_for("bad.example.com").is_none());
+        assert!(r.certified_key_for("nokey.example.com").is_none());
+        assert!(r.certified_key_for("good.example.com").is_some());
+    }
+
+    #[test]
+    fn server_config_builds_on_aws_lc_rs_and_reports_fips_only_when_built_for_it() {
+        let (_src, r) = resolver();
+        let cfg = r.server_config().expect("server config");
+        assert_eq!(cfg.fips(), cfg!(feature = "fips"), "FIPS status must match the build");
+    }
+
+    /// Hybrid post-quantum key exchange (X25519MLKEM768) is the edge's preferred group on the
+    /// default build, and a client that lacks it still connects (classical fallback). The FIPS
+    /// build is deliberately excluded: rustls' FIPS provider offers only approved groups.
+    #[cfg(not(feature = "fips"))]
+    #[tokio::test]
+    async fn the_edge_negotiates_hybrid_pq_key_exchange_and_falls_back_for_classical_clients() {
+        use rustls::pki_types::{CertificateDer, ServerName};
+        let (src, r) = resolver();
+        let m = material("*.tascloud.app");
+        src.install("*.tascloud.app", m.clone());
+        let acceptor = tokio_rustls::TlsAcceptor::from(r.server_config().unwrap());
+        let mut roots = rustls::RootCertStore::empty();
+        for der in crate::pem::blocks(&m.chain_pem, "CERTIFICATE") {
+            roots.add(CertificateDer::from(der)).unwrap();
+        }
+
+        let classical_only = {
+            let mut p = super::sni::provider();
+            p.kx_groups = vec![rustls::crypto::aws_lc_rs::kx_group::X25519];
+            p
+        };
+        for (provider, expect) in [
+            (super::sni::provider(), rustls::NamedGroup::X25519MLKEM768),
+            (classical_only, rustls::NamedGroup::X25519),
+        ] {
+            let cfg = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_root_certificates(roots.clone())
+                .with_no_client_auth();
+            let (c, s) = tokio::io::duplex(64 * 1024);
+            let acceptor = acceptor.clone();
+            let server = tokio::spawn(async move {
+                let tls = acceptor.accept(s).await.unwrap();
+                tls.get_ref().1.negotiated_key_exchange_group().map(|g| g.name())
+            });
+            let name = ServerName::try_from("amber-wren-1a2b3c.tascloud.app".to_string()).unwrap();
+            let client = tokio_rustls::TlsConnector::from(Arc::new(cfg)).connect(name, c).await.unwrap();
+            assert_eq!(client.get_ref().1.negotiated_key_exchange_group().map(|g| g.name()), Some(expect));
+            assert_eq!(server.await.unwrap(), Some(expect));
+        }
+    }
+
+    #[test]
+    fn a_chain_whose_leaf_does_not_belong_to_the_key_is_refused() {
+        let (src, r) = resolver();
+        let a = material("a.example.com");
+        let b = material("a.example.com");
+        src.install("a.example.com", CertMaterial { chain_pem: a.chain_pem, key_pem: b.key_pem });
+        assert!(r.certified_key_for("a.example.com").is_none(), "mismatched cert/key must never be served");
+    }
+
+    /// The real thing: a TLS handshake through the resolver, one listener, two names, two certificates.
+    #[tokio::test]
+    async fn one_listener_presents_the_right_certificate_per_sni_and_refuses_the_rest() {
+        use rustls::pki_types::{CertificateDer, ServerName};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (src, r) = resolver();
+        let wild = material("*.tascloud.app");
+        let custom = material("app.acme.com.au");
+        src.install("*.tascloud.app", wild.clone());
+        src.install("app.acme.com.au", custom.clone());
+        let acceptor = tokio_rustls::TlsAcceptor::from(r.server_config().unwrap());
+
+        let client_for = |trust: &CertMaterial| {
+            let mut roots = rustls::RootCertStore::empty();
+            for der in crate::pem::blocks(&trust.chain_pem, "CERTIFICATE") {
+                roots.add(CertificateDer::from(der)).unwrap();
+            }
+            let cfg = rustls::ClientConfig::builder_with_provider(Arc::new(super::sni::provider()))
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_root_certificates(roots)
+                .with_no_client_auth();
+            tokio_rustls::TlsConnector::from(Arc::new(cfg))
+        };
+
+        // (trust anchor the client holds, SNI it sends, expect success)
+        let cases = [
+            (&wild, "amber-wren-1a2b3c.tascloud.app", true),
+            (&custom, "app.acme.com.au", true),
+            (&wild, "deep.nested.tascloud.app", false), // wildcard covers one label
+            (&custom, "unknown.example.org", false),    // no certificate => handshake refused
+            (&custom, "amber-wren-1a2b3c.tascloud.app", false), // right name, wrong trust anchor
+        ];
+        for (trust, sni, expect_ok) in cases {
+            let (client_io, server_io) = tokio::io::duplex(16 * 1024);
+            let acceptor = acceptor.clone();
+            let server = tokio::spawn(async move {
+                let mut tls = acceptor.accept(server_io).await?;
+                tls.write_all(b"hello").await?;
+                tls.shutdown().await?;
+                Ok::<_, std::io::Error>(())
+            });
+            let connector = client_for(trust);
+            let name = ServerName::try_from(sni.to_string()).unwrap();
+            let outcome = connector.connect(name, client_io).await;
+            match (expect_ok, outcome) {
+                (true, Ok(mut tls)) => {
+                    let mut buf = Vec::new();
+                    tls.read_to_end(&mut buf).await.ok();
+                    assert_eq!(buf, b"hello", "{sni}");
+                    assert!(server.await.unwrap().is_ok(), "{sni}: server side");
+                }
+                (false, Err(_)) => {
+                    let _ = server.await;
+                }
+                (true, Err(e)) => panic!("{sni}: expected a handshake, got {e}"),
+                (false, Ok(_)) => panic!("{sni}: expected the handshake to be refused"),
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod passthrough_tests {
+    use super::*;
+    use crate::edge::{EdgeRegistry, Route, TlsMode, APEXES};
+
+    fn route(tenant: &str, tunnel: &str) -> Route {
+        Route { tenant_id: tenant.into(), tunnel_id: tunnel.into(), peer: crate::dialkey::peer_id(tunnel), origin_port: 443 }
+    }
+
+    struct Stub(PeerId);
+    impl crate::Connection for Stub {
+        fn peer_id(&self) -> PeerId { self.0 }
+        fn open_bi<'a>(&'a self) -> crate::BoxFuture<'a, std::io::Result<(Box<dyn crate::BiStream>, Box<dyn crate::BiStream>)>> {
+            Box::pin(async { Err(std::io::Error::other("stub")) })
+        }
+        fn accept_bi<'a>(&'a self) -> crate::BoxFuture<'a, std::io::Result<(Box<dyn crate::BiStream>, Box<dyn crate::BiStream>)>> {
+            Box::pin(async { Err(std::io::Error::other("stub")) })
+        }
+        fn close<'a>(&'a self) -> crate::BoxFuture<'a, std::io::Result<()>> { Box::pin(async { Ok(()) }) }
+    }
+
+    fn setup() -> (EdgeRegistry, ConnectorPool, String, PeerId) {
+        let apex = APEXES.iter().find(|a| a.zone == "tascloud.app").unwrap();
+        let mut reg = EdgeRegistry::new(b"s".to_vec());
+        let rec = reg.claim_managed(apex, "dk", route("acme", "t1")).unwrap();
+        (reg, ConnectorPool::new(), rec.fqdn, rec.route.peer)
+    }
+
+    #[test]
+    fn only_passthrough_names_are_routed_around_termination() {
+        let (mut reg, _pool, fqdn, _) = setup();
+        assert_eq!(sni_route(&reg, &fqdn), SniRoute::Terminate);
+        assert_eq!(sni_route(&reg, "nobody.tascloud.app"), SniRoute::Terminate, "unknown names are never spliced");
+        reg.set_tls_mode("acme", &fqdn, TlsMode::Passthrough).unwrap();
+        assert_eq!(sni_route(&reg, &fqdn.to_uppercase()), SniRoute::Passthrough);
+    }
+
+    #[test]
+    fn passthrough_admission_applies_the_same_gates_without_needing_a_certificate() {
+        let (mut reg, mut pool, fqdn, peer) = setup();
+        // Not a passthrough name: the caller must terminate, never splice.
+        assert_eq!(decide_passthrough(&reg, &pool, Some(&fqdn)), Decision::Misdirected);
+        reg.set_tls_mode("acme", &fqdn, TlsMode::Passthrough).unwrap();
+
+        assert_eq!(decide_passthrough(&reg, &pool, None), Decision::Unknown, "no SNI, nowhere to route");
+        assert_eq!(decide_passthrough(&reg, &pool, Some("nobody.tascloud.app")), Decision::Unknown);
+        assert_eq!(decide_passthrough(&reg, &pool, Some(&fqdn)), Decision::NoConnector);
+        pool.register(peer, Arc::new(Stub(peer)));
+        assert!(matches!(decide_passthrough(&reg, &pool, Some(&fqdn)), Decision::Serve(_)), "served with NO certificate loaded");
+
+        reg.suspend("acme", &fqdn).unwrap();
+        assert_eq!(decide_passthrough(&reg, &pool, Some(&fqdn)), Decision::Suspended);
+    }
+
+    #[test]
+    fn an_unproven_custom_passthrough_name_is_not_spliced() {
+        let apex = APEXES.iter().find(|a| a.zone == "tascloud.app").unwrap();
+        let mut reg = EdgeRegistry::new(b"s".to_vec());
+        let target = reg.claim_managed(apex, "dk", route("acme", "t1")).unwrap();
+        reg.add_custom("secure.acme.com.au", &target.fqdn, route("acme", "t2")).unwrap();
+        reg.set_tls_mode("acme", "secure.acme.com.au", TlsMode::Passthrough).unwrap();
+        let mut pool = ConnectorPool::new();
+        let peer = reg.lookup("secure.acme.com.au").unwrap().route.peer;
+        pool.register(peer, Arc::new(Stub(peer)));
+        assert!(matches!(decide_passthrough(&reg, &pool, Some("secure.acme.com.au")), Decision::NotValidated(_)));
+        reg.record_probe("secure.acme.com.au", true, 5).unwrap();
+        assert!(matches!(decide_passthrough(&reg, &pool, Some("secure.acme.com.au")), Decision::Serve(_)));
     }
 }

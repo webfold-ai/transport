@@ -40,7 +40,13 @@ pub mod load_balance;
 /// tas-edge — the SaaS hostname layer (managed subdomains, BYO custom hostnames). Pure
 /// registry logic over hashtrinity, so it is always compiled; only the DNS halves need a dep.
 pub mod edge;
-#[cfg(feature = "bind-edge-dns")]
+/// PEM / base64 plumbing for the certificate paths.
+pub mod pem;
+/// The primitives the secure channel and signed records use: aws-lc-rs (FIPS-capable), with a
+/// hashtrinity fallback for the dependency-free core.
+pub mod prim;
+/// ClientHello SNI peeking for TLS passthrough routing.
+pub mod tls_hello;
 pub mod edge_dns;
 /// Proof-of-control checks for BYO hostnames. The sweep and its `DnsProbe` seam are always
 /// compiled (and unit-tested against a static probe); only the real resolver is gated.
@@ -57,17 +63,30 @@ pub mod provision;
 pub mod http_types;
 /// The plain/TLS stream, connection pool, and request/response wire I/O underneath
 /// [`http_client`]. Lifted verbatim from bedrock's `native_lib::wire`.
+#[cfg(feature = "native")]
 pub(crate) mod wire;
 /// A minimal async HTTP client (GET/PUT + bytes), used by [`pkarr::RelayClient`] to talk to
-/// pkarr relays — "native, always available, no `pkarr` [crate] dependency" per
-/// `dialkey.rs`'s own doc comment, so this isn't behind an opt-in feature.
+/// pkarr relays — "native", i.e. no `pkarr` [crate] dependency. It is real TLS (`rustls`) on
+/// `tokio` with `tracing` spans, so it is behind the on-by-default `native` feature: without it
+/// the crate is the wire-format-only zero-dep core.
+#[cfg(feature = "native")]
 pub mod http_client;
 /// ACME v2 (RFC 8555) automation for [`edge::CertSource`] — the issuance worker `edge.rs`'s own
 /// doc comment calls "eventually." Needs [`http_client`]'s real TLS+HTTP/1.1 client and JSON, so
-/// (unlike `http_client` itself) this one IS behind the `native` feature — matching `native.rs`/
-/// `gossip.rs`/`quic.rs`'s own `#![cfg(feature = "...")]` convention rather than `http_client`'s.
+/// this is behind the `native` feature too, like `http_client` — matching `native.rs`/
+/// `gossip.rs`/`quic.rs`'s own `#![cfg(feature = "...")]` convention.
 #[cfg(feature = "native")]
 pub mod acme;
+/// The certificate renewal engine: what to issue, when to renew, how to fail, how to persist.
+#[cfg(feature = "native")]
+pub mod acme_renew;
+/// DNS health findings for the zones and names the edge depends on: DNSSEC chain health
+/// (DS vs DNSKEY, RRSIG lifetime), RFC 8659 CAA policy, NS/SOA sanity. Pure evaluators over
+/// injected lookups; the live resolver is `edge_verify`'s DNS client.
+#[cfg(feature = "native")]
+pub mod dns_health;
+/// Owner-signed object replication over the native transport (zone snapshots, ACME challenge state).
+pub mod zone_sync;
 
 use std::future::Future;
 use std::io;
