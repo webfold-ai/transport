@@ -565,7 +565,7 @@ checksum = "e4eba85ea1d0a966a983acd07deee566e67395d2d96b6fb39e62b5a833f1eb0b"
 [[package]]
 name = "hashtrinity"
 version = "0.1.0"
-source = "git+https://github.com/Ptyktos/hashtrinity?rev=2c36b995c82c073c71df7c28b14c62665d62cbf0#2c36b995c82c073c71df7c28b14c62665d62cbf0"
+source = "git+https://github.com/Ptyktos/hashtrinity?rev=8de00eff38d3ffa5393190c2358a9e54dac5bc2f#8de00eff38d3ffa5393190c2358a9e54dac5bc2f"
 dependencies = [
  "apeiron",
  "rustls",
@@ -1309,7 +1309,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 [[package]]
 name = "relayfold"
 version = "0.1.0"
-source = "git+https://github.com/Ptyktos/relayfold#4098a55ef2648d4f7466e94740850940008d013b"
+source = "git+https://github.com/Ptyktos/relayfold?rev=2a79c5aa9f9988d6376ec2f135ccd143ae8473b1#2a79c5aa9f9988d6376ec2f135ccd143ae8473b1"
 dependencies = [
  "hashtrinity",
 ]
@@ -2353,7 +2353,3 @@ name = "zmij"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
-
-[[patch.unused]]
-name = "relayfold"
-version = "0.0.0"

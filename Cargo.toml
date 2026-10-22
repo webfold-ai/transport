@@ -53,7 +53,7 @@ serde_json = { version = "1", optional = true }
 # different references to the same repo (rev vs branch vs none) as distinct SourceIds, and two
 # copies make `hashtrinity::Table<K, V>` two incompatible types (E0308 "multiple different
 # versions of crate `hashtrinity`"), so every consumer pins exactly this form.
-hashtrinity = { git = "https://github.com/Ptyktos/hashtrinity", rev = "2c36b995c82c073c71df7c28b14c62665d62cbf0", features = ["base32"] }
+hashtrinity = { git = "https://github.com/Ptyktos/hashtrinity", rev = "8de00eff38d3ffa5393190c2358a9e54dac5bc2f", features = ["base32"] }
 rustls-pki-types = "1"
 rustls-native-certs = "0.8"
 bytes = "1"
@@ -68,7 +68,10 @@ flate2 = { version = "1", optional = true }
 # carries `Tuple`/`Relationships`/`Upstream`/`Backends`, which this crate's version didn't) and is
 # already what `bedrock` itself re-exports on both remotes, so it's canonical; `load_balance.rs`
 # is now a thin re-export.
-relayfold = { git = "https://github.com/Ptyktos/relayfold" }
+# Pinned by rev (like hashtrinity): relayfold carries its own hashtrinity pin, so an unpinned entry
+# would resolve to relayfold's default branch, whatever hashtrinity that names, and a consumer that
+# also names relayfold must use this exact rev or the graph holds two relayfolds and two hashtrinitys.
+relayfold = { git = "https://github.com/Ptyktos/relayfold", rev = "2a79c5aa9f9988d6376ec2f135ccd143ae8473b1" }
 pkarr = { version = "8.0.1", optional = true }
 
 # The unit tests of modules that are always compiled (`edge_verify`, `edge_proxy`) drive async code with
