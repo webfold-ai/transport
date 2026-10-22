@@ -40,8 +40,7 @@
 
 use super::{BiStream, BoxFuture, Connection, PeerId, Transport};
 use hashtrinity::crypto::blake3;
-use hashtrinity::crypto::chacha_poly::{chacha20poly1305_decrypt, chacha20poly1305_encrypt};
-use hashtrinity::crypto::{ed25519_pubkey, ed25519_sign, ed25519_verify, x25519};
+use crate::prim::{chacha20poly1305_decrypt, chacha20poly1305_encrypt, ed25519_pubkey, ed25519_sign, ed25519_verify, x25519_pubkey, x25519_shared};
 use std::collections::HashMap;
 use std::io;
 
@@ -114,20 +113,12 @@ pub(super) fn derive_session_keys(shared_secret: &[u8; 32], client: &HandshakeMs
     (blake3(&c2s_input), blake3(&s2c_input))
 }
 
-/// The X25519 base point (the constant `9`, per RFC 7748) — shared so every caller generating
-/// an ephemeral keypair uses the same point, not a re-typed magic value.
-pub(super) const X25519_BASEPOINT: [u8; 32] = {
-    let mut b = [0u8; 32];
-    b[0] = 9;
-    b
-};
-
 /// Generate a fresh ephemeral X25519 keypair for one handshake. Returns (secret, public).
 pub(super) fn generate_ephemeral_x25519() -> ([u8; 32], [u8; 32]) {
     let ephemeral_secret_bytes = hashtrinity::crypto::rand_bytes(32);
     let mut ephemeral_secret = [0u8; 32];
     ephemeral_secret.copy_from_slice(&ephemeral_secret_bytes);
-    let ephemeral_pubkey = x25519(&ephemeral_secret, &X25519_BASEPOINT);
+    let ephemeral_pubkey = x25519_pubkey(&ephemeral_secret);
     (ephemeral_secret, ephemeral_pubkey)
 }
 
@@ -139,12 +130,15 @@ pub(super) fn resolve_session_keys(
     own_msg: &HandshakeMsg,
     peer_msg: &HandshakeMsg,
     is_client: bool,
-) -> (PeerId, [u8; 32], [u8; 32]) {
-    let shared_secret = x25519(ephemeral_secret, &peer_msg.ephemeral_pubkey);
+) -> io::Result<(PeerId, [u8; 32], [u8; 32])> {
+    // A low-order peer point forces an all-zero shared secret (a known contributory-behaviour
+    // attack: the "session key" would be computable by anyone). Refuse the handshake.
+    let shared_secret = x25519_shared(ephemeral_secret, &peer_msg.ephemeral_pubkey)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "peer ephemeral key is of low order"))?;
     let (client_msg, server_msg) = if is_client { (own_msg, peer_msg) } else { (peer_msg, own_msg) };
     let (c2s_key, s2c_key) = derive_session_keys(&shared_secret, client_msg, server_msg);
     let (send_key, recv_key) = if is_client { (c2s_key, s2c_key) } else { (s2c_key, c2s_key) };
-    (peer_msg.static_pubkey, send_key, recv_key)
+    Ok((peer_msg.static_pubkey, send_key, recv_key))
 }
 
 /// Run the handshake over a fresh TCP stream. `is_client` picks send-then-recv vs
@@ -173,7 +167,7 @@ async fn run_handshake(
         peer_msg
     };
 
-    Ok(resolve_session_keys(&ephemeral_secret, &own_msg, &peer_msg, is_client))
+    resolve_session_keys(&ephemeral_secret, &own_msg, &peer_msg, is_client)
 }
 
 /// Seal one frame: `[u32 stream_id][u64 len][payload]` sealed as a whole under
@@ -200,6 +194,11 @@ fn nonce_from_counter(counter: u64) -> [u8; 12] {
     nonce
 }
 
+/// Largest sealed-frame ciphertext accepted. Writers chunk at 4 KiB; 1 MiB leaves ample room for
+/// callers that write larger buffers in one `write_all`, while bounding what an unauthenticated
+/// length prefix can make the reader allocate.
+const MAX_FRAME_CIPHERTEXT: usize = 1 << 20;
+
 /// Read + open one sealed frame from `r`. Enforces strict counter monotonicity (the nonce
 /// counter must be strictly greater than the last one accepted) to reject replay of an old
 /// frame. Returns (stream_id, payload).
@@ -224,6 +223,11 @@ async fn read_sealed_frame(
     let mut len_buf = [0u8; 4];
     r.read_exact(&mut len_buf).await?;
     let ct_len = u32::from_le_bytes(len_buf) as usize;
+    // The length is not yet authenticated: without a cap, one unauthenticated header makes us
+    // allocate up to 4 GiB per connection (any Ed25519 key passes the handshake).
+    if ct_len > MAX_FRAME_CIPHERTEXT {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "sealed frame exceeds the maximum size"));
+    }
 
     let mut ct = vec![0u8; ct_len];
     r.read_exact(&mut ct).await?;
@@ -252,7 +256,17 @@ pub struct NativeEndpoint {
     peer_id: PeerId,
     secret_key: [u8; 32],
     connections: Arc<Mutex<HashMap<PeerId, Arc<NativeConnection>>>>,
+    /// Handshaken inbound connections, fed by the acceptor task `accept` starts on first use.
+    incoming: Arc<tokio::sync::Mutex<Option<tokio::sync::mpsc::Receiver<NativeConnection>>>>,
 }
+
+/// Longest an unauthenticated peer may take to complete the handshake. Without it a client that
+/// connects and says nothing holds the handshake (and, before handshakes ran concurrently, the
+/// whole accept loop) open indefinitely.
+pub const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Most handshakes in flight at once; further TCP connections wait in the kernel backlog.
+const MAX_INFLIGHT_HANDSHAKES: usize = 256;
 
 impl NativeEndpoint {
     /// Bind a new endpoint on `addr` (e.g. "0.0.0.0:0" for any free port).
@@ -262,24 +276,26 @@ impl NativeEndpoint {
         let secret_key_bytes = hashtrinity::crypto::rand_bytes(32);
         let mut secret_key = [0u8; 32];
         secret_key.copy_from_slice(&secret_key_bytes);
-        let peer_id = hashtrinity::crypto::ed25519_pubkey(&secret_key);
+        let peer_id = crate::prim::ed25519_pubkey(&secret_key);
         Ok(NativeEndpoint {
             listener: Arc::new(listener),
             peer_id,
             secret_key,
             connections: Arc::new(Mutex::new(HashMap::new())),
+            incoming: Arc::new(tokio::sync::Mutex::new(None)),
         })
     }
 
     /// Bind with a specific secret key (for identity recovery / persistence).
     pub async fn bind_with_key(addr: &str, secret_key: [u8; 32]) -> io::Result<Self> {
         let listener = TcpListener::bind(addr).await?;
-        let peer_id = hashtrinity::crypto::ed25519_pubkey(&secret_key);
+        let peer_id = crate::prim::ed25519_pubkey(&secret_key);
         Ok(NativeEndpoint {
             listener: Arc::new(listener),
             peer_id,
             secret_key,
             connections: Arc::new(Mutex::new(HashMap::new())),
+            incoming: Arc::new(tokio::sync::Mutex::new(None)),
         })
     }
 
@@ -312,7 +328,9 @@ impl Transport for NativeEndpoint {
         Box::pin(async move {
             let mut stream = TcpStream::connect(&addr).await?;
             let peer_addr = stream.peer_addr().ok();
-            let (peer_id, send_key, recv_key) = run_handshake(&mut stream, &secret_key, true).await?;
+            let (peer_id, send_key, recv_key) = tokio::time::timeout(HANDSHAKE_TIMEOUT, run_handshake(&mut stream, &secret_key, true))
+                .await
+                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "handshake timed out"))??;
             let (read_half, write_half) = stream.into_split();
             let conn = NativeConnection::new(
                 read_half,
@@ -327,21 +345,51 @@ impl Transport for NativeEndpoint {
         })
     }
 
+    /// The next authenticated inbound connection. Handshakes run concurrently, each under
+    /// [`HANDSHAKE_TIMEOUT`], on an acceptor task started by the first call — so a peer that
+    /// connects and stalls costs one task for ten seconds, not the listener. Failed handshakes
+    /// are dropped silently; this only ever yields connections whose peer proved its identity.
     fn accept<'a>(&'a self) -> BoxFuture<'a, Option<NativeConnection>> {
         let listener = self.listener.clone();
         let secret_key = self.secret_key;
+        let incoming = self.incoming.clone();
         Box::pin(async move {
-            let (mut stream, peer_addr) = listener.accept().await.ok()?;
-            let (peer_id, send_key, recv_key) = run_handshake(&mut stream, &secret_key, false).await.ok()?;
-            let (read_half, write_half) = stream.into_split();
-            Some(NativeConnection::new(
-                read_half,
-                write_half,
-                peer_id,
-                send_key,
-                recv_key,
-                Some(peer_addr.to_string()),
-            ))
+            let mut slot = incoming.lock().await;
+            let rx = match &mut *slot {
+                Some(rx) => rx,
+                None => {
+                    let (tx, rx) = tokio::sync::mpsc::channel::<NativeConnection>(64);
+                    tokio::spawn(async move {
+                        let inflight = Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT_HANDSHAKES));
+                        loop {
+                            let permit = match inflight.clone().acquire_owned().await {
+                                Ok(p) => p,
+                                Err(_) => return,
+                            };
+                            let accepted = tokio::select! {
+                                () = tx.closed() => return,
+                                r = listener.accept() => r,
+                            };
+                            let Ok((mut stream, peer_addr)) = accepted else {
+                                // EMFILE and friends: back off rather than spin.
+                                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                                continue;
+                            };
+                            let tx = tx.clone();
+                            tokio::spawn(async move {
+                                let _permit = permit;
+                                let hs = tokio::time::timeout(HANDSHAKE_TIMEOUT, run_handshake(&mut stream, &secret_key, false)).await;
+                                let Ok(Ok((peer_id, send_key, recv_key))) = hs else { return };
+                                let (read_half, write_half) = stream.into_split();
+                                let conn = NativeConnection::new(read_half, write_half, peer_id, send_key, recv_key, Some(peer_addr.to_string()));
+                                let _ = tx.send(conn).await;
+                            });
+                        }
+                    });
+                    slot.insert(rx)
+                }
+            };
+            rx.recv().await
         })
     }
 
@@ -471,9 +519,13 @@ impl BiStream for SealedStreamSend {
         let key = self.key;
         let counter = self.counter.clone();
         Box::pin(async move {
+            // Take the write lock FIRST, then the counter: the counter order must equal the wire
+            // order, because the receiver rejects any frame whose counter is not strictly greater
+            // than the last accepted one. Allocating it before the lock let two concurrent writers
+            // put counters 5 and 6 on the wire as 6 then 5 — and the connection died as a "replay".
+            let mut w = write.lock().await;
             let n = counter.fetch_add(1, Ordering::SeqCst);
             let sealed = seal_frame(&key, n, stream_id, &data);
-            let mut w = write.lock().await;
             w.write_all(&sealed).await
         })
     }
@@ -551,6 +603,98 @@ mod tests {
         let addr = endpoint.local_addr().unwrap();
         // The endpoint is bound and listening
         assert!(addr.contains("127.0.0.1"));
+    }
+
+    /// Concurrent writers on one connection must not trip the receiver's replay check.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_writers_never_produce_out_of_order_counters() {
+        // Needs real parallelism: on a single-threaded runtime nothing can run between taking a
+        // counter and queueing for the write lock, so the (fixed) race could never fire.
+        const WRITERS: usize = 8;
+        const PER_WRITER: usize = 1500;
+        let server = NativeEndpoint::bind("127.0.0.1:0").await.unwrap();
+        let addr = server.local_addr().unwrap();
+        let reader = tokio::spawn(async move {
+            let conn = Transport::accept(&server).await.unwrap();
+            let (_, mut recv) = Connection::accept_bi(&conn).await.unwrap();
+            let mut got = 0usize;
+            let mut buf = [0u8; 16];
+            while got < WRITERS * PER_WRITER {
+                let n = recv.read(&mut buf).await.expect("no frame may be rejected as a replay");
+                assert_eq!(n, 16);
+                got += 1;
+            }
+            got
+        });
+        let client = NativeEndpoint::bind("127.0.0.1:0").await.unwrap();
+        let conn = std::sync::Arc::new(Transport::connect(&client, &addr, b"test").await.unwrap());
+        let mut tasks = Vec::new();
+        for w in 0..WRITERS {
+            let conn = conn.clone();
+            tasks.push(tokio::spawn(async move {
+                let (mut send, _) = Connection::open_bi(&*conn).await.unwrap();
+                for i in 0..PER_WRITER {
+                    let mut frame = [0u8; 16];
+                    frame[..8].copy_from_slice(&(w as u64).to_le_bytes());
+                    frame[8..].copy_from_slice(&(i as u64).to_le_bytes());
+                    send.write_all(&frame).await.unwrap();
+                }
+            }));
+        }
+        for t in tasks {
+            t.await.unwrap();
+        }
+        assert_eq!(tokio::time::timeout(std::time::Duration::from_secs(20), reader).await.unwrap().unwrap(), WRITERS * PER_WRITER);
+    }
+
+    /// An unauthenticated length prefix must not make the reader allocate gigabytes.
+    #[tokio::test]
+    async fn an_oversized_length_prefix_is_refused_before_allocating() {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let attacker = tokio::spawn(async move {
+            let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let mut header = 1u64.to_le_bytes().to_vec(); // a plausible counter
+            header.extend_from_slice(&u32::MAX.to_le_bytes()); // 4 GiB "ciphertext"
+            s.write_all(&header).await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        });
+        let (stream, _) = listener.accept().await.unwrap();
+        let (mut r, _w) = stream.into_split();
+        let last = AtomicU64::new(0);
+        let err = read_sealed_frame(&mut r, &[1u8; 32], &last).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("maximum size"), "{err}");
+        attacker.abort();
+    }
+
+    /// A peer that connects and never speaks must not stop the next, honest peer from being
+    /// accepted: handshakes are concurrent and each is bounded.
+    #[tokio::test]
+    async fn a_stalled_handshake_does_not_block_the_next_connection() {
+        let server = NativeEndpoint::bind("127.0.0.1:0").await.unwrap();
+        let addr = server.local_addr().unwrap();
+        let server_id = Transport::id(&server);
+
+        let _squatters: Vec<_> = {
+            let mut v = Vec::new();
+            for _ in 0..3 {
+                v.push(tokio::net::TcpStream::connect(&addr).await.unwrap());
+            }
+            v
+        };
+        let accepter = tokio::spawn(async move { Transport::accept(&server).await.map(|c| Connection::peer_id(&c)) });
+
+        let client = NativeEndpoint::bind("127.0.0.1:0").await.unwrap();
+        let client_id = Transport::id(&client);
+        let conn = tokio::time::timeout(std::time::Duration::from_secs(5), Transport::connect(&client, &addr, b"t"))
+            .await
+            .expect("honest handshake must not wait behind stalled ones")
+            .unwrap();
+        assert_eq!(Connection::peer_id(&conn), server_id);
+        let seen = tokio::time::timeout(std::time::Duration::from_secs(5), accepter).await.unwrap().unwrap();
+        assert_eq!(seen, Some(client_id));
     }
 
     #[tokio::test]

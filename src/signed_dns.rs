@@ -38,7 +38,7 @@
 
 use super::dns::{DnsError, Message, Record};
 use hashtrinity::base32::ZBASE32;
-use hashtrinity::crypto::{ed25519_pubkey, ed25519_sign, ed25519_verify};
+use crate::prim::{ed25519_pubkey, ed25519_sign, ed25519_verify};
 
 /// Length of the value a relay will accept, per BEP44. A DNS message over this cannot be
 /// published, and truncating it silently would publish records the author did not write.

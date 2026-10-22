@@ -40,7 +40,13 @@ pub mod load_balance;
 /// tas-edge — the SaaS hostname layer (managed subdomains, BYO custom hostnames). Pure
 /// registry logic over hashtrinity, so it is always compiled; only the DNS halves need a dep.
 pub mod edge;
-#[cfg(feature = "bind-edge-dns")]
+/// PEM / base64 plumbing for the certificate paths.
+pub mod pem;
+/// The primitives the secure channel and signed records use: aws-lc-rs (FIPS-capable), with a
+/// hashtrinity fallback for the dependency-free core.
+pub mod prim;
+/// ClientHello SNI peeking for TLS passthrough routing.
+pub mod tls_hello;
 pub mod edge_dns;
 /// Proof-of-control checks for BYO hostnames. The sweep and its `DnsProbe` seam are always
 /// compiled (and unit-tested against a static probe); only the real resolver is gated.
@@ -71,6 +77,16 @@ pub mod http_client;
 /// `gossip.rs`/`quic.rs`'s own `#![cfg(feature = "...")]` convention.
 #[cfg(feature = "native")]
 pub mod acme;
+/// The certificate renewal engine: what to issue, when to renew, how to fail, how to persist.
+#[cfg(feature = "native")]
+pub mod acme_renew;
+/// DNS health findings for the zones and names the edge depends on: DNSSEC chain health
+/// (DS vs DNSKEY, RRSIG lifetime), RFC 8659 CAA policy, NS/SOA sanity. Pure evaluators over
+/// injected lookups; the live resolver is `edge_verify`'s DNS client.
+#[cfg(feature = "native")]
+pub mod dns_health;
+/// Owner-signed object replication over the native transport (zone snapshots, ACME challenge state).
+pub mod zone_sync;
 
 use std::future::Future;
 use std::io;

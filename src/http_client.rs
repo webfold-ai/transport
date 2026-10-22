@@ -739,6 +739,38 @@ mod gzip_tests {
         addr
     }
 
+    /// Regression: a HEAD response has no body even when it carries no Content-Length, and the
+    /// server (Go's net/http, as in Let's Encrypt and Pebble) keeps the connection open. Reading
+    /// "until close" blocked until the server's idle timeout; ACME's first request is such a HEAD.
+    #[tokio::test]
+    async fn head_response_without_content_length_on_a_keep_alive_connection_returns_promptly() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf);
+            stream.write_all(b"HTTP/1.1 200 OK\r\nReplay-Nonce: abc123\r\n\r\n").expect("write head");
+            stream.flush().ok();
+            // Hold the connection open, as a keep-alive server does.
+            std::thread::sleep(std::time::Duration::from_secs(30));
+        });
+
+        let started = std::time::Instant::now();
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            Client::new().head(format!("http://{addr}/nonce")).send(),
+        )
+        .await
+        .expect("HEAD must not wait for the connection to close")
+        .expect("request succeeds");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers().get("replay-nonce").and_then(|v| v.to_str().ok()), Some("abc123"));
+        assert!(resp.bytes().await.is_empty());
+    }
+
     #[tokio::test]
     async fn gzip_response_is_transparently_decoded() {
         let plain: &'static [u8] = b"hello from a gzip-encoded response body, decoded transparently";

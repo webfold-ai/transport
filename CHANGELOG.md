@@ -1,5 +1,131 @@
 # Changelog
 
+## 0.3.0 — certificate lifecycle, edge admission, aws-lc-rs
+
+**BREAKING** (see "Migration" at the end).
+
+### Certificates and ACME
+- **`edge_dns` compiles.** It was written against `hickory-proto`, never a buildable dependency, so
+  the authoritative DNS and the DNS-01 responder did not build in any configuration. Ported to the
+  native `dns` module; compiled and tested by default. `HickoryProbe` (also unbuildable) is replaced
+  by `edge_verify::NativeProbe` (UDP + TCP fallback, CNAME-chain following, spoof-resistant reply
+  matching, resolver failover). The `bind-edge-dns` feature remains as an empty alias.
+- **ACME certificate keys are ECDSA P-256.** The finalize CSR was Ed25519, which public CAs do not
+  issue; every real order would have failed after spending validation rate limit.
+- `badNonce` is retried transparently; 429/`rateLimited` surfaces as `AcmeError::RateLimited` with
+  `Retry-After`; a failed authorization carries the CA's reason.
+- **New `acme_renew`**: the renewal engine nothing implemented. Renews at a percentage of each
+  certificate's own lifetime, exponential backoff with per-name jitter honouring `Retry-After`, keeps
+  last-known-good on failure, rejects junk/expired CA output, fails never-issued hostnames after N
+  attempts (never a baseline wildcard, never a hostname already serving), prunes unrequired certs after
+  a grace period, `FileCertStore` persists across restarts (atomic, 0600). Baseline = every apex wildcard.
+- CAA records can be bound to the ACME account and `dns-01` (`ZoneConfig::with_caa_account_uri`).
+
+- **Review fixes:** `Retry-After` is honoured in both forms (seconds and HTTP-date); `newAccount` goes
+  through the same `badNonce`/rate-limit handling as every other request; a CA's retry deadline and
+  failure count are persisted beside the certificate (`<name>.retry`) so a restart cannot defeat
+  backoff (`CertStore::{load,save}_retry`); an installed certificate must already be valid
+  (`notBefore` not in the future) — a future-dated one never displaces last-known-good; the cert
+  directory is fsynced after the atomic rename; wildcard orders also name the bare apex (one
+  certificate carries `*.zone` + `zone`, and `cert_name_for("zone")` resolves to it); the client TLS
+  config uses the FIPS provider explicitly under `--features fips`;
+  `EdgeRegistry::{quarantine_snapshot, restore_quarantine}` let a host persist release tombstones;
+  `Cargo.lock` regenerated for the new dependency set.
+
+- **ACME External Account Binding (RFC 8555 §7.3.4)**: `AcmeClient::new_with_eab` +
+  `ExternalAccountBinding::{from_base64url}` register with CAs that require a CA-issued `kid` and
+  HMAC key (ZeroSSL, Google, Sectigo...); `new` is the unchanged no-EAB wrapper. The key is never
+  logged (`Debug` redacts it).
+- **ACME account key rollover (RFC 8555 §7.3.5)**: `AcmeClient::rollover_account_key(&self, new_key)`
+  swaps the account's key via the directory's `keyChange` (old-key outer JWS around a new-key inner
+  JWS); the account URL is unchanged and the client signs with the new key from then on. `Directory`
+  now exposes `key_change`.
+- **ACME Renewal Information (RFC 9773)**: `AcmeClient::renewal_info` fetches the CA's suggested
+  renewal window (`Directory::renewal_info`, `acme::ari_cert_id`, `RenewalWindow`). The engine uses it
+  through the new `CertIssuer::renewal_window` (default: no advice; `AcmeIssuer` asks the CA): a name
+  is also due, as `Reason::CaSuggested`, once a deterministic per-name instant inside the window
+  (`ari_renew_at`) has passed. Advisory and advance-only: a CA without ARI, a failed lookup or a
+  window still ahead leaves the percent-of-lifetime rule in charge; lookups are at most once per
+  `Retry-After` (default 6 h) per name and never while a name is backing off. Pebble end-to-end tests
+  cover all three features.
+- **ACME revocation (RFC 8555 §7.6)**: `AcmeClient::revoke_certificate(cert_der_or_pem, RevocationReason)`
+  signs with the account key; `revoke_certificate_with_key(.., certificate_key_pem, ..)` signs with the
+  certificate's own key (the key-compromise route, and the one that works when the ordering account is
+  gone). `Directory::revoke_cert`; `alreadyRevoked` is success (`RevocationOutcome::AlreadyRevoked`);
+  input is bounded and sanity-checked as DER/PEM before a request is made; `AcmeError::is_problem`.
+  Tested against the mock CA and Pebble (which marks the certificate revoked, with the reason).
+- **Revoke-on-release machinery in `acme_renew`**: `CertIssuer::revoke(&CertMaterial)` (default: no-op
+  success; `AcmeIssuer` revokes with reason `cessationOfOperation`, account first, then the certificate's
+  own key if the CA says the account has no claim). `RevocationQueue` is the durable pending queue
+  (`<id>.revoke`, 0600, fsynced, reloaded at boot) that keeps the key until the CA has revoked the
+  certificate or it has expired, and `process_revocations` retries with exponential backoff, honouring
+  `Retry-After`, never giving up on an unexpired certificate. `retire_for_revocation` is the one safe
+  ordering (queue entry durable, *then* out of the serving store; a shared `*.` wildcard is never
+  retired). `RenewalEngine::with_revocations` makes the prune revoke a dedicated certificate instead of
+  just deleting it, and keeps the certificate if it cannot be queued. `impl CertIssuer for Arc<T>`.
+- **RFC 9773 `replaces`**: `AcmeClient::{issue_replacing, issue_dns01_replacing}` put the previous
+  certificate's ARI ID in `newOrder` (only when the CA advertises `renewalInfo`; if the CA refuses it with
+  `alreadyReplaced`/`malformed`/`unauthorized` the order is placed again without it).
+  `CertIssuer::issue_replacing` (default: forwards to `issue`) is what the engine calls for a renewal or a
+  CA-suggested replacement, never for a first issuance or an expired certificate.
+- **New `dns_health`** (native): DNSSEC chain health per zone (DS recomputed over the DNSKEY with SHA-256/384
+  via aws-lc, SHA-1 flagged; earliest RRSIG expiry in seconds with 7d/3d/1d escalation; missing/expired/
+  not-yet-valid signatures; DNSKEY not signed by the DS key; per-server disagreement), RFC 8659 CAA
+  tree-climb policy evaluation (allow-list, `accounturi`, `validationmethods`, permissive extra entries,
+  `issuewild` precedence, customer names), NS/SOA sanity. Pure evaluators over injected observations
+  (`evaluate_zone`, `evaluate_caa`), collectors over a `DnsLookup` trait, `NetLookup` for real sockets.
+  RRSIG signatures are **not** cryptographically verified.
+- **`dns` codec**: `DS`, `DNSKEY`, `RRSIG`, `NSEC` records (`RecordType::{DS,DNSKEY,RRSIG,NSEC}` are
+  associated constants over `Unknown(code)` so exhaustive matches elsewhere keep compiling), bounds-checked
+  decode, `dnskey_key_tag`, `serial_secs_until` (RFC 1982 times), `nsec_types`, `Name::canonical_wire`.
+  `edge_verify::DnsClient` exposes the UDP/TCP/EDNS0 (DO) query transport the probe already used.
+
+- **New `zone_sync`**: owner-signed, `(epoch, version)`-ordered object replication over `native` (signed-DNS semantics
+  without the 1000-byte BEP44 cap): `SignedObject` (domain-separated Ed25519 preimage, verify-on-decode), a bounded
+  ROOT/LIST/GET/PUSH anti-entropy protocol, `PeerPolicy` (pinned peers/publishers, default deny), `SyncStore` seam; used by `tas-dns`.
+
+### Crypto
+- **ACME account/certificate keys, JWS signing and CSR signing now use `aws-lc-rs`** instead of
+  hashtrinity's hand-written P-256 (variable-time scalar multiplication). The edge serves TLS
+  (`EdgeCertResolver::server_config`) and the HTTP client terminates/originates TLS on aws-lc-rs;
+  `ring` is no longer enabled. New `fips` feature builds the FIPS-validated module and restricts
+  providers to FIPS-approved suites (needs Go + CMake; if `bindgen` fails with a `syn` conflict run
+  `cargo update -p prettyplease --precise 0.2.37`).
+
+### Edge naming and admission
+- `APEXES` = tasmanian.cloud, tascloud.app, tascloud.dev, tasmaniancloud.{app,dev,com.au,au}.
+- A custom hostname's CNAME proof target must be an **active managed hostname of the same tenant**.
+- Released managed labels are **quarantined 30 days** against other tenants (dangling-CNAME takeover).
+- `cert_ready` only moves `PendingCert -> Active` (a certificate could previously lift a suspension);
+  new `activate_cert` / `cert_failed`.
+- Custom hostnames no public CA can certify (special-use TLDs, numeric TLD) are rejected; reserved
+  labels cover platform surfaces.
+- `EdgeCertResolver` is a real `ResolvesServerCert` with a digest-keyed cache (SNI -> certificate).
+- **TLS passthrough by SNI**: `tls_hello::peek_sni` (strict ClientHello parser), `TlsMode::Passthrough`,
+  `sni_route`, `decide_passthrough`. Passthrough names need no certificate and are never issued one.
+- `Decision::NoConnector.status()` is 502, matching its documentation (was 503).
+
+### Native transport
+- **`NativeEndpoint::accept` no longer lets one stalled peer block the listener.** It ran the
+  handshake inline with no timeout, so a TCP connection that said nothing held every later
+  dial-in hostage indefinitely. Handshakes now run concurrently (at most 256) on an acceptor task,
+  each under `HANDSHAKE_TIMEOUT` (10 s, also applied to `connect`). `accept` yields only
+  connections whose peer proved its identity.
+- Edge helpers: `EdgeRegistry::bind_peer`, `ZoneAuthority::set_caa_account_uri`,
+  `edge_verify::{ProofPolicy, sweep_shared}`, `RenewalEngine::run_forever_with`.
+- A test pins that the edge's server config negotiates hybrid `X25519MLKEM768` and still serves
+  classical-only clients.
+
+### Migration
+- `acme::Directory` gained `key_change` and `renewal_info` (both `Option`); `acme_renew::Reason` gained
+  `CaSuggested`; `CertIssuer` gained a defaulted `renewal_window` (existing implementors compile as is).
+- `AccountKey::from_bytes` now returns `Result` (new: `generate`, `to_bytes`).
+- `EdgeRegistry::add_custom` returns `InvalidCnameTarget` unless the target is an active managed
+  hostname of the same tenant. `HostnameRecord` has a new `tls_mode` field.
+- `release` of a managed label no longer frees it immediately for other tenants.
+- Hostnames under `twnstack.*` / `twnbox.*` are no longer edge apexes.
+- `MemoryCertSource::install` unchanged; new `remove`, and `CertStore` for writable stores.
+
 ## 0.2.0 — BREAKING: `dialkey::peer_id` returns the public key
 
 ### The defect
