@@ -20,7 +20,7 @@ dependencies = [
 [[package]]
 name = "apeiron"
 version = "0.1.0"
-source = "git+https://github.com/Ptyktos/apeiron.git?rev=a2b50938679888cba22e5174e8dce92dfb6414cc#a2b50938679888cba22e5174e8dce92dfb6414cc"
+source = "git+https://github.com/Ptyktos/apeiron.git?rev=255ca3018a0f06300153d905cb19b37ea548bb56#255ca3018a0f06300153d905cb19b37ea548bb56"
 
 [[package]]
 name = "async-compat"
@@ -565,7 +565,7 @@ checksum = "e4eba85ea1d0a966a983acd07deee566e67395d2d96b6fb39e62b5a833f1eb0b"
 [[package]]
 name = "hashtrinity"
 version = "0.1.0"
-source = "git+https://github.com/Ptyktos/hashtrinity?rev=8de00eff38d3ffa5393190c2358a9e54dac5bc2f#8de00eff38d3ffa5393190c2358a9e54dac5bc2f"
+source = "git+https://github.com/Ptyktos/hashtrinity?rev=92a88636ab0e59ffe366ace07c019cd1f35a0bfa#92a88636ab0e59ffe366ace07c019cd1f35a0bfa"
 dependencies = [
  "apeiron",
  "rustls",
@@ -1309,7 +1309,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 [[package]]
 name = "relayfold"
 version = "0.1.0"
-source = "git+https://github.com/Ptyktos/relayfold?rev=2a79c5aa9f9988d6376ec2f135ccd143ae8473b1#2a79c5aa9f9988d6376ec2f135ccd143ae8473b1"
+source = "git+https://github.com/Ptyktos/relayfold?rev=84169b1a5720828eb0d4925fb840c1afd88f9df8#84169b1a5720828eb0d4925fb840c1afd88f9df8"
 dependencies = [
  "hashtrinity",
 ]
