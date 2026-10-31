@@ -80,6 +80,30 @@ pub mod acme;
 /// The certificate renewal engine: what to issue, when to renew, how to fail, how to persist.
 #[cfg(feature = "native")]
 pub mod acme_renew;
+/// Where certificate-related randomness comes from (the OS CSPRNG through aws-lc-rs), the startup
+/// self-check that refuses a broken RNG, and the weak-secret gate for operator-supplied secrets.
+#[cfg(feature = "native")]
+pub mod entropy;
+/// Certificate private keys: the key policy (P-256/P-384, RSA >= 3072, nothing else), the
+/// generator seam, and atomic 0600 writes.
+#[cfg(feature = "native")]
+pub mod certkey;
+/// The CA allow-list: which CAs may issue, in what standing, and the CAA records that follow.
+#[cfg(feature = "native")]
+pub mod ca_policy;
+/// Obtaining certificates from several CAs: choice, bounded fail-over, benching, journal, ledger.
+#[cfg(feature = "native")]
+pub mod ca_resilience;
+/// Root-program (Mozilla CCADB, Chrome Root Store) distrust signals for the CAs we issue from.
+#[cfg(feature = "native")]
+pub mod ca_trust;
+/// Certificate Transparency monitoring: mis-issuance for our names, and SCTs in what we obtained.
+#[cfg(feature = "native")]
+pub mod ct_monitor;
+/// A small X.509 reader for the certificate lifecycle (issuer, SPKI, SANs, SCT presence,
+/// fingerprints). Not a path validator.
+#[cfg(feature = "native")]
+pub mod x509;
 /// DNS health findings for the zones and names the edge depends on: DNSSEC chain health
 /// (DS vs DNSKEY, RRSIG lifetime), RFC 8659 CAA policy, NS/SOA sanity. Pure evaluators over
 /// injected lookups; the live resolver is `edge_verify`'s DNS client.

@@ -908,10 +908,18 @@ pub trait CertSource: Send + Sync {
 }
 
 /// A certificate as it comes out of a [`CertSource`].
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct CertMaterial {
     pub chain_pem: String,
     pub key_pem: String,
+}
+
+// Manual: `key_pem` is a private key, and a `{:?}` in a log line or a failed assertion must never
+// be the way it leaves the process.
+impl std::fmt::Debug for CertMaterial {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CertMaterial").field("chain_pem_bytes", &self.chain_pem.len()).field("key_pem", &"<redacted>").finish()
+    }
 }
 
 /// The certificate name that covers `fqdn` under this registry's rules — the wildcard for a

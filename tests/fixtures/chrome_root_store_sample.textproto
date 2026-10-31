@@ -1,0 +1,721 @@
+# Chrome Root Store (excerpt of net/data/ssl/chrome_root_store/root_store.textproto, fetched 2026-10-22; trust_anchors blocks only).
+
+version_major: 43
+
+# CN=Amazon Root CA 3, O=Amazon, C=US
+# https://good.sca3a.amazontrust.com/
+# Constraint date: Mon, Sept 14, 2027, 23:59:59 GMT+0000
+trust_anchors {
+  sha256_hex: "18ce6cfe7bf14e60b2e347b8dfe868cb31d02ebb3ada271569f50343b46db3a4"
+  crs_root_id: 4
+  ev_policy_oids: "2.23.140.1.1"
+  constraints: {
+    sct_not_after_sec: 1820966399
+    min_version: "153.0.8010.0"
+  }
+  constraints: {
+    max_version_exclusive: "153.0.8010.0"
+  }
+}
+
+# CN=emSign Root CA - G1, O=eMudhra Technologies Limited, OU=emSign PKI, C=IN
+# https://testevg1.emsign.com/
+trust_anchors {
+  sha256_hex: "40f6af0346a99aa1cd1d555a4e9cce62c7f9634603ee406615833dc8c8d00367"
+  crs_root_id: 27
+  ev_policy_oids: "2.23.140.1.1"
+}
+
+# CN=GTS Root R1, O=Google Trust Services LLC, C=US
+trust_anchors {
+  sha256_hex: "d947432abde7b7fa90fc2e6b59101b1280e0e1c7e4e40fa3c6887fff57a7f4cf"
+  crs_root_id: 36
+  trust_anchor_id: "\xd6\x79\x09\x01"  # 11129.9.1
+}
+
+# CN=ISRG Root X1, O=Internet Security Research Group, C=US
+trust_anchors {
+  sha256_hex: "96bcec06264976f37460779acf28c5a7cfe8a3c0aae11a8ffcee05c0bddf08c6"
+  crs_root_id: 45
+  trust_anchor_id: "\x82\xdf\x13\x02\x01"  # 44947.2.1
+}
+
+# CN=Izenpe.com, O=IZENPE S.A., C=ES
+# The first OID is for businesses and the second for government entities.
+# These are the test sites, respectively:
+# https://servicios.izenpe.com
+# https://servicios1.izenpe.com
+# Constraint date: Tue, Apr 14, 2026 23:59:59 GMT+0000
+trust_anchors {
+  sha256_hex: "2530cc8e98321502bad96f9b1fba1b099e2d299e0f4548bb914f363bc0d4531f"
+  crs_root_id: 46
+  ev_policy_oids: "2.23.140.1.1"
+  constraints: {
+    sct_not_after_sec: 1776211199
+    min_version: "153.0.8010.0"
+  }
+  constraints: {
+    max_version_exclusive: "153.0.8010.0"
+  }
+}
+
+# CN=Actalis Authentication Root CA, O=Actalis S.p.A./03358520967, L=Milan, C=IT
+# https://ssltest-a.actalis.it:8443
+trust_anchors {
+  sha256_hex: "55926084ec963a64b96e2abe01ce0ba86a64fbfebcc7aab5afc155b37fd76066"
+  crs_root_id: 3
+  ev_policy_oids: "2.23.140.1.1"
+  eutl: true
+}
+
+# CN=Amazon Root CA 2, O=Amazon, C=US
+# https://good.sca2a.amazontrust.com/
+# Constraint date: Mon, Sept 14, 2027, 23:59:59 GMT+0000
+trust_anchors {
+  sha256_hex: "1ba5b2aa8c65401a82960118f80bec4f62304d83cec4713a19c39c011ea46db4"
+  crs_root_id: 5
+  ev_policy_oids: "2.23.140.1.1"
+  constraints: {
+    sct_not_after_sec: 1820966399
+    min_version: "153.0.8010.0"
+  }
+  constraints: {
+    max_version_exclusive: "153.0.8010.0"
+  }
+}
+
+# CN=Amazon Root CA 1, O=Amazon, C=US
+# https://good.sca1a.amazontrust.com/
+trust_anchors {
+  sha256_hex: "8ecde6884f3d87b1125ba31ac3fcb13d7016de7f57cc904fe1cb97c6ae98196e"
+  crs_root_id: 6
+  ev_policy_oids: "2.23.140.1.1"
+}
+
+# CN=Amazon Root CA 4, O=Amazon, C=US
+# https://good.sca4a.amazontrust.com/
+trust_anchors {
+  sha256_hex: "e35d28419ed02025cfa69038cd623962458da5c695fbdea3c22b0bfb25897092"
+  crs_root_id: 7
+  ev_policy_oids: "2.23.140.1.1"
+}
+
+# CN=Certum Trusted Network CA, OU=Certum Certification Authority, O=Unizeto Technologies S.A., C=PL
+# https://juice.certum.pl/
+# Constraint date: Wed, Sept 30, 2026, 23:59:59 GMT+0000
+trust_anchors {
+  sha256_hex: "5c58468d55f58e497e743982d2b50010b6d165374acf83a7d4a32db768c4408e"
+  crs_root_id: 8
+  ev_policy_oids: "2.23.140.1.1"
+  constraints: {
+    sct_not_after_sec: 1790812799
+    min_version: "153.0.8010.0"
+  }
+  constraints: {
+    max_version_exclusive: "153.0.8010.0"
+  }
+}
+
+# CN=Autoridad de Certificacion Firmaprofesional CIF A62634068, C=ES
+# https://publifirma.firmaprofesional.com/
+# Constraint date: Thurs, Aug 6, 2026 at 07:01:04 GMT+0000
+trust_anchors {
+  sha256_hex: "57de0583efd2b26e0361da99da9df4648def7ee8441c3b728afa9bcde0f9b26a"
+  crs_root_id: 10
+  ev_policy_oids: "2.23.140.1.1"
+  constraints: {
+    sct_not_after_sec: 1785999664
+    min_version: "153.0.8010.0"
+  }
+  constraints: {
+    max_version_exclusive: "153.0.8010.0"
+  }
+}
+
+# CN=Buypass Class 2 Root CA, O=Buypass AS-983163327, C=NO
+# Constraint date and time (GMT): Friday, October 31, 2025 11:59:59 PM
+trust_anchors {
+  sha256_hex: "9a114025197c5bb95d94e63d55cd43790847b646b23cdf11ada4a00eff15fb48"
+  crs_root_id: 11
+  constraints: {
+    sct_not_after_sec: 1761955199
+    min_version: "153.0.8010.0"
+  }
+  constraints: {
+    max_version_exclusive: "153.0.8010.0"
+  }
+}
+
+# CN=Buypass Class 3 Root CA, O=Buypass AS-983163327, C=NO
+# https://valid.evident.ca23.ssl.buypass.no/
+# Constraint date and time (GMT): Friday, October 31, 2025 11:59:59 PM
+trust_anchors {
+  sha256_hex: "edf7ebbca27a2a384d387b7d4010c666e2edb4843e4c29b4ae1d5b9332e6b24d"
+  crs_root_id: 12
+  ev_policy_oids: "2.23.140.1.1"
+  constraints: {
+    sct_not_after_sec: 1761955199
+    min_version: "153.0.8010.0"
+  }
+  constraints: {
+    max_version_exclusive: "153.0.8010.0"
+  }
+}
+
+# OU=certSIGN ROOT CA G2, O=CERTSIGN SA, C=RO
+# https://testssl-valid-evcp.certsign.ro/
+trust_anchors {
+  sha256_hex: "657cfe2fa73faa38462571f332a2363a46fce7020951710702cdfbb6eeda3305"
+  crs_root_id: 13
+  ev_policy_oids: "2.23.140.1.1"
+}
+
+# CN=CFCA EV ROOT, O=China Financial Certification Authority, C=CN
+# https://www.erenepu.com/
+trust_anchors {
+  sha256_hex: "5cc3d78e4e1d5e45547a04e6873e64f90cf9536d1ccc2ef800f355c4c5fd70fd"
+  crs_root_id: 14
+  ev_policy_oids: "2.23.140.1.1"
+}
+
+# CN=D-TRUST Root Class 3 CA 2 2009, O=D-Trust GmbH, C=DE
+# Constraint date: Thurs, May 28, 2026, 23:59:59 GMT+0000
+trust_anchors {
+  sha256_hex: "49e7a442acf0ea6287050054b52564b650e4f49e42e348d6aa38e039e957b1c1"
+  crs_root_id: 16
+  constraints: {
+    sct_not_after_sec: 1780012799
+    min_version: "153.0.8010.0"
+  }
+  constraints: {
+    max_version_exclusive: "153.0.8010.0"
+  }
+}
+
+# CN=D-TRUST Root Class 3 CA 2 EV 2009, O=D-Trust GmbH, C=DE
+# https://certdemo-ev-valid.ssl.d-trust.net/
+# Constraint date: Thurs, May 28, 2026, 23:59:59 GMT+0000
+trust_anchors {
+  sha256_hex: "eec5496b988ce98625b934092eec2908bed0b0f316c2d4730c84eaf1f3d34881"
+  crs_root_id: 17
+  # TODO(cclements,hchao): remove non-CABF OID once it is not used anymore.
+  ev_policy_oids: "1.3.6.1.4.1.4788.2.202.1"
+  ev_policy_oids: "2.23.140.1.1"
+  constraints: {
+    sct_not_after_sec: 1780012799
+    min_version: "153.0.8010.0"
+  }
+  constraints: {
+    max_version_exclusive: "153.0.8010.0"
+  }
+}
+
+# CN=T-TeleSec GlobalRoot Class 2, OU=T-Systems Trust Center, O=T-Systems Enterprise Services GmbH, C=DE
+# Constraint date: Thurs, May 28, 2026, 23:59:59 GMT+0000
+trust_anchors {
+  sha256_hex: "91e2f5788d5810eba7ba58737de1548a8ecacd014598bc0b143e041b17052552"
+  crs_root_id: 18
+  constraints: {
+    sct_not_after_sec: 1780012799
+    min_version: "153.0.8010.0"
+  }
+  constraints: {
+    max_version_exclusive: "153.0.8010.0"
+  }
+}
+
+# CN=T-TeleSec GlobalRoot Class 3, OU=T-Systems Trust Center, O=T-Systems Enterprise Services GmbH, C=DE
+# http://www.telesec.de/ / https://root-class3.test.telesec.de/
+# Constraint date: Thurs, May 28, 2026, 23:59:59 GMT+0000
+trust_anchors {
+  sha256_hex: "fd73dad31c644ff1b43bef0ccdda96710b9cd9875eca7e31707af3e96d522bbd"
+  crs_root_id: 19
+  ev_policy_oids: "2.23.140.1.1"
+  constraints: {
+    sct_not_after_sec: 1780012799
+    min_version: "153.0.8010.0"
+  }
+  constraints: {
+    max_version_exclusive: "153.0.8010.0"
+  }
+}
+
+# CN=Certigna Root CA, OU=0002 48146308100036, O=Dhimyotis, C=FR
+# Constraint date: Sun, Jun 14, 2026 23:59:59 GMT+0000
+trust_anchors {
+  sha256_hex: "d48d3d23eedb50a459e55197601c27774b9d7b18c94d5a059511a10250b93168"
+  crs_root_id: 20
+  constraints: {
+    sct_not_after_sec: 1781481599
+    min_version: "153.0.8010.0"
+  }
+  constraints: {
+    max_version_exclusive: "153.0.8010.0"
+  }
+}
+
+# CN=DigiCert Global Root G3, OU=www.digicert.com, O=DigiCert Inc, C=US
+# https://global-root-g3.chain-demos.digicert.com/
+# Constraint date: Mon, Sept 14, 2027, 23:59:59 GMT+0000
+trust_anchors {
+  sha256_hex: "31ad6648f8104138c738f39ea4320133393e3a18cc02296ef97c2ac9ef6731d0"
+  crs_root_id: 21
+  ev_policy_oids: "2.23.140.1.1"
+  trust_anchor_id: "\x83\x9a\x64\x8c\x9b\x2d\x01\x0a"  # 52580.200109.1.10
+  constraints: {
+    sct_not_after_sec: 1820966399
+    min_version: "153.0.8010.0"
+  }
+  constraints: {
+    max_version_exclusive: "153.0.8010.0"
+  }
+}
+
+# CN=DigiCert Global Root G2, OU=www.digicert.com, O=DigiCert Inc, C=US
+# https://global-root-g2.chain-demos.digicert.com/
+# Constraint date: Mon, Sept 14, 2027, 23:59:59 GMT+0000
+trust_anchors {
+  sha256_hex: "cb3ccbb76031e5e0138f8dd39a23f9de47ffc35e43c1144cea27d46a5ab1cb5f"
+  crs_root_id: 25
+  ev_policy_oids: "2.23.140.1.1"
+  trust_anchor_id: "\x83\x9a\x64\x8c\x9b\x2d\x01\x09"  # 52580.200109.1.9
+  constraints: {
+    sct_not_after_sec: 1820966399
+    min_version: "153.0.8010.0"
+  }
+  constraints: {
+    max_version_exclusive: "153.0.8010.0"
+  }
+}
+
+# CN=CA Disig Root R2, O=Disig a.s., L=Bratislava, C=SK
+trust_anchors {
+  sha256_hex: "e23d4a036d7b70e9f595b1422079d2b91edfbb1fb651a0633eaa8a9dc5f80703"
+  crs_root_id: 26
+}
+
+# CN=GDCA TrustAUTH R5 ROOT, O=GUANG DONG CERTIFICATE AUTHORITY CO.,LTD., C=CN
+trust_anchors {
+  sha256_hex: "bfff8fd04433487d6a8aa60c1a29767a9fc2bbb05e420f713a13b992891d3893"
+  crs_root_id: 29
+}
+
+# CN=GlobalSign, O=GlobalSign, OU=GlobalSign ECC Root CA - R5
+# https://2038r5.globalsign.com/
+# Constraint date: Wed, Sept 30, 2026, 23:59:59 GMT+0000
+trust_anchors {
+  sha256_hex: "179fbc148a3dd00fd24ea13458cc43bfa7f59c8182d783a513f6ebec100c8924"
+  crs_root_id: 30
+  ev_policy_oids: "2.23.140.1.1"
+  constraints: {
+    sct_not_after_sec: 1790812799
+    min_version: "153.0.8010.0"
+  }
+  constraints: {
+    max_version_exclusive: "153.0.8010.0"
+  }
+}
+
+# CN=GlobalSign, O=GlobalSign, OU=GlobalSign Root CA - R6
+# Constraint date: Wed, Sept 30, 2026, 23:59:59 GMT+0000
+trust_anchors {
+  sha256_hex: "2cabeafe37d06ca22aba7391c0033d25982952c453647349763a3ab5ad6ccf69"
+  crs_root_id: 31
+  ev_policy_oids: "2.23.140.1.1"
+  constraints: {
+    sct_not_after_sec: 1790812799
+    min_version: "153.0.8010.0"
+  }
+  constraints: {
+    max_version_exclusive: "153.0.8010.0"
+  }
+}
+
+# CN=GlobalSign, O=GlobalSign, OU=GlobalSign Root CA - R3
+# https://2029.globalsign.com/
+# Constraint date: Wed, Sept 30, 2026, 23:59:59 GMT+0000
+trust_anchors {
+  sha256_hex: "cbb522d7b7f127ad6a0113865bdf1cd4102e7d0759af635a7cf4720dc963c53b"
+  crs_root_id: 32
+  ev_policy_oids: "2.23.140.1.1"
+  constraints: {
+    sct_not_after_sec: 1790812799
+    min_version: "153.0.8010.0"
+  }
+  constraints: {
+    max_version_exclusive: "153.0.8010.0"
+  }
+}
+
+# CN=Starfield Root Certificate Authority - G2, O=Starfield Technologies, Inc., L=Scottsdale, ST=Arizona, C=US
+# https://valid.sfig2.catest.starfieldtech.com/
+trust_anchors {
+  sha256_hex: "2ce1cb0bf9d2f9e102993fbe215152c3b2dd0cabde1c68e5319b839154dbb7f5"
+  crs_root_id: 33
+  ev_policy_oids: "2.23.140.1.1"
+}
+
+# CN=Go Daddy Root Certificate Authority - G2, O=GoDaddy.com, Inc., L=Scottsdale, ST=Arizona, C=US
+# https://valid.gdig2.catest.godaddy.com/
+trust_anchors {
+  sha256_hex: "45140b3247eb9cc8c5b4f0d7b53091f73292089e6e5a63e2749dd3aca9198eda"
+  crs_root_id: 34
+  ev_policy_oids: "2.23.140.1.1"
+}
+
+# CN=GTS Root R4, O=Google Trust Services LLC, C=US
+trust_anchors {
+  sha256_hex: "349dfa4058c5e263123b398ae795573c4e1313c83fe68f93556cd5e8031b3c7d"
+  crs_root_id: 37
+  trust_anchor_id: "\xd6\x79\x09\x04"  # 11129.9.4
+}
+
+# CN=GlobalSign, O=GlobalSign, OU=GlobalSign ECC Root CA - R4
+# Constraint date: Mon, Sept 14, 2027, 23:59:59 GMT+0000
+trust_anchors {
+  sha256_hex: "b085d70b964f191a73e4af0d54ae7a0e07aafdaf9b71dd0862138ab7325a24a2"
+  crs_root_id: 38
+  constraints: {
+    sct_not_after_sec: 1820966399
+    min_version: "153.0.8010.0"
+  }
+  constraints: {
+    max_version_exclusive: "153.0.8010.0"
+  }
+}
+
+# CN=Hongkong Post Root CA 3, O=Hongkong Post, L=Hong Kong, ST=Hong Kong, C=HK
+# https://valid-ev.ecert.gov.hk/
+trust_anchors {
+  sha256_hex: "5a2fc03f0c83b090bbfa40604b0988446c7636183df9846e17101a447fb8efd6"
+  crs_root_id: 40
+  ev_policy_oids: "2.23.140.1.1"
+}
+
+# C=ES, O=ACCV, OU=PKIACCV, CN=ACCVRAIZ1
+trust_anchors {
+  sha256_hex: "9a6ec012e1a7da9dbe34194d478ad7c0db1822fb071df12981496ed104384113"
+  crs_root_id: 41
+}
+
+# OU=AC RAIZ FNMT-RCM, O=FNMT-RCM, C=ES
+trust_anchors {
+  sha256_hex: "ebc5570c29018c4d67b1aa127baf12f703b4611ebc17b7dab5573894179b93fa"
+  crs_root_id: 42
+}
+
+# CN=TUBITAK Kamu SM SSL Kok Sertifikasi - Surum 1, OU=Kamu Sertifikasyon Merkezi - Kamu SM, O=Turkiye Bilimsel ve Teknolojik Arastirma Kurumu - TUBITAK, L=Gebze - Kocaeli, C=TR
+trust_anchors {
+  sha256_hex: "46edc3689046d53a453fb3104ab80dcaec658b2660ea1629dd7e867990648716"
+  crs_root_id: 43
+}
+
+# CN=IdenTrust Commercial Root CA 1, O=IdenTrust, C=US
+# https://identrust-commercial-ev-valid.identrustssl.com/
+trust_anchors {
+  sha256_hex: "5d56499be4d2e08bcfcad08a3e38723d50503bde706948e42f55603019e528ae"
+  crs_root_id: 44
+  ev_policy_oids: "2.23.140.1.1"
+}
+
+# CN=SZAFIR ROOT CA2, O=Krajowa Izba Rozliczeniowa S.A., C=PL
+trust_anchors {
+  sha256_hex: "a1339d33281a0b56e557d3d32b1ce7f9367eb094bd5fa72a7e5004c8ded7cafe"
+  crs_root_id: 47
+}
+
+# emailAddress=info@e-szigno.hu, CN=Microsec e-Szigno Root CA 2009, O=Microsec Ltd., L=Budapest, C=HU
+# Constraint date: Wed, Sept 30, 2026, 23:59:59 GMT+0000
+trust_anchors {
+  sha256_hex: "3c5f81fea5fab82c64bfa2eaecafcde8e077fc8620a7cae537163df36edbf378"
+  crs_root_id: 48
+  constraints: {
+    sct_not_after_sec: 1790812799
+    min_version: "153.0.8010.0"
+  }
+  constraints: {
+    max_version_exclusive: "153.0.8010.0"
+  }
+}
+
+# CN=e-Szigno Root CA 2017, organizationIdentifier=VATHU-23584497, O=Microsec Ltd., L=Budapest, C=HU
+# Constraint date: Wed, Sept 30, 2026, 23:59:59 GMT+0000
+trust_anchors {
+  sha256_hex: "beb00b30839b9bc32c32e4447905950641f26421b15ed089198b518ae2ea1b99"
+  crs_root_id: 49
+  constraints: {
+    sct_not_after_sec: 1790812799
+    min_version: "153.0.8010.0"
+  }
+  constraints: {
+    max_version_exclusive: "153.0.8010.0"
+  }
+}
+
+# CN=Microsoft ECC Root Certificate Authority 2017, O=Microsoft Corporation, C=US
+trust_anchors {
+  sha256_hex: "358df39d764af9e1b766e9c972df352ee15cfac227af6ad1d70e8e4a6edcba02"
+  crs_root_id: 50
+}
+
+# CN=Microsoft RSA Root Certificate Authority 2017, O=Microsoft Corporation, C=US
+trust_anchors {
+  sha256_hex: "c741f70f4b2a8d88bf2e71c14122ef53ef10eba0cfa5e64cfa20f418853073e0"
+  crs_root_id: 51
+}
+
+# CN=OISTE WISeKey Global Root GB CA, OU=OISTE Foundation Endorsed, O=WISeKey, C=CH
+# https://goodevssl.wisekey.com
+# Constraint date: Wed, Sept 30, 2026, 23:59:59 GMT+0000
+trust_anchors {
+  sha256_hex: "6b9c08e86eb0f767cfad65cd98b62149e5494a67f5845e7bd1ed019f27b86bd6"
+  crs_root_id: 53
+  ev_policy_oids: "2.23.140.1.1"
+  constraints: {
+    sct_not_after_sec: 1790812799
+    min_version: "153.0.8010.0"
+  }
+  constraints: {
+    max_version_exclusive: "153.0.8010.0"
+  }
+}
+
+# CN=OISTE WISeKey Global Root GC CA, OU=OISTE Foundation Endorsed, O=WISeKey, C=CH
+# Constraint date: Wed, Sept 30, 2026, 23:59:59 GMT+0000
+trust_anchors {
+  sha256_hex: "8560f91c3624daba9570b5fea0dbe36ff11a8323be9486854fb3f34a5571198d"
+  crs_root_id: 54
+  constraints: {
+    sct_not_after_sec: 1790812799
+    min_version: "153.0.8010.0"
+  }
+  constraints: {
+    max_version_exclusive: "153.0.8010.0"
+  }
+}
+
+# CN=QuoVadis Root CA 3 G3, O=QuoVadis Limited, C=BM
+# Constraint date: Mon, Sept 14, 2027, 23:59:59 GMT+0000
+trust_anchors {
+  sha256_hex: "88ef81de202eb018452e43f864725cea5fbd1fc2d9d205730709c5d8b8690f46"
+  crs_root_id: 55
+  trust_anchor_id: "\x83\x9a\x64\x8c\x9b\x2d\x01\x08"  # 52580.200109.1.8
+  constraints: {
+    sct_not_after_sec: 1820966399
+    min_version: "153.0.8010.0"
+  }
+  constraints: {
+    max_version_exclusive: "153.0.8010.0"
+  }
+}
+
+# CN=QuoVadis Root CA 2 G3, O=QuoVadis Limited, C=BM
+# https://evsslicag3-v.quovadisglobal.com/
+# Constraint date: Mon, Sept 14, 2027, 23:59:59 GMT+0000
+trust_anchors {
+  sha256_hex: "8fe4fb0af93a4d0d67db0bebb23e37c71bf325dcbcdd240ea04daf58b47e1840"
+  crs_root_id: 56
+  ev_policy_oids: "2.23.140.1.1"
+  trust_anchor_id: "\x83\x9a\x64\x8c\x9b\x2d\x01\x07"  # 52580.200109.1.7
+  constraints: {
+    sct_not_after_sec: 1820966399
+    min_version: "153.0.8010.0"
+  }
+  constraints: {
+    max_version_exclusive: "153.0.8010.0"
+  }
+}
+
+# OU=Security Communication RootCA2, O=SECOM Trust Systems CO.,LTD., C=JP
+# https://www.secomtrust.net/contact/form.html
+trust_anchors {
+  sha256_hex: "513b2cecb810d4cde5dd85391adfc6c2dd60d87bb736d2b521484aa47a0ebef6"
+  crs_root_id: 57
+  # TODO(cclements,hchao): remove non-CABF OID once it is not used anymore.
+  ev_policy_oids: "1.2.392.200091.100.721.1"
+  ev_policy_oids: "2.23.140.1.1"
+}
+
+# CN=COMODO ECC Certification Authority, O=COMODO CA Limited, L=Salford, ST=Greater Manchester, C=GB
+# https://comodoecccertificationauthority-ev.comodoca.com/
+# Constraint date: Wed, Sept 30, 2026, 23:59:59 GMT+0000
+trust_anchors {
+  sha256_hex: "1793927a0614549789adce2f8f34f7f0b66d0f3ae3a3b84d21ec15dbba4fadc7"
+  crs_root_id: 59
+  ev_policy_oids: "2.23.140.1.1"
+  constraints: {
+    sct_not_after_sec: 1790812799
+    min_version: "153.0.8010.0"
+  }
+  constraints: {
+    max_version_exclusive: "153.0.8010.0"
+  }
+}
+
+# CN=USERTrust ECC Certification Authority, O=The USERTRUST Network, L=Jersey City, ST=New Jersey, C=US
+# https://usertrustecccertificationauthority-ev.comodoca.com/
+# Constraint date: Wed, Sept 30, 2026, 23:59:59 GMT+0000
+trust_anchors {
+  sha256_hex: "4ff460d54b9c86dabfbcfc5712e0400d2bed3fbc4d4fbdaa86e06adcd2a9ad7a"
+  crs_root_id: 60
+  ev_policy_oids: "2.23.140.1.1"
+  constraints: {
+    sct_not_after_sec: 1790812799
+    min_version: "153.0.8010.0"
+  }
+  constraints: {
+    max_version_exclusive: "153.0.8010.0"
+  }
+}
+
+# CN=COMODO RSA Certification Authority, O=COMODO CA Limited, L=Salford, ST=Greater Manchester, C=GB
+# https://comodorsacertificationauthority-ev.comodoca.com/
+# Constraint date: Wed, Sept 30, 2026, 23:59:59 GMT+0000
+trust_anchors {
+  sha256_hex: "52f0e1c4e58ec629291b60317f074671b85d7ea80d5b07273463534b32b40234"
+  crs_root_id: 61
+  ev_policy_oids: "2.23.140.1.1"
+  constraints: {
+    sct_not_after_sec: 1790812799
+    min_version: "153.0.8010.0"
+  }
+  constraints: {
+    max_version_exclusive: "153.0.8010.0"
+  }
+}
+
+# CN=USERTrust RSA Certification Authority, O=The USERTRUST Network, L=Jersey City, ST=New Jersey, C=US
+# https://usertrustrsacertificationauthority-ev.comodoca.com/
+# Constraint date: Wed, Sept 30, 2026, 23:59:59 GMT+0000
+trust_anchors {
+  sha256_hex: "e793c9b02fd8aa13e21c31228accb08119643b749c898964b1746d46c3d4cbd2"
+  crs_root_id: 62
+  ev_policy_oids: "2.23.140.1.1"
+  constraints: {
+    sct_not_after_sec: 1790812799
+    min_version: "153.0.8010.0"
+  }
+  constraints: {
+    max_version_exclusive: "153.0.8010.0"
+  }
+}
+
+# CN=UCA Global G2 Root, O=UniTrust, C=CN
+trust_anchors {
+  sha256_hex: "9bea11c976fe014764c1be56a6f914b5a560317abd9988393382e5161aa0493c"
+  crs_root_id: 63
+}
+
+# CN=UCA Extended Validation Root, O=UniTrust, C=CN
+# https://rsaevg1.good.sheca.com/
+trust_anchors {
+  sha256_hex: "d43af9b35473755c9684fc06d7d8cb70ee5c28e773fb294eb41ee71722924d24"
+  crs_root_id: 64
+  ev_policy_oids: "2.23.140.1.1"
+}
+
+# CN=SSL.com EV Root Certification Authority ECC, O=SSL Corporation, L=Houston, ST=Texas, C=US
+# https://test-ev-ecc.ssl.com/
+# Constraint date: Sun, Jun 14, 2026 23:59:59 GMT+0000
+trust_anchors {
+  sha256_hex: "22a2c1f7bded704cc1e701b5f408c310880fe956b5de2a4a44f99c873a25a7c8"
+  crs_root_id: 65
+  ev_policy_oids: "2.23.140.1.1"
+  constraints: {
+    sct_not_after_sec: 1781481599
+    min_version: "153.0.8010.0"
+  }
+  constraints: {
+    max_version_exclusive: "153.0.8010.0"
+  }
+}
+
+# CN=SSL.com EV Root Certification Authority RSA R2, O=SSL Corporation, L=Houston, ST=Texas, C=US
+# https://test-ev-rsa.ssl.com/
+# Constraint date: Sun, Jun 14, 2026 23:59:59 GMT+0000
+trust_anchors {
+  sha256_hex: "2e7bf16cc22485a7bbe2aa8696750761b0ae39be3b2fe9d0cc6d4ef73491425c"
+  crs_root_id: 66
+  ev_policy_oids: "2.23.140.1.1"
+  constraints: {
+    sct_not_after_sec: 1781481599
+    min_version: "153.0.8010.0"
+  }
+  constraints: {
+    max_version_exclusive: "153.0.8010.0"
+  }
+}
+
+# CN=SSL.com Root Certification Authority ECC, O=SSL Corporation, L=Houston, ST=Texas, C=US
+# Constraint date: Sun, Jun 14, 2026 23:59:59 GMT+0000
+trust_anchors {
+  sha256_hex: "3417bb06cc6007da1b961c920b8ab4ce3fad820e4aa30b9acbc4a74ebdcebc65"
+  crs_root_id: 67
+  constraints: {
+    sct_not_after_sec: 1781481599
+    min_version: "153.0.8010.0"
+  }
+  constraints: {
+    max_version_exclusive: "153.0.8010.0"
+  }
+}
+
+# CN=SSL.com Root Certification Authority RSA, O=SSL Corporation, L=Houston, ST=Texas, C=US
+# Constraint date: Sun, Jun 14, 2026 23:59:59 GMT+0000
+trust_anchors {
+  sha256_hex: "85666a562ee0be5ce925c1d8890a6f76a87ec16d4d7d5f29ea7419cf20123b69"
+  crs_root_id: 68
+  constraints: {
+    sct_not_after_sec: 1781481599
+    min_version: "153.0.8010.0"
+  }
+  constraints: {
+    max_version_exclusive: "153.0.8010.0"
+  }
+}
+
+# CN=TWCA Global Root CA, OU=Root CA, O=TAIWAN-CA, C=TW
+# https://evssldemo3.twca.com.tw/index.html
+# Constraint date: Mon, Sep 14, 2026 23:59:59 GMT+0000
+trust_anchors {
+  sha256_hex: "59769007f7685d0fcd50872f9f95d5755a5b2b457d81f3692b610a98672f0e1b"
+  crs_root_id: 69
+  ev_policy_oids: "2.23.140.1.1"
+  constraints: {
+    sct_not_after_sec: 1789430399
+    min_version: "153.0.8010.0"
+  }
+  constraints: {
+    max_version_exclusive: "153.0.8010.0"
+  }
+}
+
+# CN=Certum EC-384 CA, OU=Certum Certification Authority, O=Asseco Data Systems S.A., C=PL
+# https://valid-cec384ca.certificates.certum.pl/
+trust_anchors {
+  sha256_hex: "6b328085625318aa50d173c98d8bda09d57e27413d114cf787a0f5d06c030cf6"
+  crs_root_id: 70
+  ev_policy_oids: "2.23.140.1.1"
+}
+
+# CN=Certum Trusted Root CA, OU=Certum Certification Authority, O=Asseco Data Systems S.A., C=PL
+# https://valid-ctrca.certificates.certum.pl/
+trust_anchors {
+  sha256_hex: "fe7696573855773e37a95e7ad4d9cc96c30157c15d31765ba9b15704e1ae78fd"
+  crs_root_id: 71
+  ev_policy_oids: "2.23.140.1.1"
+}
+
+# CN=D-TRUST BR Root CA 1 2020, O=D-Trust GmbH, C=DE
+# Constraint date: Mon, Sept 14, 2027, 23:59:59 GMT+0000
+trust_anchors {
+  sha256_hex: "e59aaa816009c22bff5b25bad37df306f049797c1f81d85ab089e657bd8f0044"
+  crs_root_id: 72
+  constraints: {
+    sct_not_after_sec: 1820966399
+    min_version: "153.0.8010.0"
+  }
+  constraints: {
+    max_version_exclusive: "153.0.8010.0"
+  }
+}

@@ -34,6 +34,18 @@ mod imp {
         Ed25519KeyPair::from_seed_unchecked(seed).expect("32-byte Ed25519 seed")
     }
 
+    /// `n` bytes from the system CSPRNG through aws-lc-rs (the FIPS-validated DRBG with the `fips`
+    /// feature). A failing RNG panics rather than returning predictable bytes: every caller is a
+    /// key, nonce or identifier whose predictability would void the security of the handshake.
+    #[must_use]
+    pub fn random_bytes(n: usize) -> Vec<u8> {
+        let mut out = vec![0u8; n];
+        if aws_lc_rs::rand::fill(&mut out).is_err() {
+            panic!("the system RNG failed; refusing to continue with predictable key material");
+        }
+        out
+    }
+
     /// The Ed25519 public key for a 32-byte seed.
     #[must_use]
     pub fn ed25519_pubkey(seed: &[u8; 32]) -> [u8; 32] {
@@ -110,6 +122,13 @@ mod imp {
 mod imp {
     use hashtrinity::crypto as ht;
 
+    /// `n` bytes from the kernel CSPRNG (the zero-dependency core has no aws-lc-rs); panics on
+    /// failure, never returning predictable bytes.
+    #[must_use]
+    pub fn random_bytes(n: usize) -> Vec<u8> {
+        ht::rand_bytes(n)
+    }
+
     #[must_use]
     pub fn ed25519_pubkey(seed: &[u8; 32]) -> [u8; 32] {
         ht::ed25519_pubkey(seed)
@@ -149,6 +168,14 @@ pub use imp::*;
 mod tests {
     use super::*;
     use hashtrinity::crypto as ht;
+
+    #[test]
+    fn random_bytes_come_from_the_system_rng_and_differ() {
+        let (a, b) = (random_bytes(32), random_bytes(32));
+        assert_eq!((a.len(), b.len()), (32, 32));
+        assert_ne!(a, b);
+        assert_ne!(a, vec![0u8; 32]);
+    }
 
     fn rnd<const N: usize>() -> [u8; N] {
         let mut a = [0u8; N];

@@ -115,7 +115,7 @@ pub(super) fn derive_session_keys(shared_secret: &[u8; 32], client: &HandshakeMs
 
 /// Generate a fresh ephemeral X25519 keypair for one handshake. Returns (secret, public).
 pub(super) fn generate_ephemeral_x25519() -> ([u8; 32], [u8; 32]) {
-    let ephemeral_secret_bytes = hashtrinity::crypto::rand_bytes(32);
+    let ephemeral_secret_bytes = crate::prim::random_bytes(32);
     let mut ephemeral_secret = [0u8; 32];
     ephemeral_secret.copy_from_slice(&ephemeral_secret_bytes);
     let ephemeral_pubkey = x25519_pubkey(&ephemeral_secret);
@@ -273,7 +273,7 @@ impl NativeEndpoint {
     /// Generates a fresh Ed25519 keypair for the endpoint identity.
     pub async fn bind(addr: &str) -> io::Result<Self> {
         let listener = TcpListener::bind(addr).await?;
-        let secret_key_bytes = hashtrinity::crypto::rand_bytes(32);
+        let secret_key_bytes = crate::prim::random_bytes(32);
         let mut secret_key = [0u8; 32];
         secret_key.copy_from_slice(&secret_key_bytes);
         let peer_id = crate::prim::ed25519_pubkey(&secret_key);

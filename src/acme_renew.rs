@@ -47,6 +47,7 @@ use hashtrinity::crypto::sha256;
 use hashtrinity::Table;
 
 use crate::acme::{days_from_civil, der, AcmeClient, AcmeError, Dns01Responder, Http01Responder, RenewalWindow, RevocationReason};
+use crate::certkey::{KeyAlg, KeyPolicy};
 use crate::edge::{CertMaterial, CertSource, EdgeRegistry, APEXES};
 use crate::edge_proxy::MemoryCertSource;
 use crate::BoxFuture;
@@ -215,10 +216,26 @@ impl FileCertStore {
         let mem = MemoryCertSource::new();
         for entry in std::fs::read_dir(&dir)? {
             let path = entry?.path();
+            let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            // A crashed write leaves its temporary file, which holds a private key: destroy it.
+            if file_name.ends_with(".tmp") && (file_name.starts_with('.') || file_name.ends_with(".pem.tmp")) {
+                shred(&path);
+                continue;
+            }
             if path.extension().and_then(|e| e.to_str()) != Some("pem") {
                 continue;
             }
             let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else { continue };
+            // A key file other users could read is treated as exposed: tighten it (the only thing
+            // still in our power) and say so. It is replaced at the next renewal like any other.
+            if crate::certkey::is_group_or_world_accessible(&path) {
+                tracing::warn!(path = %path.display(), "certificate key file was group/world accessible; restricting to 0600");
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+                }
+            }
             match Self::read_file(&path) {
                 Some(material) => mem.install(name_from_stem(stem), material),
                 None => tracing::warn!(path = %path.display(), "skipping unreadable certificate file"),
@@ -255,6 +272,39 @@ fn validate(material: &CertMaterial) -> Result<Validity, String> {
     Ok(v)
 }
 
+/// [`validate`] plus the key policy ([`KeyPolicy`]): what is accepted for a **new** installation.
+/// Loading what is already on disk, and queueing a certificate for revocation, use the structural
+/// check alone -- a key that predates the policy must still be servable until it is replaced, and a
+/// weak key must still be revocable.
+fn validate_new(material: &CertMaterial) -> Result<Validity, String> {
+    let v = validate(material)?;
+    KeyPolicy::default().check_pkcs8_pem(&material.key_pem).map_err(|e| format!("certificate key refused: {e}"))?;
+    Ok(v)
+}
+
+/// Whether two materials hold the same private key: byte-identical PKCS#8, or the same EC public
+/// point (a re-encoding of one key), or leaf certificates certifying the same `SubjectPublicKeyInfo`.
+/// A renewal that returns the same key as the certificate it replaces has defeated the point of
+/// rotating (a key stolen once stays useful for the next lifetime).
+#[must_use]
+pub fn same_key(a: &CertMaterial, b: &CertMaterial) -> bool {
+    let der = |m: &CertMaterial| crate::pem::blocks(&m.key_pem, "PRIVATE KEY").into_iter().next();
+    if let (Some(x), Some(y)) = (der(a), der(b)) {
+        if x == y {
+            return true;
+        }
+        let point = |d: &[u8]| {
+            [KeyAlg::P256, KeyAlg::P384].into_iter().find_map(|alg| aws_lc_rs::signature::EcdsaKeyPair::from_pkcs8(alg.signing(), d).ok().map(|k| aws_lc_rs::signature::KeyPair::public_key(&k).as_ref().to_vec()))
+        };
+        if let (Some(px), Some(py)) = (point(&x), point(&y)) {
+            if px == py {
+                return true;
+            }
+        }
+    }
+    matches!((crate::x509::leaf_spki(&a.chain_pem), crate::x509::leaf_spki(&b.chain_pem)), (Some(x), Some(y)) if x == y)
+}
+
 impl CertSource for FileCertStore {
     fn cert_for(&self, cert_name: &str) -> Option<CertMaterial> {
         self.mem.cert_for(cert_name)
@@ -263,33 +313,17 @@ impl CertSource for FileCertStore {
 
 impl CertStore for FileCertStore {
     fn put(&self, name: &str, material: CertMaterial) -> Result<(), String> {
-        validate(&material)?;
+        validate_new(&material)?;
         let path = self.path_for(name).ok_or_else(|| format!("refusing to store a certificate under {name:?}"))?;
-        let tmp = path.with_extension("pem.tmp");
         let mut body = material.chain_pem.clone();
         if !body.ends_with('\n') {
             body.push('\n');
         }
         body.push_str(&material.key_pem);
-        {
-            use std::io::Write;
-            let mut opts = std::fs::OpenOptions::new();
-            opts.write(true).create(true).truncate(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                opts.mode(0o600);
-            }
-            let mut f = opts.open(&tmp).map_err(|e| format!("writing {}: {e}", tmp.display()))?;
-            f.write_all(body.as_bytes()).map_err(|e| format!("writing {}: {e}", tmp.display()))?;
-            f.sync_all().map_err(|e| format!("syncing {}: {e}", tmp.display()))?;
-        }
-        std::fs::rename(&tmp, &path).map_err(|e| format!("installing {}: {e}", path.display()))?;
-        // The rename itself must be durable too: without syncing the directory a power loss can
-        // drop the new directory entry and a restart would reload the old certificate (or none)
-        // and place another order.
-        #[cfg(unix)]
-        std::fs::File::open(&self.dir).and_then(|d| d.sync_all()).map_err(|e| format!("syncing {}: {e}", self.dir.display()))?;
+        // Exclusive temp file at 0600 from creation, fsync, rename, directory fsync: a crash or a
+        // power loss leaves the old file or the new one, never a torn or readable one, and the
+        // directory entry is durable so a restart does not re-order a certificate it had.
+        crate::certkey::write_private_atomic(&path, body.as_bytes()).map_err(|e| format!("installing {}: {e}", path.display()))?;
         // Memory is updated only after the file is durable: what is served is never ahead of
         // what a restart would reload.
         self.mem.install(name.to_string(), material);
@@ -417,34 +451,17 @@ fn revocation_id(chain_pem: &str) -> String {
     sha256(chain_pem.as_bytes()).iter().take(16).map(|b| format!("{b:02x}")).collect()
 }
 
-/// Write `body` to `path` atomically (temp file, 0600, fsync, rename, fsync of the directory).
+/// Write `body` to `path` atomically and privately (see [`crate::certkey::write_private_atomic`]).
 fn write_private(path: &Path, body: &str) -> Result<(), String> {
-    use std::io::Write;
-    let tmp = path.with_extension("tmp");
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    {
-        let mut f = opts.open(&tmp).map_err(|e| format!("writing {}: {e}", tmp.display()))?;
-        f.write_all(body.as_bytes()).and_then(|()| f.sync_all()).map_err(|e| format!("writing {}: {e}", tmp.display()))?;
-    }
-    std::fs::rename(&tmp, path).map_err(|e| format!("installing {}: {e}", path.display()))?;
-    #[cfg(unix)]
-    if let Some(dir) = path.parent() {
-        std::fs::File::open(dir).and_then(|d| d.sync_all()).map_err(|e| format!("syncing {}: {e}", dir.display()))?;
-    }
-    Ok(())
+    crate::certkey::write_private_atomic(path, body.as_bytes()).map_err(|e| format!("writing {}: {e}", path.display()))
 }
 
 /// Overwrite then unlink: the key does not linger in a freed block more than a file system lets us
 /// prevent (journalling and copy-on-write file systems can still keep old blocks; the directory is
 /// 0700 and the disk is expected to be encrypted).
 fn shred(path: &Path) {
-    if let Ok(meta) = std::fs::metadata(path) {
+    // Only a regular file is overwritten: writing zeros through a symlink would damage its target.
+    if let Ok(meta) = std::fs::symlink_metadata(path).and_then(|m| if m.is_file() { Ok(m) } else { Err(std::io::Error::other("not a regular file")) }) {
         if let Ok(f) = std::fs::OpenOptions::new().write(true).open(path) {
             use std::io::Write;
             let mut f = f;
@@ -724,6 +741,32 @@ pub trait CertIssuer: Send + Sync {
     fn revoke<'a>(&'a self, _material: &'a CertMaterial) -> BoxFuture<'a, Result<(), AcmeError>> {
         Box::pin(async { Ok(()) })
     }
+
+    /// Whether the CA that issued `material` has been marked for leaving (see
+    /// [`crate::ca_policy::CaStatus`]): a certificate from a [`Migration::Retiring`] CA is renewed
+    /// early, one from a [`Migration::Distrusted`] CA first of all. The default says there is no
+    /// reason to move, which is right for an issuer with a single CA.
+    fn migration(&self, _material: &CertMaterial) -> Migration {
+        Migration::None
+    }
+
+    /// The configured name of the CA that issued `material`, for status and metrics.
+    fn ca_name(&self, _material: &CertMaterial) -> Option<String> {
+        None
+    }
+}
+
+/// Whether a held certificate should be replaced because of who issued it, and how urgently.
+/// The derived order is the urgency order: `None < Retiring < Distrusted`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Migration {
+    #[default]
+    None,
+    /// The CA is being phased out: replace its certificates early, without emergency.
+    Retiring,
+    /// The CA is distrusted (or has lost the trust of a root program): replace its certificates
+    /// before anything else, and revoke the ones replaced.
+    Distrusted,
 }
 
 /// Lets one issuer serve the renewal engine and a separate revocation worker.
@@ -740,6 +783,12 @@ impl<T: CertIssuer + ?Sized> CertIssuer for Arc<T> {
     fn revoke<'a>(&'a self, material: &'a CertMaterial) -> BoxFuture<'a, Result<(), AcmeError>> {
         (**self).revoke(material)
     }
+    fn migration(&self, material: &CertMaterial) -> Migration {
+        (**self).migration(material)
+    }
+    fn ca_name(&self, material: &CertMaterial) -> Option<String> {
+        (**self).ca_name(material)
+    }
 }
 
 /// [`CertIssuer`] over a registered ACME account: DNS-01 for wildcards (we are the
@@ -754,6 +803,18 @@ impl AcmeIssuer {
     #[must_use]
     pub fn new(client: AcmeClient, dns01: Arc<dyn Dns01Responder>, http01: Option<Arc<dyn Http01Responder>>) -> Self {
         AcmeIssuer { client, dns01, http01 }
+    }
+
+    /// The ACME account URL at the CA (the value CAA's `accounturi` binds to).
+    #[must_use]
+    pub fn account_url(&self) -> Option<String> {
+        self.client.account_url()
+    }
+
+    /// The directory URL this issuer's client talks to.
+    #[must_use]
+    pub fn directory_url(&self) -> &str {
+        self.client.directory_url()
     }
 }
 
@@ -840,6 +901,10 @@ pub struct RenewalPolicy {
     pub give_up_after: u32,
     /// How long a certificate for a no-longer-required name is kept before being deleted.
     pub prune_after_secs: i64,
+    /// Most certificates replaced per pass **because their CA is retiring or distrusted**, on top
+    /// of `max_per_run`: a CA leaving is a bounded emergency, and the ordinary pace (10 an hour)
+    /// would take days to move a fleet. Still bounded, because the new CA has rate limits too.
+    pub migration_per_run: usize,
 }
 
 impl Default for RenewalPolicy {
@@ -851,6 +916,7 @@ impl Default for RenewalPolicy {
             max_per_run: 10,
             give_up_after: 6,
             prune_after_secs: 7 * 24 * 3600,
+            migration_per_run: 50,
         }
     }
 }
@@ -865,6 +931,10 @@ pub enum Reason {
     /// The CA's ACME Renewal Information window (RFC 9773) has opened for this certificate,
     /// ahead of the percentage-of-lifetime rule.
     CaSuggested,
+    /// The CA that issued the held certificate is being retired.
+    CaRetiring,
+    /// The CA that issued the held certificate is distrusted.
+    CaDistrusted,
 }
 
 /// Whether, given what is held, `cert_name` needs an order now. Pure. This is the
@@ -964,6 +1034,10 @@ pub struct RunReport {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CertStatus {
     pub name: String,
+    /// The configured name of the CA that issued the held certificate, when the issuer knows.
+    pub ca: Option<String>,
+    /// Whether the held certificate is waiting to be moved off its CA.
+    pub migration: Migration,
     pub not_after: Option<i64>,
     pub seconds_left: Option<i64>,
     pub consecutive_failures: u32,
@@ -1066,7 +1140,7 @@ impl<S: CertStore, I: CertIssuer> RenewalEngine<S, I> {
         required.sort();
 
         // 2. What is due, most urgent first (nothing held, then soonest expiry).
-        let mut work: Vec<(i64, String, Reason)> = Vec::new();
+        let mut work: Vec<(u8, i64, String, Reason)> = Vec::new();
         for name in &required {
             let held = self.store.cert_for(name);
             let mut s = self.st(name);
@@ -1074,6 +1148,15 @@ impl<S: CertStore, I: CertIssuer> RenewalEngine<S, I> {
             // The percentage rule decides first and costs nothing; only a held certificate it
             // calls healthy is worth asking the CA about.
             let mut reason = due(&self.policy, held.as_ref(), now);
+            if let (None, Some(material)) = (reason, &held) {
+                // Who issued it comes before when it expires: a certificate from a distrusted or
+                // retiring CA is replaced whatever its remaining lifetime.
+                reason = match self.issuer.migration(material) {
+                    Migration::Distrusted => Some(Reason::CaDistrusted),
+                    Migration::Retiring => Some(Reason::CaRetiring),
+                    Migration::None => None,
+                };
+            }
             if let (None, Some(material)) = (reason, &held) {
                 let window = self.ca_window(material, &mut s, now).await;
                 reason = due_with_window(&self.policy, name, held.as_ref(), now, window.as_ref());
@@ -1094,19 +1177,40 @@ impl<S: CertStore, I: CertIssuer> RenewalEngine<S, I> {
                         .as_ref()
                         .and_then(|m| cert_validity(&m.chain_pem))
                         .map_or(i64::MIN, |v| v.not_after);
-                    work.push((urgency, name.clone(), reason));
+                    // Names with nothing usable are already down and go first; then certificates
+                    // from a distrusted CA (a browser may already refuse them), then a retiring
+                    // CA's, then the ordinary schedule by soonest expiry.
+                    let tier = match reason {
+                        Reason::Missing | Reason::Unreadable | Reason::Expired => 0,
+                        Reason::CaDistrusted => 1,
+                        Reason::CaRetiring => 2,
+                        Reason::Renewal | Reason::CaSuggested => 3,
+                    };
+                    work.push((tier, urgency, name.clone(), reason));
                 }
             }
         }
-        work.sort_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
+        work.sort_by(|a, b| (a.0, a.1, &a.2).cmp(&(b.0, b.1, &b.2)));
 
-        // 3. Order them. No registry lock is held across the CA round trip.
-        for (_, name, reason) in work.into_iter().take(self.policy.max_per_run) {
+        // 3. Order them. No registry lock is held across the CA round trip. Ordinary work and
+        //    CA-migration work have separate per-pass budgets, so a mass migration neither starves
+        //    the ordinary schedule nor is throttled to its pace.
+        let (mut ordinary_budget, mut migration_budget) = (self.policy.max_per_run, self.policy.migration_per_run);
+        let mut batch = Vec::new();
+        for (_, _, name, reason) in work {
+            let budget = if matches!(reason, Reason::CaDistrusted | Reason::CaRetiring) { &mut migration_budget } else { &mut ordinary_budget };
+            if *budget > 0 {
+                *budget -= 1;
+                batch.push((name, reason));
+            }
+        }
+        for (name, reason) in batch {
             // A renewal names the certificate it replaces (RFC 9773) so the CA can treat it as one;
             // a first issuance, or a replacement of something already expired or unreadable, has
             // nothing to name.
+            let held_before = self.store.cert_for(&name);
             let previous = match reason {
-                Reason::Renewal | Reason::CaSuggested => self.store.cert_for(&name),
+                Reason::Renewal | Reason::CaSuggested | Reason::CaRetiring | Reason::CaDistrusted => held_before.clone(),
                 Reason::Missing | Reason::Unreadable | Reason::Expired => None,
             };
             let ordered = match &previous {
@@ -1114,11 +1218,28 @@ impl<S: CertStore, I: CertIssuer> RenewalEngine<S, I> {
                 None => self.issuer.issue(&name).await,
             };
             let outcome: Result<(), (String, Option<u64>)> = match ordered {
-                Ok(material) => match validate(&material) {
+                // A new certificate must not reuse the private key of the one it replaces (or of
+                // whatever is held, expired or not): rotation that keeps the key rotates nothing.
+                Ok(material) if held_before.as_ref().is_some_and(|h| same_key(h, &material)) => {
+                    Err(("the issuer returned a certificate with the same private key as the one it replaces; refusing to install it".to_string(), None))
+                }
+                Ok(material) => match validate_new(&material) {
                     // Never replace a held certificate with something the CA mangled or that
                     // is already dead: a bad order must leave last-known-good untouched.
                     Ok(v) if v.not_after > now && v.not_before <= now.saturating_add(NOT_BEFORE_SKEW_SECS) => {
-                        self.store.put(&name, material).map_err(|e| (e, None))
+                        let installed = self.store.put(&name, material).map_err(|e| (e, None));
+                        if installed.is_ok() {
+                            // The replaced certificate of a distrusted CA is revoked at that CA
+                            // (queued durably; the key stays with the entry until it lands).
+                            if let (Some(old), Some(queue)) = (&held_before, &self.revocations) {
+                                if self.issuer.migration(old) == Migration::Distrusted {
+                                    if let Err(e) = queue.enqueue(&name, old.clone(), now) {
+                                        tracing::error!(cert = %name, error = %e, "could not queue the distrusted CA's certificate for revocation");
+                                    }
+                                }
+                            }
+                        }
+                        installed
                     }
                     Ok(v) if v.not_before > now => Err(("CA returned a certificate that is not yet valid".to_string(), None)),
                     Ok(_) => Err(("CA returned an already-expired certificate".to_string(), None)),
@@ -1229,8 +1350,11 @@ impl<S: CertStore, I: CertIssuer> RenewalEngine<S, I> {
             .into_iter()
             .map(|name| {
                 let s = self.st(&name);
-                let v = self.store.cert_for(&name).and_then(|m| cert_validity(&m.chain_pem));
+                let held = self.store.cert_for(&name);
+                let v = held.as_ref().and_then(|m| cert_validity(&m.chain_pem));
                 CertStatus {
+                    ca: held.as_ref().and_then(|m| self.issuer.ca_name(m)),
+                    migration: held.as_ref().map_or(Migration::None, |m| self.issuer.migration(m)),
                     not_after: v.map(|v| v.not_after),
                     seconds_left: v.map(|v| v.not_after - now),
                     consecutive_failures: s.failures,
@@ -2357,5 +2481,299 @@ PfFwXFUdKr72euUqW9E4wdcMVA==\n\
         let r = eng.run_once(T0 + 9 * DAY, &reg).await;
         assert_eq!(r.pruned, vec!["app.acme.com.au".to_string()]);
         assert!(r.revoked.is_empty() && spy.revoked.lock().unwrap().is_empty());
+    }
+
+    // ── Key hygiene ───────────────────────────────────────────────────────────────────────
+
+    fn rsa_pkcs8_pem(size: aws_lc_rs::rsa::KeySize) -> String {
+        use aws_lc_rs::encoding::AsDer;
+        let pair = aws_lc_rs::rsa::KeyPair::generate(size).unwrap();
+        pem_wrap("PRIVATE KEY", AsDer::<aws_lc_rs::encoding::Pkcs8V1Der>::as_der(&pair).unwrap().as_ref())
+    }
+
+    #[tokio::test]
+    async fn a_renewal_that_reuses_the_previous_certificate_key_is_refused_and_last_known_good_stays() {
+        let reg = registry();
+        let held_key = Arc::new(Mutex::new(None::<String>));
+        let hk = held_key.clone();
+        // First issuance: fresh keys. Renewals: hand back the key of the certificate being replaced.
+        let (iss, _calls) = issuer(move |name, n| {
+            let mut m = ninety_days(T0 + i64::try_from(n).unwrap());
+            if name == "app.acme.com.au" {
+                if let Some(k) = hk.lock().unwrap().as_ref() {
+                    m.key_pem = k.clone();
+                }
+            }
+            Ok(m)
+        });
+        let store = Arc::new(MemoryCertSource::new());
+        let mut eng = engine(store.clone(), iss);
+        eng.run_once(T0, &reg).await;
+        let before = store.cert_for("app.acme.com.au").unwrap();
+        *held_key.lock().unwrap() = Some(before.key_pem.clone());
+
+        let r = eng.run_once(T0 + 60 * DAY, &reg).await;
+        assert_eq!(r.issued, vec!["*.tascloud.app".to_string()], "the wildcard got a new key and renewed; the reused key did not install: {r:?}");
+        assert!(r.failed.iter().any(|(n, why)| n == "app.acme.com.au" && why.contains("same private key")), "{r:?}");
+        let after = store.cert_for("app.acme.com.au").unwrap();
+        assert_eq!(after.chain_pem, before.chain_pem, "last-known-good is still what is served");
+        // ...and it backs off like any other failure rather than re-ordering every pass.
+        let again = eng.run_once(T0 + 60 * DAY + 60, &reg).await;
+        assert!(again.failed.is_empty() && again.backing_off == 1, "{again:?}");
+    }
+
+    #[test]
+    fn the_same_key_is_recognised_however_it_is_encoded() {
+        use aws_lc_rs::signature::{EcdsaKeyPair, ECDSA_P256_SHA256_FIXED_SIGNING};
+        let pair = EcdsaKeyPair::generate(&ECDSA_P256_SHA256_FIXED_SIGNING).unwrap();
+        let ours = CertMaterial { chain_pem: fake_chain(T0, T0 + DAY), key_pem: p256_key_to_pkcs8_pem(&pair) };
+        // The same key, PKCS#8-encoded by the library instead (different bytes, same key).
+        let other = {
+            use aws_lc_rs::encoding::{AsBigEndian, EcPrivateKeyBin};
+            let sk: EcPrivateKeyBin<'static> = pair.private_key().as_be_bytes().unwrap();
+            let ec_private_key = der::seq(&[der::uint(&[1]), der::tlv(0x04, sk.as_ref())]); // no [1] publicKey
+            let pkcs8 = der::seq(&[der::uint(&[0]), crate::certkey::ec_algorithm_identifier(KeyAlg::P256), der::tlv(0x04, &ec_private_key)]);
+            CertMaterial { chain_pem: fake_chain(T0 + 1, T0 + DAY), key_pem: pem_wrap("PRIVATE KEY", &pkcs8) }
+        };
+        assert_ne!(ours.key_pem, other.key_pem);
+        assert!(same_key(&ours, &other), "a re-encoding of one key is still one key");
+        assert!(same_key(&ours, &ours.clone()));
+        assert!(!same_key(&ours, &material(T0, T0 + DAY)), "an independent key is a different key");
+    }
+
+    #[tokio::test]
+    async fn a_certificate_with_a_weak_key_is_never_installed() {
+        use aws_lc_rs::rsa::KeySize;
+        let reg = registry();
+        for (what, key) in [("RSA-2048", rsa_pkcs8_pem(KeySize::Rsa2048)), ("garbage", pem_wrap("PRIVATE KEY", &[0x30, 0x00]))] {
+            let k = key.clone();
+            let (iss, _) = issuer(move |_, _| Ok(CertMaterial { key_pem: k.clone(), ..ninety_days(T0) }));
+            let store = Arc::new(MemoryCertSource::new());
+            let mut eng = engine(store.clone(), iss);
+            let r = eng.run_once(T0, &reg).await;
+            assert!(r.issued.is_empty() && !r.failed.is_empty(), "{what}: {r:?}");
+            assert!(r.failed.iter().all(|(_, why)| why.contains("certificate key refused")), "{what}: {r:?}");
+            assert!(store.cert_for("app.acme.com.au").is_none(), "{what}");
+        }
+        // An RSA-3072 key meets the policy.
+        let ok = rsa_pkcs8_pem(KeySize::Rsa3072);
+        let (iss, _) = issuer(move |_, _| Ok(CertMaterial { key_pem: ok.clone(), ..ninety_days(T0) }));
+        let store = Arc::new(MemoryCertSource::new());
+        let r = engine(store, iss).run_once(T0, &reg).await;
+        assert!(r.failed.is_empty() && !r.issued.is_empty(), "{r:?}");
+    }
+
+    fn temp_store_dir(tag: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!("acme-renew-{tag}-{}", crate::entropy::random_hex(6).unwrap()));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    #[test]
+    fn the_file_store_refuses_weak_keys_writes_0600_atomically_and_cleans_up_after_a_crash() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_store_dir("filestore");
+        let store = FileCertStore::open(&dir).unwrap();
+        let weak = CertMaterial { key_pem: rsa_pkcs8_pem(aws_lc_rs::rsa::KeySize::Rsa2048), ..material(T0, T0 + 90 * DAY) };
+        assert!(store.put("a.example.test", weak).unwrap_err().contains("certificate key refused"));
+        assert!(store.cert_for("a.example.test").is_none());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0, "a refused write leaves nothing on disk");
+
+        let good = material(T0, T0 + 90 * DAY);
+        store.put("a.example.test", good.clone()).unwrap();
+        let file = dir.join("a.example.test.pem");
+        assert_eq!(std::fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o700);
+        // Replacing it keeps 0600 and leaves no temporary file.
+        store.put("a.example.test", material(T0 + 1, T0 + 90 * DAY)).unwrap();
+        assert_eq!(std::fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+
+        // A crash mid-write left a temporary file holding a key, and someone loosened a key file.
+        let stale = dir.join(".b.example.test.0123456789abcdef.tmp");
+        std::fs::write(&stale, &good.key_pem).unwrap();
+        let legacy_stale = dir.join("c.example.test.pem.tmp");
+        std::fs::write(&legacy_stale, &good.key_pem).unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let reopened = FileCertStore::open(&dir).unwrap();
+        assert!(!stale.exists() && !legacy_stale.exists(), "stale temporary files holding keys are destroyed at start");
+        assert_eq!(std::fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600, "a loosened key file is restricted again");
+        assert!(reopened.cert_for("a.example.test").is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_key_that_predates_the_policy_still_loads_at_boot_but_cannot_be_installed_new() {
+        let dir = temp_store_dir("legacy");
+        let legacy = CertMaterial { key_pem: rsa_pkcs8_pem(aws_lc_rs::rsa::KeySize::Rsa2048), ..material(T0, T0 + 90 * DAY) };
+        let mut body = legacy.chain_pem.clone();
+        body.push_str(&legacy.key_pem);
+        crate::certkey::write_private_atomic(&dir.join("old.example.test.pem"), body.as_bytes()).unwrap();
+        let store = FileCertStore::open(&dir).unwrap();
+        assert!(store.cert_for("old.example.test").is_some(), "an edge must boot and keep serving what it has");
+        assert!(store.put("old.example.test", legacy).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── CA migration ──────────────────────────────────────────────────────────────────────
+
+    /// Issues certificates attributed to the CA currently named in `issuing`, and reports each
+    /// held certificate's migration state from the status table.
+    #[derive(Default)]
+    struct MigIssuer {
+        issuing: Mutex<String>,
+        owner: Mutex<std::collections::HashMap<String, String>>,
+        status: Mutex<std::collections::HashMap<String, Migration>>,
+        orders: Mutex<Vec<(String, Option<String>)>>,
+        revoked: Mutex<Vec<String>>,
+        serial: std::sync::atomic::AtomicI64,
+    }
+
+    impl MigIssuer {
+        fn new(ca: &str) -> Arc<Self> {
+            let m = MigIssuer::default();
+            *m.issuing.lock().unwrap() = ca.to_string();
+            Arc::new(m)
+        }
+        fn fresh(&self, now: i64) -> CertMaterial {
+            let n = self.serial.fetch_add(1, SeqCst);
+            let m = material(now + n, now + n + 90 * DAY);
+            self.owner.lock().unwrap().insert(m.chain_pem.clone(), self.issuing.lock().unwrap().clone());
+            m
+        }
+        fn mark(&self, ca: &str, state: Migration) {
+            self.status.lock().unwrap().insert(ca.to_string(), state);
+        }
+    }
+
+    impl CertIssuer for MigIssuer {
+        fn issue<'a>(&'a self, cert_name: &'a str) -> BoxFuture<'a, Result<CertMaterial, AcmeError>> {
+            Box::pin(async move {
+                self.orders.lock().unwrap().push((cert_name.to_string(), None));
+                Ok(self.fresh(T0))
+            })
+        }
+        fn issue_replacing<'a>(&'a self, cert_name: &'a str, previous: &'a CertMaterial) -> BoxFuture<'a, Result<CertMaterial, AcmeError>> {
+            Box::pin(async move {
+                let prev_ca = self.owner.lock().unwrap().get(&previous.chain_pem).cloned();
+                self.orders.lock().unwrap().push((cert_name.to_string(), prev_ca));
+                Ok(self.fresh(T0))
+            })
+        }
+        fn migration(&self, material: &CertMaterial) -> Migration {
+            let ca = self.owner.lock().unwrap().get(&material.chain_pem).cloned();
+            ca.and_then(|c| self.status.lock().unwrap().get(&c).copied()).unwrap_or_default()
+        }
+        fn ca_name(&self, material: &CertMaterial) -> Option<String> {
+            self.owner.lock().unwrap().get(&material.chain_pem).cloned()
+        }
+        fn revoke<'a>(&'a self, material: &'a CertMaterial) -> BoxFuture<'a, Result<(), AcmeError>> {
+            Box::pin(async move {
+                self.revoked.lock().unwrap().push(self.ca_name(material).unwrap_or_default());
+                Ok(())
+            })
+        }
+    }
+
+    /// Four custom names, all issued by CA "old".
+    async fn fleet(iss: &Arc<MigIssuer>, store: &Arc<MemoryCertSource>, revocations: Option<Arc<RevocationQueue>>) -> (Arc<tokio::sync::Mutex<EdgeRegistry>>, RenewalEngine<MemoryCertSource, Arc<MigIssuer>>) {
+        let reg = registry();
+        {
+            let mut r = reg.lock().await;
+            for (i, name) in ["b.acme.com.au", "c.acme.com.au", "d.acme.com.au"].iter().enumerate() {
+                r.add_custom(name, "mine.tascloud.app", route("acme", &format!("t{}", i + 2))).unwrap();
+                r.record_probe(name, true, 5).unwrap();
+            }
+        }
+        let mut eng = RenewalEngine::new(store.clone(), iss.clone(), RenewalPolicy::default());
+        if let Some(q) = revocations {
+            eng = eng.with_revocations(q);
+        }
+        let first = eng.run_once(T0, &reg).await;
+        assert_eq!(first.issued.len(), 5, "the wildcard and four custom names: {first:?}");
+        (reg, eng)
+    }
+
+    #[tokio::test]
+    async fn certificates_from_a_distrusted_ca_are_replaced_first_and_the_old_ones_are_revoked_at_their_ca() {
+        let iss = MigIssuer::new("old");
+        let store = Arc::new(MemoryCertSource::new());
+        let queue = Arc::new(RevocationQueue::in_memory());
+        let (reg, mut eng) = fleet(&iss, &store, Some(queue.clone())).await;
+        // Nothing is due by the percentage rule a day later.
+        assert!(eng.run_once(T0 + DAY, &reg).await.issued.is_empty());
+        iss.orders.lock().unwrap().clear();
+
+        *iss.issuing.lock().unwrap() = "new".to_string();
+        iss.mark("old", Migration::Distrusted);
+        let r = eng.run_once(T0 + DAY + 3600, &reg).await;
+        assert_eq!(r.issued.len(), 5, "every certificate from the distrusted CA is replaced in one pass: {r:?}");
+        assert!(iss.orders.lock().unwrap().iter().all(|(_, prev)| prev.as_deref() == Some("old")));
+        assert!(store.names().iter().all(|n| iss.ca_name(&store.cert_for(n).unwrap()).as_deref() == Some("new")));
+        // Each replaced certificate was queued and then revoked through its own CA.
+        assert!(r.revoked.len() == 5 && queue.is_empty(), "{r:?}");
+        assert_eq!(iss.revoked.lock().unwrap().iter().filter(|c| *c == "old").count(), 5);
+        // Nothing is left to do afterwards.
+        assert!(eng.run_once(T0 + DAY + 7200, &reg).await.issued.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_retiring_ca_is_migrated_early_but_its_certificates_are_not_revoked() {
+        let iss = MigIssuer::new("old");
+        let store = Arc::new(MemoryCertSource::new());
+        let queue = Arc::new(RevocationQueue::in_memory());
+        let (reg, mut eng) = fleet(&iss, &store, Some(queue.clone())).await;
+        *iss.issuing.lock().unwrap() = "new".to_string();
+        iss.mark("old", Migration::Retiring);
+        let r = eng.run_once(T0 + DAY, &reg).await;
+        assert_eq!(r.issued.len(), 5, "{r:?}");
+        assert!(queue.is_empty() && iss.revoked.lock().unwrap().is_empty(), "an orderly retirement revokes nothing");
+        let st = eng.status(T0 + DAY, &reg).await;
+        assert!(st.iter().all(|s| s.ca.as_deref() == Some("new") && s.migration == Migration::None), "{st:?}");
+    }
+
+    #[tokio::test]
+    async fn migration_work_is_ordered_distrusted_first_and_has_its_own_bounded_budget() {
+        let iss = MigIssuer::new("old");
+        let store = Arc::new(MemoryCertSource::new());
+        let (reg, _) = fleet(&iss, &store, None).await;
+        // Replace two names with certificates from "mid" (retiring); the rest stay on "old" (distrusted).
+        let policy = RenewalPolicy { migration_per_run: 2, max_per_run: 1, ..RenewalPolicy::default() };
+        let mut eng = RenewalEngine::new(store.clone(), iss.clone(), policy);
+        *iss.issuing.lock().unwrap() = "mid".to_string();
+        for name in ["b.acme.com.au", "c.acme.com.au"] {
+            // Older (so they expire sooner) than the distrusted ones: only the tier puts them behind.
+            store.put(name, iss.fresh(T0 - 30 * DAY)).unwrap();
+        }
+        iss.mark("old", Migration::Distrusted);
+        iss.mark("mid", Migration::Retiring);
+        *iss.issuing.lock().unwrap() = "new".to_string();
+        iss.orders.lock().unwrap().clear();
+        let previous_ca = |from: usize| -> Vec<Option<String>> { iss.orders.lock().unwrap().iter().skip(from).map(|(_, p)| p.clone()).collect() };
+
+        // Three certificates are on the distrusted CA, two on the retiring one; two moves per pass.
+        let r = eng.run_once(T0 + DAY, &reg).await;
+        assert_eq!(r.issued.len(), 2, "the migration budget bounds one pass: {r:?}");
+        assert!(previous_ca(0).iter().all(|p| p.as_deref() == Some("old")), "distrusted first: {:?}", previous_ca(0));
+        let r = eng.run_once(T0 + DAY + 3600, &reg).await;
+        assert_eq!(r.issued.len(), 2);
+        let second = previous_ca(2);
+        assert_eq!((second[0].as_deref(), second[1].as_deref()), (Some("old"), Some("mid")), "the last distrusted one, then retiring: {second:?}");
+        let r = eng.run_once(T0 + DAY + 7200, &reg).await;
+        assert_eq!(r.issued.len(), 1);
+        assert_eq!(previous_ca(4), vec![Some("mid".to_string())]);
+        assert!(eng.run_once(T0 + DAY + 10_800, &reg).await.issued.is_empty(), "done");
+    }
+
+    #[tokio::test]
+    async fn a_missing_certificate_outranks_a_migration_and_a_failing_migration_backs_off() {
+        let iss = MigIssuer::new("old");
+        let store = Arc::new(MemoryCertSource::new());
+        let (reg, mut eng) = fleet(&iss, &store, None).await;
+        iss.mark("old", Migration::Distrusted);
+        store.remove("d.acme.com.au");
+        iss.orders.lock().unwrap().clear();
+        let r = eng.run_once(T0 + DAY, &reg).await;
+        assert_eq!(iss.orders.lock().unwrap()[0].0, "d.acme.com.au", "nothing-to-serve goes before replacing something that still serves: {r:?}");
     }
 }

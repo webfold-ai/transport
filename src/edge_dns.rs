@@ -81,6 +81,69 @@ pub struct ZoneConfig {
     /// at the same CA (stolen DNS-validation capability, a rogue tenant) is refused by the CA
     /// itself. Also pins `validationmethods=dns-01`. Ignored when `caa_issuers` is empty.
     pub caa_account_uri: Option<String>,
+    /// The full CAA policy, with each CA bound to its own account and `issuewild` handled
+    /// separately (see [`CaaRecords`]). When set it replaces `caa_issuers`/`caa_account_uri`.
+    pub caa_records: Option<CaaRecords>,
+}
+
+/// One CA authorised to issue, as published in a CAA `issue`/`issuewild` property value
+/// (RFC 8659 §4.2, RFC 8657).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CaaIssuer {
+    /// The CA's issuer domain (`letsencrypt.org`).
+    pub domain: String,
+    /// Bind issuance to this CA account (`accounturi`, RFC 8657).
+    pub account_uri: Option<String>,
+    /// Restrict to these validation methods (`validationmethods`, RFC 8657); empty = unrestricted.
+    pub validation_methods: Vec<String>,
+}
+
+impl CaaIssuer {
+    fn value(&self) -> String {
+        let mut v = normalize(&self.domain);
+        if let Some(uri) = &self.account_uri {
+            v.push_str(&format!("; accounturi={uri}"));
+        }
+        if !self.validation_methods.is_empty() {
+            v.push_str(&format!("; validationmethods={}", self.validation_methods.join(",")));
+        }
+        v
+    }
+}
+
+/// The CAA properties a zone publishes: the CAs allowed to issue (`issue`), those allowed to issue
+/// *wildcard* certificates (`issuewild`, which governs wildcards instead of `issue` whenever it is
+/// present, RFC 8659 §3), or an explicit `issuewild ";"` forbidding them.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CaaRecords {
+    pub issue: Vec<CaaIssuer>,
+    pub issuewild: Vec<CaaIssuer>,
+    /// Publish `issuewild ";"`: no CA may issue wildcard certificates. Set when `issuewild` is empty.
+    pub forbid_wildcard: bool,
+}
+
+impl CaaRecords {
+    /// Normalise: no `issuewild` entries means wildcards are forbidden, not "whatever `issue` says".
+    #[must_use]
+    pub fn finish(mut self) -> Self {
+        self.forbid_wildcard = self.issuewild.is_empty();
+        self
+    }
+
+    /// `(tag, value)` for every record, `issue` first.
+    fn values(&self) -> Vec<(&'static str, String)> {
+        let mut out: Vec<(&'static str, String)> = if self.issue.is_empty() {
+            vec![("issue", ";".to_string())] // nobody may issue
+        } else {
+            self.issue.iter().map(|i| ("issue", i.value())).collect()
+        };
+        if self.forbid_wildcard || self.issuewild.is_empty() {
+            out.push(("issuewild", ";".to_string()));
+        } else {
+            out.extend(self.issuewild.iter().map(|i| ("issuewild", i.value())));
+        }
+        out
+    }
 }
 
 impl ZoneConfig {
@@ -96,6 +159,7 @@ impl ZoneConfig {
             serial: 1,
             caa_issuers: Vec::new(),
             caa_account_uri: None,
+            caa_records: None,
             zone,
         }
     }
@@ -114,16 +178,28 @@ impl ZoneConfig {
         self
     }
 
-    /// The CAA `issue` property values this zone publishes, one per permitted issuer.
-    fn caa_values(&self) -> Vec<String> {
+    /// Publish `records` as this zone's CAA policy (each CA with its own account, `issuewild`
+    /// separate). Replaces `with_caa_issuers`/`with_caa_account_uri`.
+    #[must_use]
+    pub fn with_caa_records(mut self, records: CaaRecords) -> Self {
+        self.caa_records = Some(records);
+        self
+    }
+
+    /// The CAA `(tag, value)` properties this zone publishes.
+    fn caa_values(&self) -> Vec<(&'static str, String)> {
+        if let Some(records) = &self.caa_records {
+            return records.values();
+        }
         self.caa_issuers
             .iter()
             .map(|issuer| {
                 let issuer = normalize(issuer);
-                match &self.caa_account_uri {
+                let value = match &self.caa_account_uri {
                     Some(uri) => format!("{issuer}; accounturi={uri}; validationmethods=dns-01"),
                     None => issuer,
-                }
+                };
+                ("issue", value)
             })
             .collect()
     }
@@ -195,6 +271,15 @@ impl ZoneAuthority {
     /// exists. Until it is called, zones publish the plain `issue` records.
     pub fn set_caa_account_uri(&mut self, uri: &str) {
         let updated: Vec<ZoneConfig> = self.zones.iter().map(|(_, z)| z.clone().with_caa_account_uri(uri)).collect();
+        for z in updated {
+            self.zones.put(z.zone.clone(), z);
+        }
+    }
+
+    /// Replace every zone's CAA policy with `records` (a CA switch, a new standby, a CA removed).
+    /// Takes effect on the next query; the TTL on the records is how long resolvers keep the old.
+    pub fn set_caa_records(&mut self, records: &CaaRecords) {
+        let updated: Vec<ZoneConfig> = self.zones.iter().map(|(_, z)| z.clone().with_caa_records(records.clone())).collect();
         for z in updated {
             self.zones.put(z.zone.clone(), z);
         }
@@ -310,11 +395,11 @@ impl ZoneAuthority {
                 RecordType::Caa => Resolution::Answers(
                     zone.caa_values()
                         .into_iter()
-                        .map(|value| {
+                        .map(|(tag, value)| {
                             Record::new(
                                 name.clone(),
                                 NS_TTL,
-                                RData::Caa { flags: 0, tag: "issue".to_string(), value: value.into_bytes() },
+                                RData::Caa { flags: 0, tag: tag.to_string(), value: value.into_bytes() },
                             )
                         })
                         .collect(),
@@ -1015,5 +1100,45 @@ mod tests {
         let mut sink = Vec::new();
         let n = tokio::time::timeout(std::time::Duration::from_secs(2), bad.read_to_end(&mut sink)).await.unwrap().unwrap();
         assert_eq!(n, 0, "an unparseable query gets no reply");
+    }
+
+    #[test]
+    fn caa_records_publish_each_ca_with_its_account_and_issuewild_separately() {
+        let records = CaaRecords {
+            issue: vec![
+                CaaIssuer { domain: "letsencrypt.org".into(), account_uri: Some("https://le/acct/1".into()), validation_methods: vec!["dns-01".into()] },
+                CaaIssuer { domain: "pki.goog".into(), account_uri: Some("https://gts/acct/2".into()), validation_methods: vec![] },
+            ],
+            issuewild: vec![CaaIssuer { domain: "letsencrypt.org".into(), account_uri: Some("https://le/acct/1".into()), validation_methods: vec!["dns-01".into()] }],
+            forbid_wildcard: false,
+        }
+        .finish();
+        let zone = ZoneConfig::new("tascloud.app", vec!["ns1.tascloud.app".into()]).with_caa_records(records);
+        let values = zone.caa_values();
+        assert_eq!(
+            values,
+            vec![
+                ("issue", "letsencrypt.org; accounturi=https://le/acct/1; validationmethods=dns-01".to_string()),
+                ("issue", "pki.goog; accounturi=https://gts/acct/2".to_string()),
+                ("issuewild", "letsencrypt.org; accounturi=https://le/acct/1; validationmethods=dns-01".to_string()),
+            ]
+        );
+        // And they come out of the server as CAA records with the right tags.
+        let mut auth = ZoneAuthority::new(vec![zone], vec!["127.0.0.1".parse().unwrap()], vec![]);
+        let reg = EdgeRegistry::new(b"s".to_vec());
+        let reply = ask(&mut auth, &reg, "tascloud.app", RecordType::Caa);
+        let tags: Vec<String> = reply.answers.iter().map(|r| match &r.data { RData::Caa { tag, .. } => tag.clone(), other => panic!("{other:?}") }).collect();
+        assert_eq!(tags, ["issue", "issue", "issuewild"]);
+        // A live switch: replace the policy on every zone.
+        auth.set_caa_records(&CaaRecords { issue: vec![CaaIssuer { domain: "pki.goog".into(), account_uri: None, validation_methods: vec![] }], ..CaaRecords::default() }.finish());
+        let reply = ask(&mut auth, &reg, "tascloud.app", RecordType::Caa);
+        let values: Vec<String> = reply.answers.iter().map(|r| match &r.data { RData::Caa { tag, value, .. } => format!("{tag} {}", String::from_utf8_lossy(value)), other => panic!("{other:?}") }).collect();
+        assert_eq!(values, ["issue pki.goog", "issuewild ;"], "wildcards are forbidden unless a CA is listed for them");
+    }
+
+    #[test]
+    fn with_no_ca_listed_caa_forbids_issuance_rather_than_permitting_everything() {
+        let records = CaaRecords::default().finish();
+        assert_eq!(records.values(), vec![("issue", ";".to_string()), ("issuewild", ";".to_string())]);
     }
 }

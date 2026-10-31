@@ -178,7 +178,7 @@ mod native_probe {
         /// one that does not answer this question; otherwise the reply **whatever its rcode** (the
         /// caller decides whether SERVFAIL or REFUSED matters — for a health check it does).
         pub async fn query(&self, server: SocketAddr, name: &Name, qtype: RecordType, opts: QueryOptions) -> Option<Message> {
-            let id_bytes = hashtrinity::crypto::rand_bytes(2);
+            let id_bytes = crate::prim::random_bytes(2);
             let id = u16::from_be_bytes([*id_bytes.first()?, *id_bytes.get(1)?]);
             let mut query = Message {
                 id,

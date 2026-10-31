@@ -813,7 +813,7 @@ pub struct QuicEndpoint {
 impl QuicEndpoint {
     pub async fn bind(addr: &str) -> io::Result<Self> {
         let socket = UdpSocket::bind(addr).await?;
-        let secret_key_bytes = hashtrinity::crypto::rand_bytes(32);
+        let secret_key_bytes = crate::prim::random_bytes(32);
         let mut secret_key = [0u8; 32];
         secret_key.copy_from_slice(&secret_key_bytes);
         let peer_id = crate::prim::ed25519_pubkey(&secret_key);
