@@ -56,4 +56,11 @@ relayfold = { git = "https://github.com/Ptyktos/relayfold" }
 pkarr = { version = "8.0.1", optional = true }
 hickory-proto = { version = "0.24", optional = true }
 
+# Ptyktos/apeiron no longer exists on GitHub; its history (through a2b5093, the commit every
+# dependent pins) lives on the `apeiron` branch of Ptyktos/hashtrinity. This redirect is
+# root-only — consumers' own patches/locks still win (webfold carries the same one) — but
+# without it this crate does not build or test standalone at all.
+[patch."https://github.com/Ptyktos/apeiron.git"]
+apeiron = { git = "https://github.com/Ptyktos/hashtrinity", rev = "255ca3018a0f06300153d905cb19b37ea548bb56" }
+
 [workspace]

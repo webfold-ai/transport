@@ -398,6 +398,26 @@ async fn read_response_head(reader: &mut StreamReader) -> Result<ResponseHead> {
     Ok(ResponseHead { version, status, headers, content_length, chunked })
 }
 
+/// Read response heads until the FINAL one. RFC 9110 §15.2 requires a client to accept one or
+/// more interim 1xx responses (100 Continue, 103 Early Hints — nginx and CDNs send these
+/// unbidden, Songsterr among them) before the final response. Treating an interim head as final
+/// lost the real response entirely — and worse, the interim head looks bodyless, so the
+/// still-unread final response stayed in a socket that was then returned to the keepalive pool,
+/// corrupting the next pooled request. The interim count is bounded: an endless 1xx stream is a
+/// parse error, not a hang.
+async fn read_final_response_head(reader: &mut StreamReader) -> Result<ResponseHead> {
+    const MAX_INTERIM_RESPONSES: usize = 8;
+    for _ in 0..=MAX_INTERIM_RESPONSES {
+        let head = read_response_head(reader).await?;
+        if !head.status.is_informational() {
+            return Ok(head);
+        }
+    }
+    Err(Error::Parse(format!(
+        "more than {MAX_INTERIM_RESPONSES} interim 1xx responses without a final response"
+    )))
+}
+
 pub(crate) async fn send_request(
     mut stream: Stream,
     method: Method,
@@ -407,16 +427,17 @@ pub(crate) async fn send_request(
 ) -> Result<Response> {
     write_request(&mut stream, &method, uri, &headers, &body).await?;
     let mut reader = stream.into_reader();
-    let head = read_response_head(&mut reader).await?;
+    let head = read_final_response_head(&mut reader).await?;
 
     // Only a DEFINITE-length body (no body at all, Content-Length, or a chunked terminator) means
     // the connection is genuinely still usable afterward — the "read to end" fallback below means
     // there was no length information at all, which in practice means the peer intends to close
     // the connection once the body is sent, so pooling that stream would just hand back a socket
     // that's already going away.
+    // `head` is the final response — interim 1xx heads were already consumed by
+    // `read_final_response_head` — so only 204/304 are bodyless here.
     let (body, poolable) = if head.status == StatusCode::NO_CONTENT
         || head.status == StatusCode::NOT_MODIFIED
-        || head.status.is_informational()
     {
         (Vec::new(), true)
     } else if head.chunked {
@@ -573,11 +594,10 @@ pub(crate) async fn send_request_streaming(
 ) -> Result<StreamingResponse> {
     write_request(&mut stream, &method, uri, &headers, &body).await?;
     let mut reader = stream.into_reader();
-    let head = read_response_head(&mut reader).await?;
+    let head = read_final_response_head(&mut reader).await?;
 
     let framing = if head.status == StatusCode::NO_CONTENT
         || head.status == StatusCode::NOT_MODIFIED
-        || head.status.is_informational()
     {
         BodyFraming::None
     } else if head.chunked {
@@ -644,3 +664,169 @@ async fn read_chunked(reader: &mut StreamReader) -> Result<Vec<u8>> {
     Ok(body)
 }
 
+
+#[cfg(test)]
+mod interim_response_tests {
+    //! RFC 9110 §15.2 interim 1xx responses. Loopback tests on purpose: the defect was
+    //! `send_request` surfacing a 103 Early Hints head as the final response — empty body,
+    //! and the still-unread real 200 left in a socket that was then pooled, corrupting the
+    //! next pooled request. Only a server that actually emits the two-head sequence proves
+    //! the client reads past it. Songsterr's nginx (`?pattern=` search) is the production
+    //! case that motivated this fix.
+
+    use super::{identity_for, pool_take, send_request, send_request_streaming, Stream};
+    use crate::http_types::{HeaderMap, Method, StatusCode, Uri};
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
+    /// Accept one connection, read one request head, answer with `responses` verbatim.
+    async fn serve_once(listener: TcpListener, responses: &'static [u8]) {
+        let (mut socket, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+            .await
+            .expect("client connects")
+            .expect("accept");
+        let mut buf = vec![0u8; 4096];
+        let _ = tokio::time::timeout(Duration::from_secs(5), socket.read(&mut buf))
+            .await
+            .expect("client sends a request")
+            .expect("read request");
+        // A client that errors early (the endless-interim test) makes these writes fail;
+        // that is the client's business, not the server's.
+        let _ = socket.write_all(responses).await;
+    }
+
+    async fn request_once(responses: &'static [u8]) -> (crate::http_types::Response, Uri) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(serve_once(listener, responses));
+        let uri: Uri = format!("http://{addr}/x").parse().expect("uri");
+        let stream = TcpStream::connect(addr).await.expect("connect");
+        let resp = tokio::time::timeout(
+            Duration::from_secs(5),
+            send_request(Stream::Plain(stream), Method::GET, &uri, HeaderMap::new(), None),
+        )
+        .await
+        .expect("no hang")
+        .expect("a final response");
+        server.await.expect("server task");
+        (resp, uri)
+    }
+
+    #[tokio::test]
+    async fn an_interim_103_is_read_through_to_the_final_response() {
+        let (resp, _) = request_once(
+            b"HTTP/1.1 103 Early Hints\r\nLink: </app.css>; rel=preload\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello",
+        )
+        .await;
+        assert_eq!(resp.status, StatusCode::OK);
+        assert_eq!(resp.body, b"hello");
+    }
+
+    #[tokio::test]
+    async fn several_interim_responses_are_all_read_through() {
+        let (resp, _) = request_once(
+            b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 103 Early Hints\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+        )
+        .await;
+        assert_eq!(resp.status, StatusCode::OK);
+        assert_eq!(resp.body, b"ok");
+    }
+
+    #[tokio::test]
+    async fn the_streaming_path_reads_past_interim_responses() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(serve_once(
+            listener,
+            b"HTTP/1.1 103 Early Hints\r\nLink: </app.js>; rel=modulepreload\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nstream",
+        ));
+        let uri: Uri = format!("http://{addr}/s").parse().expect("uri");
+        let stream = TcpStream::connect(addr).await.expect("connect");
+        let resp = tokio::time::timeout(
+            Duration::from_secs(5),
+            send_request_streaming(Stream::Plain(stream), Method::GET, &uri, HeaderMap::new(), None),
+        )
+        .await
+        .expect("no hang")
+        .expect("a final response");
+        assert_eq!(resp.status, StatusCode::OK);
+        assert_eq!(resp.bytes().await.expect("body"), b"stream");
+        server.await.expect("server task");
+    }
+
+    /// The negative control: a peer that never stops sending 1xx must produce an error,
+    /// quickly — not a task parked on a socket forever.
+    #[tokio::test]
+    async fn an_endless_interim_stream_errors_instead_of_hanging() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut buf = vec![0u8; 4096];
+            let _ = socket.read(&mut buf).await;
+            for _ in 0..16 {
+                if socket.write_all(b"HTTP/1.1 103 Early Hints\r\n\r\n").await.is_err() {
+                    break;
+                }
+            }
+        });
+        let uri: Uri = format!("http://{addr}/loop").parse().expect("uri");
+        let stream = TcpStream::connect(addr).await.expect("connect");
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            send_request(Stream::Plain(stream), Method::GET, &uri, HeaderMap::new(), None),
+        )
+        .await
+        .expect("an endless 1xx stream must not hang the caller");
+        assert!(outcome.is_err(), "endless interim responses must error");
+        server.await.expect("server task");
+    }
+
+    /// The pool-corruption half of the original bug: after a 103+200 exchange the pooled
+    /// connection must serve the NEXT request its own response, not the unread tail of the
+    /// first. Before the fix the first exchange pooled a socket still holding the real 200.
+    #[tokio::test]
+    async fn a_pooled_connection_after_an_interim_response_serves_the_next_request() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut buf = vec![0u8; 4096];
+            let _ = socket.read(&mut buf).await;
+            socket
+                .write_all(b"HTTP/1.1 103 Early Hints\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nfirst")
+                .await
+                .expect("write first");
+            let _ = socket.read(&mut buf).await;
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nsecond")
+                .await
+                .expect("write second");
+        });
+        let uri: Uri = format!("http://{addr}/one").parse().expect("uri");
+        let stream = TcpStream::connect(addr).await.expect("connect");
+        let r1 = send_request(Stream::Plain(stream), Method::GET, &uri, HeaderMap::new(), None)
+            .await
+            .expect("first response");
+        assert_eq!(r1.status, StatusCode::OK);
+        assert_eq!(r1.body, b"first");
+
+        let identity = identity_for(&uri).expect("identity");
+        let pooled = pool_take(&identity).expect("the keepalive connection was pooled");
+        let uri2: Uri = format!("http://{addr}/two").parse().expect("uri");
+        let r2 = tokio::time::timeout(
+            Duration::from_secs(5),
+            send_request(pooled.stream, Method::GET, &uri2, HeaderMap::new(), None),
+        )
+        .await
+        .expect("no hang on the pooled connection")
+        .expect("second response");
+        assert_eq!(r2.status, StatusCode::OK);
+        assert_eq!(
+            r2.body, b"second",
+            "a pooled connection must never answer a request with a previous response's tail"
+        );
+        server.await.expect("server task");
+    }
+}

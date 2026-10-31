@@ -562,15 +562,6 @@ pub mod flow_count {
             fn close<'a>(&'a self) -> BoxFuture<'a, std::io::Result<()>> {
                 Box::pin(async { Ok(()) })
             }
-
-            fn raw_halves(
-                &self,
-            ) -> Option<(
-                Arc<tokio::sync::Mutex<tokio::net::tcp::OwnedReadHalf>>,
-                Arc<tokio::sync::Mutex<tokio::net::tcp::OwnedWriteHalf>>,
-            )> {
-                None
-            }
         }
 
         fn rt() -> tokio::runtime::Runtime {
