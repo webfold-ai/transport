@@ -53,7 +53,7 @@ serde_json = { version = "1", optional = true }
 # different references to the same repo (rev vs branch vs none) as distinct SourceIds, and two
 # copies make `hashtrinity::Table<K, V>` two incompatible types (E0308 "multiple different
 # versions of crate `hashtrinity`"), so every consumer pins exactly this form.
-hashtrinity = { git = "https://github.com/Ptyktos/hashtrinity", rev = "92a88636ab0e59ffe366ace07c019cd1f35a0bfa", features = ["base32"] }
+hashtrinity = { git = "https://github.com/Ptyktos/hashtrinity", rev = "b6aa208afa682ba0951f1b74941d140fbfa9fc50", features = ["base32"] }
 rustls-pki-types = "1"
 rustls-native-certs = "0.8"
 bytes = "1"
@@ -71,7 +71,7 @@ flate2 = { version = "1", optional = true }
 # Pinned by rev (like hashtrinity): relayfold carries its own hashtrinity pin, so an unpinned entry
 # would resolve to relayfold's default branch, whatever hashtrinity that names, and a consumer that
 # also names relayfold must use this exact rev or the graph holds two relayfolds and two hashtrinitys.
-relayfold = { git = "https://github.com/Ptyktos/relayfold", rev = "84169b1a5720828eb0d4925fb840c1afd88f9df8" }
+relayfold = { git = "https://github.com/Ptyktos/relayfold", rev = "29f7b78370425cf6f0fc9909a1ea1201edcb5f6e" }
 pkarr = { version = "8.0.1", optional = true }
 
 # The unit tests of modules that are always compiled (`edge_verify`, `edge_proxy`) drive async code with

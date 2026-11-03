@@ -18,11 +18,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "apeiron"
-version = "0.1.0"
-source = "git+https://github.com/Ptyktos/apeiron.git?rev=255ca3018a0f06300153d905cb19b37ea548bb56#255ca3018a0f06300153d905cb19b37ea548bb56"
-
-[[package]]
 name = "async-compat"
 version = "0.2.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -115,7 +110,7 @@ dependencies = [
  "regex",
  "rustc-hash",
  "shlex",
- "syn 2.0.119",
+ "syn 3.0.6",
 ]
 
 [[package]]
@@ -565,12 +560,12 @@ checksum = "e4eba85ea1d0a966a983acd07deee566e67395d2d96b6fb39e62b5a833f1eb0b"
 [[package]]
 name = "hashtrinity"
 version = "0.1.0"
-source = "git+https://github.com/Ptyktos/hashtrinity?rev=92a88636ab0e59ffe366ace07c019cd1f35a0bfa#92a88636ab0e59ffe366ace07c019cd1f35a0bfa"
+source = "git+https://github.com/Ptyktos/hashtrinity?rev=b6aa208afa682ba0951f1b74941d140fbfa9fc50#b6aa208afa682ba0951f1b74941d140fbfa9fc50"
 dependencies = [
- "apeiron",
  "rustls",
  "serde",
  "serde_json",
+ "uuid",
 ]
 
 [[package]]
@@ -1309,7 +1304,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 [[package]]
 name = "relayfold"
 version = "0.1.0"
-source = "git+https://github.com/Ptyktos/relayfold?rev=84169b1a5720828eb0d4925fb840c1afd88f9df8#84169b1a5720828eb0d4925fb840c1afd88f9df8"
+source = "git+https://github.com/Ptyktos/relayfold?rev=29f7b78370425cf6f0fc9909a1ea1201edcb5f6e#29f7b78370425cf6f0fc9909a1ea1201edcb5f6e"
 dependencies = [
  "hashtrinity",
 ]
@@ -2022,6 +2017,18 @@ name = "utf8_iter"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6c140620e7ffbb22c2dee59cafe6084a59b5ffc27a8859a5f0d494b5d52b6be"
+
+[[package]]
+name = "uuid"
+version = "1.29.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4a0e2d11620c50695fe12bbbfde96b3477fe606e7284c22d505c12ce51214514"
+dependencies = [
+ "getrandom 0.4.3",
+ "js-sys",
+ "serde_core",
+ "wasm-bindgen",
+]
 
 [[package]]
 name = "valuable"
