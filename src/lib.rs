@@ -111,6 +111,10 @@ pub mod x509;
 pub mod dns_health;
 /// Owner-signed object replication over the native transport (zone snapshots, ACME challenge state).
 pub mod zone_sync;
+/// The set-difference file sync and the protocol pieces under it: S3 and SigV4, HTTP/1.1 and HTTP/2,
+/// gRPC and HPACK, TLS 1.3, bundles and block images. Moved here from `hashtrinity::sync`.
+#[cfg(feature = "syncfold")]
+pub mod sync;
 
 use std::future::Future;
 use std::io;
