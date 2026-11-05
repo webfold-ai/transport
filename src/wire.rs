@@ -304,8 +304,8 @@ pub(crate) async fn connect_fresh(
     match uri.scheme_str() {
         Some("https") => {
             let tcp = match dial_target {
-                Some(addr) => TcpStream::connect(addr).await?,
-                None => TcpStream::connect(format!("{}:{}", host, port)).await?,
+                Some(addr) => nodelay(TcpStream::connect(addr).await?),
+                None => nodelay(TcpStream::connect(format!("{}:{}", host, port)).await?),
             };
             let server_name = rustls_pki_types::ServerName::try_from(host.clone())
                 .map_err(|e| Error::Tls(format!("invalid hostname {host:?}: {e}")))?
@@ -318,10 +318,16 @@ pub(crate) async fn connect_fresh(
             Ok(Stream::Tls(Box::new(tls)))
         }
         _ => Ok(Stream::Plain(match dial_target {
-            Some(addr) => TcpStream::connect(addr).await?,
-            None => TcpStream::connect(format!("{}:{}", host, port)).await?,
+            Some(addr) => nodelay(TcpStream::connect(addr).await?),
+            None => nodelay(TcpStream::connect(format!("{}:{}", host, port)).await?),
         })),
     }
+}
+
+/// HTTP is many small writes and one wait for the answer: do not hold the small ones back.
+fn nodelay(s: TcpStream) -> TcpStream {
+    let _ = s.set_nodelay(true);
+    s
 }
 
 /// Write the request line, headers, and body — shared by the buffered (`send_request`) and
@@ -357,6 +363,14 @@ async fn write_request(
     headers: &HeaderMap,
     body: &Option<Vec<u8>>,
 ) -> Result<()> {
+    // One request, one write. A write per header leaves the peer with dozens of tiny segments, and Nagle's
+    // algorithm plus the peer's delayed ACK then hold the tail back for ~40 ms on every request.
+    stream.write_all(&encode_request(method, uri, headers, body)).await?;
+    Ok(())
+}
+
+/// The request line, headers, `Content-Length` and body as the bytes that go on the wire.
+fn encode_request(method: &Method, uri: &Uri, headers: &HeaderMap, body: &Option<Vec<u8>>) -> Vec<u8> {
     let path = uri.path_and_query();
     let host = uri.host().unwrap_or("");
     let authority = match uri.port_u16() {
@@ -364,9 +378,8 @@ async fn write_request(
         None => host.to_string(),
     };
 
-    stream
-        .write_all(format!("{} {} HTTP/1.1\r\nHost: {}\r\n", method, path, authority).as_bytes())
-        .await?;
+    let mut out: Vec<u8> = Vec::with_capacity(256 + body.as_ref().map_or(0, Vec::len));
+    out.extend_from_slice(format!("{} {} HTTP/1.1\r\nHost: {}\r\n", method, path, authority).as_bytes());
     // A caller-supplied User-Agent wins.
     //
     // This used to be unconditional, so `RequestBuilder::header(USER_AGENT, …)` sent
@@ -378,9 +391,7 @@ async fn write_request(
     // making it, and origins that gate on the agent string (Google's asset CDN
     // among them) served a sign-in page instead of the file.
     if let Some(agent) = effective_user_agent(headers) {
-        stream
-            .write_all(format!("User-Agent: {agent}\r\n").as_bytes())
-            .await?;
+        out.extend_from_slice(format!("User-Agent: {agent}\r\n").as_bytes());
     }
 
     for (name, value) in headers.iter() {
@@ -391,22 +402,20 @@ async fn write_request(
         if name.eq_ignore_ascii_case(crate::http_types::header::USER_AGENT) {
             continue;
         }
-        stream.write_all(name.as_bytes()).await?;
-        stream.write_all(b": ").await?;
-        stream.write_all(value.as_bytes()).await?;
-        stream.write_all(b"\r\n").await?;
+        out.extend_from_slice(name.as_bytes());
+        out.extend_from_slice(b": ");
+        out.extend_from_slice(value.as_bytes());
+        out.extend_from_slice(b"\r\n");
     }
 
     if let Some(ref body) = body {
-        stream
-            .write_all(format!("Content-Length: {}\r\n", body.len()).as_bytes())
-            .await?;
+        out.extend_from_slice(format!("Content-Length: {}\r\n", body.len()).as_bytes());
     }
-    stream.write_all(b"\r\n").await?;
+    out.extend_from_slice(b"\r\n");
     if let Some(body) = body {
-        stream.write_all(body).await?;
+        out.extend_from_slice(body);
     }
-    Ok(())
+    out
 }
 
 /// The parsed response status line + headers, before the body is touched — shared by both the
@@ -762,6 +771,35 @@ mod wire_head_tests {
             .await
             .expect("send");
         server.await.expect("the loopback server task must not panic")
+    }
+
+    /// The whole request is one buffer: this is what keeps it in one write (see `write_request`).
+    #[test]
+    fn the_request_is_encoded_as_one_buffer_with_the_exact_wire_bytes() {
+        let uri: Uri = "http://example.test:8080/a?b=1".parse().expect("uri");
+        let mut headers = HeaderMap::new();
+        headers.insert("accept", "*/*");
+        headers.insert(USER_AGENT, "webfold/0.1");
+        let got = super::encode_request(&Method::POST, &uri, &headers, &Some(b"xyz".to_vec()));
+        let text = String::from_utf8(got).expect("ascii");
+        assert!(text.starts_with("POST /a?b=1 HTTP/1.1\r\nHost: example.test:8080\r\nUser-Agent: webfold/0.1\r\n"), "{text:?}");
+        assert!(text.contains("accept: */*\r\n"), "{text:?}");
+        assert!(text.ends_with("Content-Length: 3\r\n\r\nxyz"), "{text:?}");
+        assert_eq!(text.matches("ser-Agent").count(), 1, "one agent: {text:?}");
+    }
+
+    /// A fresh plain connection has Nagle off, so a small write is never held back waiting for an ACK.
+    #[tokio::test]
+    async fn a_fresh_plain_connection_has_nodelay_set() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+        let _server = tokio::spawn(async move { listener.accept().await });
+        let uri: Uri = format!("http://{addr}/").parse().expect("uri");
+        let stream = crate::wire::connect_fresh(&uri, &std::collections::HashMap::new()).await.expect("connect");
+        match stream {
+            crate::wire::Stream::Plain(s) => assert!(s.nodelay().expect("nodelay"), "TCP_NODELAY must be set"),
+            crate::wire::Stream::Tls(_) => panic!("plain http gave a TLS stream"),
+        }
     }
 
     #[tokio::test]
