@@ -32,7 +32,7 @@ native = ["runtime-tokio", "dep:rustls", "dep:tokio-rustls", "dep:tracing", "dep
 fips = ["native", "aws-lc-rs/fips", "rustls/fips"]
 federation = ["dep:pkarr"]
 # `sync`: the set-difference file sync (S3/SigV4, HTTP/1.1 and HTTP/2, gRPC/HPACK, TLS 1.3, bundles,
-# block images) and the `syncfold` and `swalk` binaries. Moved here from hashtrinity. It is
+# block images) and the `syncfold` binary. Moved here from hashtrinity. It is
 # std-only apart from `hashtrinity::Table` and `hashtrinity::tregex`, so it adds no dependency, and
 # it is off by default so the zero-dependency core stays as it is.
 syncfold = []
@@ -90,11 +90,6 @@ rcgen = "0.13"
 [[bin]]
 name = "syncfold"
 path = "src/bin/syncfold.rs"
-required-features = ["syncfold"]
-
-[[bin]]
-name = "swalk"
-path = "src/bin/swalk.rs"
 required-features = ["syncfold"]
 
 [workspace]

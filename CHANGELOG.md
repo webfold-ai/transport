@@ -1,15 +1,16 @@
 # Changelog
 
-## Unreleased — `sync` module and the `syncfold` and `swalk` binaries
+## Unreleased — `sync` module and the `syncfold` binary
 
-Moved here from `hashtrinity::sync` (and hashtrinity's `src/bin/syncfold.rs` and `src/bin/swalk.rs`).
+Moved here from `hashtrinity::sync` and hashtrinity's `src/bin/syncfold.rs`.
 Behind the new `syncfold` feature, which is off by default.
 
 - **`transport::sync`**: `archive`, `block`, `copy`, `crypto`, `grpc`, `hpack`, `http`, `http2`,
   `image`, `s3`, `scan`, `sigv4`, `sync`, `sysio` and `tls` (TLS 1.3 client and server, X.509, ECDSA,
   RSA). Same code as in hashtrinity, with its unit tests: 36 pass and 2 are ignored because they
   spawn a real provider binary.
-- **Binaries**: `syncfold` and `swalk`, `required-features = ["syncfold"]`.
+- **Binary**: `syncfold`, `required-features = ["syncfold"]`. `swalk` stays in hashtrinity: it uses
+  `tregex`, not `sync`.
 - **No new dependency.** The module is `std` plus `hashtrinity::Table` and `hashtrinity::tregex`,
   both already dependencies.
 - **Migrating** from hashtrinity: depend on `transport` with `features = ["syncfold"]` and replace
