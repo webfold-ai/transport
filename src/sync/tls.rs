@@ -3645,6 +3645,14 @@ pub mod x509 {
         anchors: Vec<Cert>,
     }
     impl TrustStore {
+        /// A store anchored at every certificate in `pem` (blocks that do not parse are skipped).
+        pub fn from_pem(pem: &str) -> TrustStore {
+            let anchors = pem_certs(pem)
+                .iter()
+                .filter_map(|d| parse_cert(d))
+                .collect();
+            TrustStore { anchors }
+        }
         pub fn system() -> TrustStore {
             let mut anchors = Vec::new();
             for path in [

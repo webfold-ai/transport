@@ -96,4 +96,8 @@ required-features = ["syncfold"]
 name = "syncfold_dd"
 required-features = ["syncfold"]
 
+[[test]]
+name = "sync_hardening"
+required-features = ["syncfold"]
+
 [workspace]
