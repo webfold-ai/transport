@@ -1083,12 +1083,40 @@ pub mod block {
             d.set_len(size)?; // sparse-zero base; unsent (hole) regions stay zero
         }
 
+        // A device keeps whatever it held before, so the sender's omitted all-zero extents must be
+        // written as zeros there; a regular file was truncated and sized above and reads zero.
+        recv_extents(&mut stream, &d, size, dst_is_dev, quiet)
+    }
+
+    /// Write zeros over `[from, to)` of `d`.
+    fn zero_fill(d: &File, from: u64, to: u64) -> io::Result<()> {
+        let zeros = vec![0u8; WIRE_CHUNK];
+        let mut at = from;
+        while at < to {
+            let n = ((to - at) as usize).min(zeros.len());
+            sysio::write_all_at(d, &zeros[..n], at)?;
+            at += n as u64;
+        }
+        Ok(())
+    }
+
+    /// Read DATA frames from `r` until END and write each into `d` at its offset. With `zero_gaps`
+    /// the ranges the sender left out (all-zero extents) are written as zeros: between frames, and
+    /// from the last frame to `size`. The sender emits frames in increasing offset order.
+    fn recv_extents(
+        r: &mut dyn Read,
+        d: &File,
+        size: u64,
+        zero_gaps: bool,
+        quiet: bool,
+    ) -> io::Result<Stats> {
         let mut acc = Stats::ZERO;
         let mut hdr = [0u8; 13];
         let mut data = vec![0u8; WIRE_CHUNK];
         let mut tick = Throttle::new();
+        let mut cursor = 0u64; // one past the last byte written so far
         loop {
-            stream.read_exact(&mut hdr[..1])?;
+            r.read_exact(&mut hdr[..1])?;
             if hdr[0] == 0x00 {
                 break; // END
             }
@@ -1098,14 +1126,18 @@ pub mod block {
                     "unknown frame tag",
                 ));
             }
-            stream.read_exact(&mut hdr[1..13])?;
+            r.read_exact(&mut hdr[1..13])?;
             let off = u64::from_le_bytes(hdr[1..9].try_into().unwrap());
             let len = u32::from_le_bytes(hdr[9..13].try_into().unwrap()) as usize;
             if len > data.len() {
                 data.resize(len, 0);
             }
-            stream.read_exact(&mut data[..len])?;
-            sysio::write_all_at(&d, &data[..len], off)?;
+            r.read_exact(&mut data[..len])?;
+            if zero_gaps && off > cursor {
+                zero_fill(d, cursor, off)?;
+            }
+            sysio::write_all_at(d, &data[..len], off)?;
+            cursor = cursor.max(off + len as u64);
             acc.bytes_copied += len as u64;
             acc.blocks_copied += 1;
             if !quiet && tick.ready() {
@@ -1118,6 +1150,9 @@ pub mod block {
                 );
                 let _ = e.flush();
             }
+        }
+        if zero_gaps && cursor < size {
+            zero_fill(d, cursor, size)?;
         }
         d.sync_all()?;
         if !quiet {
@@ -1151,6 +1186,68 @@ pub mod block {
                 break;
             }
             thread::sleep(std::time::Duration::from_millis(120));
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::fs;
+
+        fn frame(off: u64, data: &[u8]) -> Vec<u8> {
+            let mut f = vec![0x01];
+            f.extend_from_slice(&off.to_le_bytes());
+            f.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            f.extend_from_slice(data);
+            f
+        }
+
+        /// A 24 KiB target full of 0xAA, standing in for a previously used device, and the stream
+        /// a sparse sender produces for data at 4096..8192 and 16384..20480 (the rest was zero).
+        fn run(zero_gaps: bool) -> Vec<u8> {
+            let path = std::env::temp_dir().join(format!(
+                "syncfold_recv_{}_{zero_gaps}",
+                std::process::id()
+            ));
+            let size = 24 * 1024u64;
+            let d = File::options()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&path)
+                .unwrap();
+            sysio::write_all_at(&d, &vec![0xAAu8; size as usize], 0).unwrap();
+            let mut wire = frame(4096, &[1u8; 4096]);
+            wire.extend(frame(16384, &[2u8; 4096]));
+            wire.push(0x00); // END
+            let mut r = &wire[..];
+            let st = recv_extents(&mut r, &d, size, zero_gaps, true).unwrap();
+            assert_eq!(st.bytes_copied, 8192);
+            let got = fs::read(&path).unwrap();
+            let _ = fs::remove_file(&path);
+            got
+        }
+
+        #[test]
+        fn a_device_target_gets_zeros_where_the_sender_omitted_extents() {
+            let got = run(true);
+            assert_eq!(got.len(), 24 * 1024);
+            assert!(got[..4096].iter().all(|&b| b == 0), "leading hole");
+            assert!(got[4096..8192].iter().all(|&b| b == 1));
+            assert!(got[8192..16384].iter().all(|&b| b == 0), "middle hole");
+            assert!(got[16384..20480].iter().all(|&b| b == 2));
+            assert!(got[20480..].iter().all(|&b| b == 0), "trailing hole");
+        }
+
+        #[test]
+        fn a_regular_file_target_is_left_alone_between_frames() {
+            // A regular file is truncated and sized before the stream, so there is nothing to zero;
+            // this pins that `zero_gaps = false` writes only the frames it is sent.
+            let got = run(false);
+            assert!(got[..4096].iter().all(|&b| b == 0xAA));
+            assert!(got[4096..8192].iter().all(|&b| b == 1));
+            assert!(got[8192..16384].iter().all(|&b| b == 0xAA));
         }
     }
 }
