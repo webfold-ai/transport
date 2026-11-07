@@ -3024,6 +3024,42 @@ pub mod http {
         }
         conn.flush()?;
 
+        read_response(conn)
+    }
+
+    /// One CRLF-terminated line, including the CRLF, read a byte at a time so nothing past it is
+    /// consumed from a keep-alive connection.
+    fn read_crlf_line<R: std::io::Read>(conn: &mut R, what: &str) -> io::Result<Vec<u8>> {
+        const MAX: usize = 64 * 1024;
+        let mut line = Vec::new();
+        let mut b = [0u8; 1];
+        loop {
+            match conn.read(&mut b) {
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        ErrorKind::UnexpectedEof,
+                        format!("eof in {what}"),
+                    ))
+                }
+                Ok(_) => {
+                    line.push(b[0]);
+                    if line.ends_with(b"\r\n") {
+                        return Ok(line);
+                    }
+                    if line.len() > MAX {
+                        return Err(io::Error::other(format!("{what} line too long")));
+                    }
+                }
+                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// Read exactly one HTTP/1.1 response from `conn`: the head, then the body by chunked framing
+    /// or Content-Length, leaving the connection positioned at the next response.
+    fn read_response<R: std::io::Read>(conn: &mut R) -> io::Result<Response> {
+        use std::io::Read;
         // Read one response head, then the body per Content-Length.
         let mut buf = Vec::with_capacity(8192);
         let head_end = loop {
@@ -3069,26 +3105,7 @@ pub mod http {
         let body = if chunked {
             let mut out = Vec::new();
             loop {
-                let mut size_line = Vec::new();
-                let mut b = [0u8; 1];
-                loop {
-                    match conn.read(&mut b) {
-                        Ok(0) => {
-                            return Err(io::Error::new(
-                                ErrorKind::UnexpectedEof,
-                                "eof in chunk size",
-                            ))
-                        }
-                        Ok(_) => {
-                            size_line.push(b[0]);
-                            if size_line.ends_with(b"\r\n") {
-                                break;
-                            }
-                        }
-                        Err(e) if e.kind() == ErrorKind::Interrupted => continue,
-                        Err(e) => return Err(e),
-                    }
-                }
+                let size_line = read_crlf_line(conn, "chunk size")?;
                 let size = usize::from_str_radix(
                     std::str::from_utf8(&size_line[..size_line.len() - 2])
                         .unwrap_or("")
@@ -3100,6 +3117,13 @@ pub mod http {
                 )
                 .map_err(|_| io::Error::other("bad chunk size"))?;
                 if size == 0 {
+                    // Consume the trailer section, up to and including its blank line, so the
+                    // next response on this connection starts at its own status line.
+                    loop {
+                        if read_crlf_line(conn, "chunk trailer")?.len() == 2 {
+                            break;
+                        }
+                    }
                     break;
                 }
                 let mut chunk = vec![0u8; size + 2];
@@ -3215,6 +3239,41 @@ pub mod http {
 
     fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
         hay.windows(needle.len()).position(|w| w == needle)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// Two keep-alive responses back to back on one stream: the second must start at its own
+        /// status line, so the first has to consume its trailer section and final blank line.
+        #[test]
+        fn a_chunked_response_leaves_the_connection_at_the_next_response() {
+            let wire = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nx\r\n0\r\n\r\n\
+                         HTTP/1.1 201 Created\r\nTransfer-Encoding: chunked\r\n\r\n1\r\ny\r\n0\r\n\r\n";
+            let mut r = &wire[..];
+            let a = read_response(&mut r).unwrap();
+            assert_eq!((a.status, a.body.as_slice()), (200, &b"x"[..]));
+            let b = read_response(&mut r).unwrap();
+            assert_eq!((b.status, b.body.as_slice()), (201, &b"y"[..]));
+            assert!(r.is_empty());
+        }
+
+        #[test]
+        fn chunk_trailer_fields_are_consumed_too() {
+            let wire = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nhi\r\n0\r\nX-Sum: 1\r\nX-More: 2\r\n\r\n\
+                         HTTP/1.1 204 No Content\r\n\r\n";
+            let mut r = &wire[..];
+            assert_eq!(read_response(&mut r).unwrap().body, b"hi");
+            assert_eq!(read_response(&mut r).unwrap().status, 204);
+        }
+
+        #[test]
+        fn a_truncated_trailer_is_an_error_not_a_hang() {
+            let wire = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nx\r\n0\r\nX-Sum: 1\r\n";
+            let mut r = &wire[..];
+            assert!(read_response(&mut r).is_err());
+        }
     }
 }
 pub mod http2 {
