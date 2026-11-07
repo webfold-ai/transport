@@ -3975,7 +3975,10 @@ pub mod x509 {
         fn a_tbs_with_malformed_trailing_bytes_is_not_a_certificate() {
             let p = pki();
             let good = leaf(&p, &ok_leaf_exts(), (NB, NA));
-            assert!(parse_cert(&good).is_some(), "control: the certificate parses");
+            assert!(
+                parse_cert(&good).is_some(),
+                "control: the certificate parses"
+            );
             // a SEQUENCE claiming 5 content bytes with only one present, and a bare tag
             for junk in [&[0x30u8, 0x05, 0x01][..], &[0x05u8][..]] {
                 let bad = with_tbs_junk(&good, junk);

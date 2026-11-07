@@ -84,7 +84,10 @@ fn archive_restore_refuses_parent_and_absolute_paths() {
         both_refuse(&blob, &base);
     }
     assert!(!base.join("escape").exists(), "a file escaped the root");
-    assert!(!base.join("escape_dir").exists(), "a directory escaped the root");
+    assert!(
+        !base.join("escape_dir").exists(),
+        "a directory escaped the root"
+    );
     assert!(!abs.exists(), "an absolute entry was written");
     let _ = fs::remove_dir_all(&base);
 }
@@ -129,7 +132,13 @@ fn a_chain_through_a_certificate_that_is_not_a_ca_is_rejected() {
 
     // Control: the attacker's own leaf validates for its own name.
     assert!(
-        x509::validate(std::slice::from_ref(&attacker), "attacker.example", NOW, &trust).is_ok(),
+        x509::validate(
+            std::slice::from_ref(&attacker),
+            "attacker.example",
+            NOW,
+            &trust
+        )
+        .is_ok(),
         "control chain rejected"
     );
     let err = x509::validate(&[forged, attacker], "victim.example", NOW, &trust)

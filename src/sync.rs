@@ -4216,12 +4216,7 @@ pub mod http {
         let head_end = loop {
             let mut b = [0u8; 1];
             match conn.read(&mut b) {
-                Ok(0) => {
-                    return Err(Error::new(
-                        ErrorKind::UnexpectedEof,
-                        "eof in response head",
-                    ))
-                }
+                Ok(0) => return Err(Error::new(ErrorKind::UnexpectedEof, "eof in response head")),
                 Ok(_) => {
                     buf.push(b[0]);
                     if buf.len() >= 4 && &buf[buf.len() - 4..] == b"\r\n\r\n" {
