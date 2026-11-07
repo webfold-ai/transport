@@ -4,7 +4,7 @@
 use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 const KEY: &[u8] = b"0123456789abcdef-test-key";
@@ -73,6 +73,16 @@ fn connect(port: u16) -> TcpStream {
     }
 }
 
+/// A server process that is killed and reaped when the test ends, even if an assertion fails.
+struct Reaped(Child);
+
+impl Drop for Reaped {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 fn serve_cmd(dst: &Path, port: u16, extra: &[&str]) -> Command {
     let mut c = Command::new(env!("CARGO_BIN_EXE_syncfold"));
     c.args([
@@ -96,11 +106,13 @@ fn a_v1_peer_is_dropped_by_a_keyed_server_and_the_destination_is_never_created()
     let src = d.join("src.img");
     std::fs::write(&src, vec![0x5au8; 64 * 1024]).unwrap();
     let port = free_port();
-    let mut server = serve_cmd(&dst, port, &["--key-file", key.to_str().unwrap()])
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+    let mut server = Reaped(
+        serve_cmd(&dst, port, &["--key-file", key.to_str().unwrap()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
 
     // A version 1 HELLO: the server offers no challenge to it and must drop the connection.
     let mut s = connect(port);
@@ -136,9 +148,10 @@ fn a_v1_peer_is_dropped_by_a_keyed_server_and_the_destination_is_never_created()
         "{}",
         String::from_utf8_lossy(&push.stderr)
     );
-    assert!(server.wait().unwrap().success());
+    assert!(server.0.wait().unwrap().success());
     let mut log = String::new();
     server
+        .0
         .stderr
         .take()
         .unwrap()
