@@ -17,7 +17,7 @@ pub mod archive {
 
     use std::fs::{self, File, FileTimes};
     use std::io::{self, Error, ErrorKind, Read, Write};
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use crate::sync::sysio;
@@ -177,11 +177,13 @@ pub mod archive {
     }
     impl<'a> Cur<'a> {
         fn take(&mut self, n: usize) -> io::Result<&'a [u8]> {
-            if self.p + n > self.b.len() {
-                return Err(Error::new(ErrorKind::UnexpectedEof, "truncated archive"));
-            }
-            let s = &self.b[self.p..self.p + n];
-            self.p += n;
+            let end = self
+                .p
+                .checked_add(n)
+                .filter(|&e| e <= self.b.len())
+                .ok_or_else(|| Error::new(ErrorKind::UnexpectedEof, "truncated archive"))?;
+            let s = &self.b[self.p..end];
+            self.p = end;
             Ok(s)
         }
         fn u16(&mut self) -> io::Result<usize> {
@@ -195,7 +197,127 @@ pub mod archive {
         }
     }
 
+    /// Longest symlink target `unpack`/`unpack_stream` accept (Linux `PATH_MAX`); the
+    /// length is a peer-controlled u32, so it is bounded before anything is allocated.
+    const MAX_LINK_TARGET: usize = 4096;
+
+    fn bad_entry(msg: &str) -> Error {
+        Error::new(ErrorKind::InvalidData, msg.to_string())
+    }
+
+    /// Split an archive entry path into its components. Only plain relative paths are
+    /// accepted: every `/`-separated segment must be non-empty, not `.` or `..`, and free
+    /// of NUL (so absolute paths, `a//b`, `a/`, `./a` and traversal are all refused). On
+    /// Windows `\` and `:` are refused too, so no backslash or drive-prefix form can
+    /// smuggle in an absolute or parent-relative path.
+    fn entry_segments(path: &str) -> io::Result<Vec<&str>> {
+        let segs: Vec<&str> = path.split('/').collect();
+        for s in &segs {
+            let bad = s.is_empty()
+                || *s == "."
+                || *s == ".."
+                || s.contains('\0')
+                || (cfg!(windows) && (s.contains('\\') || s.contains(':')));
+            if bad {
+                return Err(bad_entry("unsafe path in archive entry"));
+            }
+        }
+        Ok(segs)
+    }
+
+    /// A symlink target is accepted only if it is relative and, resolved from the
+    /// link's own directory (`depth` real directories below the root), cannot leave the
+    /// root: `..` may appear only as a leading run, never after a normal segment, and
+    /// the run may not be longer than `depth`. (A purely lexical "does it stay inside"
+    /// check is fooled by `l1 -> .` followed by `l2 -> l1/..`.) Empty and `.` segments
+    /// are ignored; absolute targets and NUL are refused.
+    fn check_link_target(target: &str, depth: usize) -> io::Result<()> {
+        if target.is_empty()
+            || target.starts_with('/')
+            || target.contains('\0')
+            || (cfg!(windows) && (target.contains('\\') || target.contains(':')))
+        {
+            return Err(bad_entry("unsafe symlink target in archive"));
+        }
+        let mut ups = 0usize;
+        let mut normal = false;
+        for seg in target.split('/') {
+            match seg {
+                "" | "." => {}
+                ".." => {
+                    if normal {
+                        return Err(bad_entry("unsafe symlink target in archive"));
+                    }
+                    ups += 1;
+                }
+                _ => normal = true,
+            }
+        }
+        if ups > depth {
+            return Err(bad_entry("symlink target escapes the restore root"));
+        }
+        Ok(())
+    }
+
+    /// Create the parent directories of `segs` below `root` one component at a time,
+    /// refusing any component that is a symlink (or not a directory), so nothing is
+    /// ever created through a link. Returns the destination path.
+    fn prepare_dest(root: &Path, segs: &[&str], make_last_dir: bool) -> io::Result<PathBuf> {
+        let mut cur = root.to_path_buf();
+        let n = if make_last_dir {
+            segs.len()
+        } else {
+            segs.len() - 1
+        };
+        for s in &segs[..n] {
+            cur.push(s);
+            match fs::symlink_metadata(&cur) {
+                Ok(m) if m.file_type().is_symlink() => {
+                    return Err(bad_entry("archive entry passes through a symlink"));
+                }
+                Ok(m) if m.is_dir() => {}
+                Ok(_) => return Err(bad_entry("archive entry parent is not a directory")),
+                Err(e) if e.kind() == ErrorKind::NotFound => fs::create_dir(&cur)?,
+                Err(e) => return Err(e),
+            }
+        }
+        if !make_last_dir {
+            cur.push(segs[segs.len() - 1]);
+        }
+        Ok(cur)
+    }
+
+    /// Create the file for a file entry. Whatever already sits at `dst` (a symlink in
+    /// particular) is removed first and the file is made with `create_new` (`O_EXCL`),
+    /// so the write can never be redirected through a pre-existing link.
+    fn create_dest_file(dst: &Path) -> io::Result<File> {
+        match fs::symlink_metadata(dst) {
+            Ok(m) if m.is_dir() => {
+                return Err(bad_entry("archive file entry collides with a directory"));
+            }
+            Ok(_) => fs::remove_file(dst)?,
+            Err(e) if e.kind() == ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+        File::options().write(true).create_new(true).open(dst)
+    }
+
+    /// Place a symlink entry (target already vetted by `check_link_target`).
+    fn place_symlink(dst: &Path, target: &str) -> io::Result<()> {
+        if let Ok(m) = fs::symlink_metadata(dst) {
+            if m.is_dir() {
+                return Err(bad_entry("archive symlink entry collides with a directory"));
+            }
+            fs::remove_file(dst)?;
+        }
+        sysio::symlink(target.as_ref(), dst)
+    }
+
     /// Unpack a blob into `root`, recreating the tree bit-exact (mode + mtime).
+    ///
+    /// The blob is untrusted: entry paths must be plain relative paths, nothing is
+    /// created through a symlink, symlink targets must be relative and stay inside
+    /// `root`, and setuid/setgid/sticky bits are never restored.
     pub fn unpack(blob: &[u8], root: &Path) -> io::Result<()> {
         if !blob.starts_with(MAGIC) {
             return Err(Error::new(ErrorKind::InvalidData, "not an SFAR archive"));
@@ -210,37 +332,35 @@ pub mod archive {
             let plen = c.u16()?;
             let path = std::str::from_utf8(c.take(plen)?)
                 .map_err(|_| Error::new(ErrorKind::InvalidData, "bad path"))?;
-            let dst = confined(root, path)?;
+            let segs = entry_segments(path)?;
             match kind {
                 b'd' => {
-                    fs::create_dir_all(&dst)?;
+                    prepare_dest(root, &segs, true)?;
                 }
                 b'l' => {
                     let tlen = c.u32()? as usize;
+                    if tlen > MAX_LINK_TARGET {
+                        return Err(bad_entry("symlink target too long"));
+                    }
                     let target = std::str::from_utf8(c.take(tlen)?)
                         .map_err(|_| Error::new(ErrorKind::InvalidData, "bad symlink"))?;
-                    if let Some(parent) = dst.parent() {
-                        fs::create_dir_all(parent)?;
-                    }
-                    let _ = fs::remove_file(&dst);
-                    sysio::symlink(target.as_ref(), &dst)?;
+                    check_link_target(target, segs.len() - 1)?;
+                    let dst = prepare_dest(root, &segs, false)?;
+                    place_symlink(&dst, target)?;
                 }
                 b'f' => {
                     let mode = c.u32()?;
                     let secs = c.u64()?;
                     let nanos = c.u32()?;
-                    let len = c.u64()? as usize;
+                    let len = usize::try_from(c.u64()?)
+                        .map_err(|_| Error::new(ErrorKind::UnexpectedEof, "truncated archive"))?;
                     let data = c.take(len)?;
-                    if let Some(parent) = dst.parent() {
-                        fs::create_dir_all(parent)?;
-                    }
-                    clear_symlink(&dst)?;
-                    fs::write(&dst, data)?;
-                    sysio::set_mode_path(&dst, mode)?;
+                    let dst = prepare_dest(root, &segs, false)?;
+                    let mut f = create_dest_file(&dst)?;
+                    f.write_all(data)?;
+                    sysio::set_mode_file(&f, mode)?;
                     let mt = SystemTime::UNIX_EPOCH + Duration::new(secs, nanos);
-                    if let Ok(f) = File::options().write(true).open(&dst) {
-                        let _ = f.set_times(FileTimes::new().set_modified(mt));
-                    }
+                    let _ = f.set_times(FileTimes::new().set_modified(mt));
                 }
                 other => {
                     return Err(Error::new(
@@ -274,33 +394,31 @@ pub mod archive {
             r.read_exact(&mut pbytes)?;
             let path = std::str::from_utf8(&pbytes)
                 .map_err(|_| Error::new(ErrorKind::InvalidData, "bad path"))?;
-            let dst = confined(root, path)?;
+            let segs = entry_segments(path)?;
             match k[0] {
                 b'd' => {
-                    fs::create_dir_all(&dst)?;
+                    prepare_dest(root, &segs, true)?;
                 }
                 b'l' => {
                     let tlen = read_u32(r)? as usize;
+                    if tlen > MAX_LINK_TARGET {
+                        return Err(bad_entry("symlink target too long"));
+                    }
                     let mut t = vec![0u8; tlen];
                     r.read_exact(&mut t)?;
                     let target = std::str::from_utf8(&t)
                         .map_err(|_| Error::new(ErrorKind::InvalidData, "bad symlink"))?;
-                    if let Some(p) = dst.parent() {
-                        fs::create_dir_all(p)?;
-                    }
-                    let _ = fs::remove_file(&dst);
-                    sysio::symlink(target.as_ref(), &dst)?;
+                    check_link_target(target, segs.len() - 1)?;
+                    let dst = prepare_dest(root, &segs, false)?;
+                    place_symlink(&dst, target)?;
                 }
                 b'f' => {
                     let mode = read_u32(r)?;
                     let secs = read_u64(r)?;
                     let nanos = read_u32(r)?;
                     let len = read_u64(r)?;
-                    if let Some(p) = dst.parent() {
-                        fs::create_dir_all(p)?;
-                    }
-                    clear_symlink(&dst)?;
-                    let mut f = File::create(&dst)?;
+                    let dst = prepare_dest(root, &segs, false)?;
+                    let mut f = create_dest_file(&dst)?;
                     let mut remaining = len;
                     let mut buf = vec![0u8; 1 << 20];
                     while remaining > 0 {
@@ -353,55 +471,6 @@ pub mod archive {
         Ok(u64::from_be_bytes(b))
     }
 
-    /// The destination for an archive entry, or an error if the entry would land outside `root`.
-    ///
-    /// Only plain path components are accepted: an absolute path, a `..` component or a path with no
-    /// component is refused. No existing ancestor below `root` may be a symlink, so an earlier
-    /// symlink entry cannot redirect a later entry out of the tree.
-    fn confined(root: &Path, rel: &str) -> io::Result<std::path::PathBuf> {
-        use std::path::Component;
-        let bad = || {
-            Error::new(
-                ErrorKind::InvalidData,
-                format!("unsafe archive path: {rel:?}"),
-            )
-        };
-        let mut names = Vec::new();
-        for c in Path::new(rel).components() {
-            match c {
-                Component::Normal(n) => names.push(n),
-                Component::CurDir => {}
-                _ => return Err(bad()),
-            }
-        }
-        let Some((_, parents)) = names.split_last() else {
-            return Err(bad());
-        };
-        let mut cur = root.to_path_buf();
-        for n in parents {
-            cur.push(n);
-            match fs::symlink_metadata(&cur) {
-                Ok(m) if m.file_type().is_symlink() => return Err(bad()),
-                Ok(_) => {}
-                Err(e) if e.kind() == ErrorKind::NotFound => {}
-                Err(e) => return Err(e),
-            }
-        }
-        let mut dst = root.to_path_buf();
-        dst.extend(names);
-        Ok(dst)
-    }
-
-    /// Remove a symlink at `dst` so that creating a file there cannot write through it.
-    fn clear_symlink(dst: &Path) -> io::Result<()> {
-        match fs::symlink_metadata(dst) {
-            Ok(m) if m.file_type().is_symlink() => fs::remove_file(dst),
-            Ok(_) => Ok(()),
-            Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(e),
-        }
-    }
-
     /// Count of leaf files in a tree (for reporting "N objects → 1").
     pub fn count_files(root: &Path) -> u64 {
         fn rec(p: &Path) -> u64 {
@@ -424,6 +493,7 @@ pub mod archive {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use std::path::PathBuf;
 
         #[test]
         fn pack_unpack_roundtrip() {
@@ -551,6 +621,244 @@ pub mod archive {
                 .unwrap()
                 .file_type()
                 .is_symlink());
+            let _ = fs::remove_dir_all(&base);
+        }
+
+        // ---- hostile-archive tests (NET-03 / NET-04 / NET-11) ----
+
+        /// Build SFAR bytes entry by entry (the on-disk framing `pack` emits).
+        struct Sfar(Vec<u8>);
+        impl Sfar {
+            fn new() -> Self {
+                Sfar(MAGIC.to_vec())
+            }
+            fn path(&mut self, kind: u8, path: &[u8]) {
+                self.0.push(kind);
+                self.0.extend_from_slice(&(path.len() as u16).to_be_bytes());
+                self.0.extend_from_slice(path);
+            }
+            fn dir(mut self, path: &str) -> Self {
+                self.path(b'd', path.as_bytes());
+                self
+            }
+            fn link(mut self, path: &str, target: &str) -> Self {
+                self.path(b'l', path.as_bytes());
+                self.0
+                    .extend_from_slice(&(target.len() as u32).to_be_bytes());
+                self.0.extend_from_slice(target.as_bytes());
+                self
+            }
+            fn file_mode(mut self, path: &[u8], mode: u32, data: &[u8]) -> Self {
+                self.path(b'f', path);
+                self.0.extend_from_slice(&mode.to_be_bytes());
+                self.0.extend_from_slice(&0u64.to_be_bytes());
+                self.0.extend_from_slice(&0u32.to_be_bytes());
+                self.0.extend_from_slice(&(data.len() as u64).to_be_bytes());
+                self.0.extend_from_slice(data);
+                self
+            }
+            fn file(self, path: &str, data: &[u8]) -> Self {
+                self.file_mode(path.as_bytes(), 0o644, data)
+            }
+        }
+
+        fn scratch(tag: &str) -> PathBuf {
+            let base = std::env::temp_dir().join(format!("sfar_{tag}_{}", std::process::id()));
+            let _ = fs::remove_dir_all(&base);
+            fs::create_dir_all(&base).unwrap();
+            base
+        }
+
+        /// Run both unpackers on `blob` into `<base>/root`; each must fail.
+        fn assert_both_refuse(blob: &[u8], base: &Path) {
+            let r1 = base.join("root1");
+            let r2 = base.join("root2");
+            assert!(
+                unpack(blob, &r1).is_err(),
+                "unpack accepted a hostile archive"
+            );
+            assert!(
+                unpack_stream(&mut &blob[..], &r2).is_err(),
+                "unpack_stream accepted a hostile archive"
+            );
+        }
+
+        #[test]
+        fn rejects_parent_dir_traversal() {
+            let base = scratch("dotdot");
+            let blob = Sfar::new().file("../escape", b"pwn").0;
+            assert_both_refuse(&blob, &base);
+            assert!(!base.join("escape").exists(), "file escaped the root");
+            let blob = Sfar::new().dir("a").file("a/../../escape2", b"pwn").0;
+            assert_both_refuse(&blob, &base);
+            assert!(!base.join("escape2").exists(), "file escaped the root");
+            let _ = fs::remove_dir_all(&base);
+        }
+
+        #[test]
+        fn rejects_absolute_path() {
+            let base = scratch("abs");
+            let outside = base.join("outside_abs");
+            let blob = Sfar::new().file(outside.to_str().unwrap(), b"pwn").0;
+            assert_both_refuse(&blob, &base);
+            assert!(!outside.exists(), "absolute entry wrote outside the root");
+            let _ = fs::remove_dir_all(&base);
+        }
+
+        #[test]
+        fn rejects_empty_dot_and_nul_components() {
+            let base = scratch("odd");
+            for bad in ["a//b", "./a", "a/./b", "a/", "", "a\0b"] {
+                let blob = Sfar::new().file_mode(bad.as_bytes(), 0o644, b"x").0;
+                assert_both_refuse(&blob, &base);
+                let _ = fs::remove_dir_all(base.join("root1"));
+                let _ = fs::remove_dir_all(base.join("root2"));
+            }
+            let _ = fs::remove_dir_all(&base);
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn never_writes_through_symlink() {
+            let base = scratch("symlink");
+            let outside = base.join("outside");
+            fs::create_dir_all(&outside).unwrap();
+            // symlink d -> <absolute outside dir>, then a file under it. Even if the
+            // symlink entry itself were tolerated, the file must not land outside.
+            let blob = Sfar::new()
+                .link("d", outside.to_str().unwrap())
+                .file("d/pwned", b"pwn")
+                .0;
+            assert_both_refuse(&blob, &base);
+            assert!(
+                !outside.join("pwned").exists(),
+                "file written through a symlink"
+            );
+            // A relative in-root-looking link that climbs out.
+            let blob = Sfar::new()
+                .link("d", "../outside")
+                .file("d/pwned", b"pwn")
+                .0;
+            assert_both_refuse(&blob, &base);
+            assert!(
+                !outside.join("pwned").exists(),
+                "file written through ../ link"
+            );
+            let _ = fs::remove_dir_all(&base);
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn never_writes_through_in_root_symlink_to_dir() {
+            // Even a symlink that stays inside the root must not be written through
+            // (the entry after it is refused, nothing is created via the link).
+            let base = scratch("inroot");
+            let blob = Sfar::new()
+                .dir("real")
+                .link("alias", "real")
+                .file("alias/f", b"x")
+                .0;
+            assert_both_refuse(&blob, &base);
+            assert!(!base.join("root1/real/f").exists());
+            assert!(!base.join("root2/real/f").exists());
+            let _ = fs::remove_dir_all(&base);
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn rejects_symlink_chain_escaping_root() {
+            // l1 -> .  (harmless), l2 -> l1/..  (lexically inside, really the root's parent)
+            let base = scratch("chain");
+            let blob = Sfar::new().link("l1", ".").link("l2", "l1/..").0;
+            assert_both_refuse(&blob, &base);
+            let _ = fs::remove_dir_all(&base);
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn existing_symlink_at_destination_is_not_followed() {
+            let base = scratch("preexist");
+            let victim = base.join("victim");
+            fs::write(&victim, b"keep").unwrap();
+            for stream in [false, true] {
+                let root = base.join(format!("root_{stream}"));
+                fs::create_dir_all(&root).unwrap();
+                std::os::unix::fs::symlink(&victim, root.join("f")).unwrap();
+                let blob = Sfar::new().file("f", b"pwn").0;
+                let _ = if stream {
+                    unpack_stream(&mut &blob[..], &root)
+                } else {
+                    unpack(&blob, &root)
+                };
+                assert_eq!(fs::read(&victim).unwrap(), b"keep", "wrote through symlink");
+            }
+            let _ = fs::remove_dir_all(&base);
+        }
+
+        #[test]
+        fn legit_relative_symlinks_still_restore() {
+            let base = scratch("legit");
+            let blob = Sfar::new()
+                .dir("a")
+                .file("a/x", b"hi")
+                .link("a/up", "../a/x")
+                .link("top", "a/x")
+                .0;
+            unpack_stream(&mut &blob[..], &base.join("r")).unwrap();
+            #[cfg(unix)]
+            {
+                assert_eq!(fs::read(base.join("r/top")).unwrap(), b"hi");
+                assert_eq!(fs::read(base.join("r/a/up")).unwrap(), b"hi");
+            }
+            let _ = fs::remove_dir_all(&base);
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn setuid_setgid_sticky_bits_are_masked() {
+            use std::os::unix::fs::PermissionsExt;
+            let base = scratch("mode");
+            let blob = Sfar::new().file_mode(b"suid", 0o7755, b"x").0;
+            unpack(&blob, &base.join("r1")).unwrap();
+            unpack_stream(&mut &blob[..], &base.join("r2")).unwrap();
+            for r in ["r1", "r2"] {
+                let m = fs::metadata(base.join(r).join("suid"))
+                    .unwrap()
+                    .permissions()
+                    .mode();
+                assert_eq!(m & 0o7000, 0, "{r}: special bits survived: {m:o}");
+                assert_eq!(m & 0o777, 0o755, "{r}: permission bits lost: {m:o}");
+            }
+            let _ = fs::remove_dir_all(&base);
+        }
+
+        #[test]
+        fn oversized_symlink_target_length_is_refused_before_allocating() {
+            // A link entry declaring a ~4 GiB target must be rejected as invalid data
+            // up front, not by trying to read (and allocate) the target.
+            let mut blob = Sfar::new().0;
+            blob.push(b'l');
+            blob.extend_from_slice(&1u16.to_be_bytes());
+            blob.push(b'x');
+            blob.extend_from_slice(&u32::MAX.to_be_bytes());
+            let base = scratch("biglink");
+            let e = unpack(&blob, &base.join("r1")).unwrap_err();
+            assert_eq!(e.kind(), ErrorKind::InvalidData, "unpack: {e}");
+            let e = unpack_stream(&mut &blob[..], &base.join("r2")).unwrap_err();
+            assert_eq!(e.kind(), ErrorKind::InvalidData, "unpack_stream: {e}");
+            let _ = fs::remove_dir_all(&base);
+        }
+
+        #[test]
+        fn cur_take_rejects_overflowing_length() {
+            // A file entry declaring len = u64::MAX must be a clean error, not a panic.
+            let mut blob = Sfar::new().file("f", b"x").0;
+            let n = blob.len();
+            blob[n - 1 - 8..n - 1].copy_from_slice(&u64::MAX.to_be_bytes());
+            blob.truncate(n - 1);
+            let base = scratch("take");
+            let e = unpack(&blob, &base.join("r")).unwrap_err();
+            assert_eq!(e.kind(), ErrorKind::UnexpectedEof);
             let _ = fs::remove_dir_all(&base);
         }
     }
@@ -6134,11 +6442,12 @@ pub mod sysio {
     #[cfg(windows)]
     pub fn open_options_mode(_: &mut OpenOptions, _: u32) {}
 
-    /// Set a unix mode on a path / handle (no-op on Windows).
+    /// Set a unix mode on a path / handle (no-op on Windows). Only the permission bits
+    /// (`0o777`) are applied: setuid/setgid/sticky never come from untrusted archive data.
     #[cfg(unix)]
     pub fn set_mode_path(path: &Path, mode: u32) -> io::Result<()> {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode & 0o777))
     }
     #[cfg(windows)]
     pub fn set_mode_path(_: &Path, _: u32) -> io::Result<()> {
@@ -6148,7 +6457,7 @@ pub mod sysio {
     #[cfg(unix)]
     pub fn set_mode_file(f: &File, mode: u32) -> io::Result<()> {
         use std::os::unix::fs::PermissionsExt;
-        f.set_permissions(std::fs::Permissions::from_mode(mode))
+        f.set_permissions(std::fs::Permissions::from_mode(mode & 0o777))
     }
     #[cfg(windows)]
     pub fn set_mode_file(_: &File, _: u32) -> io::Result<()> {
