@@ -17,11 +17,20 @@ fn dd_dry_run_to_tcp_does_not_connect() {
     let port = listener.local_addr().unwrap().port();
 
     let out = Command::new(env!("CARGO_BIN_EXE_syncfold"))
-        .args(["dd", src.to_str().unwrap(), &format!("tcp://127.0.0.1:{port}"), "--dry-run"])
+        .args([
+            "dd",
+            src.to_str().unwrap(),
+            &format!("tcp://127.0.0.1:{port}"),
+            "--dry-run",
+        ])
         .output()
         .unwrap();
 
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     assert!(String::from_utf8_lossy(&out.stderr).contains("dry run"));
     match listener.accept() {
         Err(e) if e.kind() == ErrorKind::WouldBlock => {}

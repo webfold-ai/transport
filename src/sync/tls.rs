@@ -3164,8 +3164,12 @@ pub mod x509 {
                         while let Some((t, c, _)) = b.tlv() {
                             if t == 0x01 {
                                 is_ca = c.first().is_some_and(|&x| x != 0);
-                            } else if t == 0x02 && c.len() <= 4 && c.first().is_some_and(|&x| x & 0x80 == 0) {
-                                path_len = Some(c.iter().fold(0u32, |a, &x| (a << 8) | u32::from(x)));
+                            } else if t == 0x02
+                                && c.len() <= 4
+                                && c.first().is_some_and(|&x| x & 0x80 == 0)
+                            {
+                                path_len =
+                                    Some(c.iter().fold(0u32, |a, &x| (a << 8) | u32::from(x)));
                             }
                         }
                     }
@@ -3419,14 +3423,20 @@ pub mod x509 {
                 continue;
             }
             if !c.is_ca {
-                return Err(format!("cert {i} signed another certificate but is not a CA"));
+                return Err(format!(
+                    "cert {i} signed another certificate but is not a CA"
+                ));
             }
             if c.key_cert_sign == Some(false) {
-                return Err(format!("cert {i} is a CA whose key usage forbids signing certificates"));
+                return Err(format!(
+                    "cert {i} is a CA whose key usage forbids signing certificates"
+                ));
             }
             if let Some(max) = c.path_len {
                 if i - 1 > max as usize {
-                    return Err(format!("cert {i} exceeds its path length constraint of {max}"));
+                    return Err(format!(
+                        "cert {i} exceeds its path length constraint of {max}"
+                    ));
                 }
             }
         }
@@ -3578,16 +3588,36 @@ pub mod x509 {
         const DIGITAL_SIGNATURE: u8 = 0x80;
 
         fn root_spec() -> Spec<'static> {
-            Spec { subject: "root", issuer: "root", ca: Some((true, None)), key_usage: Some(KEY_CERT_SIGN), san: None }
+            Spec {
+                subject: "root",
+                issuer: "root",
+                ca: Some((true, None)),
+                key_usage: Some(KEY_CERT_SIGN),
+                san: None,
+            }
         }
         fn ca_spec<'a>(subject: &'a str, issuer: &'a str, path_len: Option<u8>) -> Spec<'a> {
-            Spec { subject, issuer, ca: Some((true, path_len)), key_usage: Some(KEY_CERT_SIGN), san: None }
+            Spec {
+                subject,
+                issuer,
+                ca: Some((true, path_len)),
+                key_usage: Some(KEY_CERT_SIGN),
+                san: None,
+            }
         }
         fn leaf_spec<'a>(issuer: &'a str) -> Spec<'a> {
-            Spec { subject: "leaf", issuer, ca: Some((false, None)), key_usage: Some(DIGITAL_SIGNATURE), san: Some("example.test") }
+            Spec {
+                subject: "leaf",
+                issuer,
+                ca: Some((false, None)),
+                key_usage: Some(DIGITAL_SIGNATURE),
+                san: Some("example.test"),
+            }
         }
         fn trust(root_der: &[u8]) -> TrustStore {
-            TrustStore { anchors: vec![parse_cert(root_der).expect("root parses")] }
+            TrustStore {
+                anchors: vec![parse_cert(root_der).expect("root parses")],
+            }
         }
         fn check(chain: &[&Vec<u8>], root_der: &[u8]) -> Result<(), String> {
             let chain: Vec<Vec<u8>> = chain.iter().map(|c| (*c).clone()).collect();
@@ -3601,7 +3631,10 @@ pub mod x509 {
             let inter = cert(&ca_spec("inter", "root", None), &ik, &rk);
             let leaf = cert(&leaf_spec("inter"), &lk, &ik);
             assert!(check(&[&leaf, &inter], &root).is_ok());
-            assert!(check(&[&leaf, &inter, &root], &root).is_ok(), "the anchor itself may be sent");
+            assert!(
+                check(&[&leaf, &inter, &root], &root).is_ok(),
+                "the anchor itself may be sent"
+            );
         }
 
         /// The finding's attack: an ordinary end-entity certificate, with its key, signs a leaf.
@@ -3610,7 +3643,17 @@ pub mod x509 {
             let (rk, ek, lk) = (key(), key(), key());
             let root = cert(&root_spec(), &rk, &rk);
             let ee = cert(&leaf_spec("root"), &ek, &rk); // a leaf the root issued: CA:false
-            let forged = cert(&Spec { subject: "victim", issuer: "leaf", ca: Some((false, None)), key_usage: Some(DIGITAL_SIGNATURE), san: Some("example.test") }, &lk, &ek);
+            let forged = cert(
+                &Spec {
+                    subject: "victim",
+                    issuer: "leaf",
+                    ca: Some((false, None)),
+                    key_usage: Some(DIGITAL_SIGNATURE),
+                    san: Some("example.test"),
+                },
+                &lk,
+                &ek,
+            );
             let e = check(&[&forged, &ee], &root).unwrap_err();
             assert!(e.contains("not a CA"), "{e}");
         }
@@ -3619,20 +3662,36 @@ pub mod x509 {
         fn an_intermediate_without_basic_constraints_is_refused() {
             let (rk, ik, lk) = (key(), key(), key());
             let root = cert(&root_spec(), &rk, &rk);
-            let spec = Spec { subject: "inter", issuer: "root", ca: None, key_usage: None, san: None };
+            let spec = Spec {
+                subject: "inter",
+                issuer: "root",
+                ca: None,
+                key_usage: None,
+                san: None,
+            };
             let inter = cert(&spec, &ik, &rk);
             let leaf = cert(&leaf_spec("inter"), &lk, &ik);
-            assert!(check(&[&leaf, &inter], &root).unwrap_err().contains("not a CA"));
+            assert!(check(&[&leaf, &inter], &root)
+                .unwrap_err()
+                .contains("not a CA"));
         }
 
         #[test]
         fn a_ca_whose_key_usage_forbids_certificate_signing_is_refused() {
             let (rk, ik, lk) = (key(), key(), key());
             let root = cert(&root_spec(), &rk, &rk);
-            let spec = Spec { subject: "inter", issuer: "root", ca: Some((true, None)), key_usage: Some(DIGITAL_SIGNATURE), san: None };
+            let spec = Spec {
+                subject: "inter",
+                issuer: "root",
+                ca: Some((true, None)),
+                key_usage: Some(DIGITAL_SIGNATURE),
+                san: None,
+            };
             let inter = cert(&spec, &ik, &rk);
             let leaf = cert(&leaf_spec("inter"), &lk, &ik);
-            assert!(check(&[&leaf, &inter], &root).unwrap_err().contains("key usage"));
+            assert!(check(&[&leaf, &inter], &root)
+                .unwrap_err()
+                .contains("key usage"));
         }
 
         #[test]
@@ -3656,7 +3715,18 @@ pub mod x509 {
             assert!(c.is_ca && c.path_len == Some(3) && c.key_cert_sign == Some(true));
             let c = parse_cert(&cert(&leaf_spec("c"), &k, &k)).unwrap();
             assert!(!c.is_ca && c.path_len.is_none() && c.key_cert_sign == Some(false));
-            let c = parse_cert(&cert(&Spec { subject: "c", issuer: "c", ca: None, key_usage: None, san: None }, &k, &k)).unwrap();
+            let c = parse_cert(&cert(
+                &Spec {
+                    subject: "c",
+                    issuer: "c",
+                    ca: None,
+                    key_usage: None,
+                    san: None,
+                },
+                &k,
+                &k,
+            ))
+            .unwrap();
             assert!(!c.is_ca && c.key_cert_sign.is_none());
         }
     }

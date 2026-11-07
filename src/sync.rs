@@ -360,7 +360,12 @@ pub mod archive {
     /// symlink entry cannot redirect a later entry out of the tree.
     fn confined(root: &Path, rel: &str) -> io::Result<std::path::PathBuf> {
         use std::path::Component;
-        let bad = || Error::new(ErrorKind::InvalidData, format!("unsafe archive path: {rel:?}"));
+        let bad = || {
+            Error::new(
+                ErrorKind::InvalidData,
+                format!("unsafe archive path: {rel:?}"),
+            )
+        };
         let mut names = Vec::new();
         for c in Path::new(rel).components() {
             match c {
@@ -471,9 +476,15 @@ pub mod archive {
 
         /// Both extractors, on the same blob: neither may write outside `root`.
         fn refuses(b: &[u8], root: &Path) {
-            assert!(unpack(b, root).is_err(), "unpack accepted an escaping entry");
+            assert!(
+                unpack(b, root).is_err(),
+                "unpack accepted an escaping entry"
+            );
             let mut r = b;
-            assert!(unpack_stream(&mut r, root).is_err(), "unpack_stream accepted an escaping entry");
+            assert!(
+                unpack_stream(&mut r, root).is_err(),
+                "unpack_stream accepted an escaping entry"
+            );
         }
 
         #[test]
@@ -484,9 +495,18 @@ pub mod archive {
             fs::create_dir_all(&base).unwrap();
             let outside = base.join("outside");
             let abs = base.join("abs_target");
-            refuses(&blob(&[entry(b'f', "../outside", &file_fields(b"x"))]), &root);
-            refuses(&blob(&[entry(b'f', "a/../../outside", &file_fields(b"x"))]), &root);
-            refuses(&blob(&[entry(b'f', abs.to_str().unwrap(), &file_fields(b"x"))]), &root);
+            refuses(
+                &blob(&[entry(b'f', "../outside", &file_fields(b"x"))]),
+                &root,
+            );
+            refuses(
+                &blob(&[entry(b'f', "a/../../outside", &file_fields(b"x"))]),
+                &root,
+            );
+            refuses(
+                &blob(&[entry(b'f', abs.to_str().unwrap(), &file_fields(b"x"))]),
+                &root,
+            );
             refuses(&blob(&[entry(b'd', "../outdir", &[])]), &root);
             refuses(&blob(&[entry(b'f', "", &file_fields(b"x"))]), &root);
             assert!(!outside.exists() && !abs.exists() && !base.join("outdir").exists());
@@ -527,7 +547,10 @@ pub mod archive {
             unpack_stream(&mut r, &root).unwrap();
             assert_eq!(fs::read(&victim).unwrap(), b"keep");
             assert_eq!(fs::read(root.join("f")).unwrap(), b"new");
-            assert!(!fs::symlink_metadata(root.join("f")).unwrap().file_type().is_symlink());
+            assert!(!fs::symlink_metadata(root.join("f"))
+                .unwrap()
+                .file_type()
+                .is_symlink());
             let _ = fs::remove_dir_all(&base);
         }
     }
@@ -1211,10 +1234,8 @@ pub mod block {
         /// A 24 KiB target full of 0xAA, standing in for a previously used device, and the stream
         /// a sparse sender produces for data at 4096..8192 and 16384..20480 (the rest was zero).
         fn run(zero_gaps: bool) -> Vec<u8> {
-            let path = std::env::temp_dir().join(format!(
-                "syncfold_recv_{}_{zero_gaps}",
-                std::process::id()
-            ));
+            let path = std::env::temp_dir()
+                .join(format!("syncfold_recv_{}_{zero_gaps}", std::process::id()));
             let size = 24 * 1024u64;
             let d = File::options()
                 .read(true)
@@ -1261,9 +1282,15 @@ pub mod block {
                 dry_run: false,
                 quiet: true,
             };
-            let e = super::run(&f, &f, &opts).err().expect("same-file dd must fail");
+            let e = super::run(&f, &f, &opts)
+                .err()
+                .expect("same-file dd must fail");
             assert!(e.to_string().contains("same file"), "{e}");
-            assert_eq!(fs::read(&f).unwrap(), vec![9u8; 8192], "the source must survive");
+            assert_eq!(
+                fs::read(&f).unwrap(),
+                vec![9u8; 8192],
+                "the source must survive"
+            );
             let _ = fs::remove_file(&f);
         }
 
@@ -1330,7 +1357,8 @@ pub mod copy {
         use std::fs;
 
         fn scratch(tag: &str) -> std::path::PathBuf {
-            let d = std::env::temp_dir().join(format!("syncfold_same_{tag}_{}", std::process::id()));
+            let d =
+                std::env::temp_dir().join(format!("syncfold_same_{tag}_{}", std::process::id()));
             let _ = fs::remove_dir_all(&d);
             fs::create_dir_all(&d).unwrap();
             d
@@ -1341,7 +1369,10 @@ pub mod copy {
             let d = scratch("copy");
             let f = d.join("f");
             fs::write(&f, b"precious").unwrap();
-            assert_eq!(copy_one(&f, &f).unwrap_err().kind(), io::ErrorKind::InvalidInput);
+            assert_eq!(
+                copy_one(&f, &f).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput
+            );
             assert_eq!(fs::read(&f).unwrap(), b"precious");
             // A hard link is the same inode under another name.
             let link = d.join("hard");
@@ -3352,7 +3383,8 @@ pub mod http {
 
         #[test]
         fn a_truncated_trailer_is_an_error_not_a_hang() {
-            let wire = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nx\r\n0\r\nX-Sum: 1\r\n";
+            let wire =
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nx\r\n0\r\nX-Sum: 1\r\n";
             let mut r = &wire[..];
             assert!(read_response(&mut r).is_err());
         }
@@ -5952,12 +5984,18 @@ pub mod sync {
 
         #[test]
         fn run_refuses_a_file_onto_itself() {
-            let base = std::env::temp_dir().join(format!("syncfold_runself_{}", std::process::id()));
+            let base =
+                std::env::temp_dir().join(format!("syncfold_runself_{}", std::process::id()));
             let _ = fs::remove_dir_all(&base);
             fs::create_dir_all(&base).unwrap();
             let f = base.join("f");
             fs::write(&f, b"precious").unwrap();
-            let opts = Opts { threads: 1, delete: false, dry_run: false, quiet: true };
+            let opts = Opts {
+                threads: 1,
+                delete: false,
+                dry_run: false,
+                quiet: true,
+            };
             let e = run(&f, &f, &opts).err().expect("same-file run must fail");
             assert!(e.to_string().contains("same file"), "{e}");
             assert_eq!(fs::read(&f).unwrap(), b"precious");
