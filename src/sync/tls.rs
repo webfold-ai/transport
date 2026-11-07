@@ -2734,6 +2734,12 @@ pub mod x509 {
         not_after: i64,
         key: Pub,
         sans: Vec<String>,
+        /// `basicConstraints` `cA`; false when the extension is absent.
+        is_ca: bool,
+        /// `basicConstraints` `pathLenConstraint`, when present.
+        path_len: Option<u32>,
+        /// `keyUsage` `keyCertSign`, or `None` when the certificate has no `keyUsage` extension.
+        key_cert_sign: Option<bool>,
     }
 
     // ── DER reader ─────────────────────────────────────────────────────────────
@@ -2782,6 +2788,7 @@ pub mod x509 {
     const OID_P521: &[u8] = &[0x2b, 0x81, 0x04, 0x00, 0x23]; // 1.3.132.0.35 — go-plugin's AutoMTLS curve
     const OID_ECDSA_SHA512: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x04];
     const OID_BASIC_CONSTRAINTS: &[u8] = &[0x55, 0x1d, 0x13];
+    const OID_KEY_USAGE: &[u8] = &[0x55, 0x1d, 0x0f];
     const OID_COMMON_NAME: &[u8] = &[0x55, 0x04, 0x03];
     const OID_ORG_NAME: &[u8] = &[0x55, 0x04, 0x0a];
 
@@ -3131,6 +3138,49 @@ pub mod x509 {
         out
     }
 
+    /// `(cA, pathLenConstraint, keyCertSign)` from the extensions of a certificate. `cA` is false
+    /// when `basicConstraints` is absent and `keyCertSign` is `None` when `keyUsage` is absent.
+    fn parse_ca_fields(ext_content: &[u8]) -> (bool, Option<u32>, Option<bool>) {
+        let mut is_ca = false;
+        let mut path_len = None;
+        let mut key_cert_sign = None;
+        let mut d = Der::new(ext_content);
+        if let Some((_, seq, _)) = d.tlv() {
+            let mut s = Der::new(seq);
+            while let Some((_, ext, _)) = s.tlv() {
+                let mut e = Der::new(ext);
+                let Some((_, oid, _)) = e.tlv() else { continue };
+                let mut octet = None;
+                while let Some((t, c, _)) = e.tlv() {
+                    if t == 0x04 {
+                        octet = Some(c);
+                    }
+                }
+                let Some(value) = octet else { continue };
+                if oid == OID_BASIC_CONSTRAINTS {
+                    let mut v = Der::new(value);
+                    if let Some((_, body, _)) = v.tlv() {
+                        let mut b = Der::new(body);
+                        while let Some((t, c, _)) = b.tlv() {
+                            if t == 0x01 {
+                                is_ca = c.first().is_some_and(|&x| x != 0);
+                            } else if t == 0x02 && c.len() <= 4 && c.first().is_some_and(|&x| x & 0x80 == 0) {
+                                path_len = Some(c.iter().fold(0u32, |a, &x| (a << 8) | u32::from(x)));
+                            }
+                        }
+                    }
+                } else if oid == OID_KEY_USAGE {
+                    let mut v = Der::new(value);
+                    if let Some((0x03, bits, _)) = v.tlv() {
+                        // BIT STRING: an unused-bits byte, then the flags; keyCertSign is bit 5.
+                        key_cert_sign = Some(bits.get(1).is_some_and(|&b| b & 0x04 != 0));
+                    }
+                }
+            }
+        }
+        (is_ca, path_len, key_cert_sign)
+    }
+
     pub fn parse_cert(der: &[u8]) -> Option<Cert> {
         let mut top = Der::new(der);
         let (_, cert_body, _) = top.tlv()?;
@@ -3154,9 +3204,11 @@ pub mod x509 {
         let (_, _subject, subject_full) = t.tlv()?;
         let (_, spki, _) = t.tlv()?;
         let mut sans = Vec::new();
+        let (mut is_ca, mut path_len, mut key_cert_sign) = (false, None, None);
         while let Some((tag, content, _)) = t.tlv() {
             if tag == 0xa3 {
                 sans = parse_sans(content);
+                (is_ca, path_len, key_cert_sign) = parse_ca_fields(content);
             }
         }
 
@@ -3177,6 +3229,9 @@ pub mod x509 {
             not_after,
             key,
             sans,
+            is_ca,
+            path_len,
+            key_cert_sign,
         })
     }
 
@@ -3356,7 +3411,26 @@ pub mod x509 {
             }
         }
         let top = chain.last().unwrap();
-        if trust.is_anchor(top) {
+        let top_is_anchor = trust.is_anchor(top);
+        // A certificate that signed another must be a CA allowed to sign certificates, within its
+        // path-length limit (RFC 5280 6.1.4 (k) to (m)). A trust anchor is trusted as given.
+        for (i, c) in chain.iter().enumerate().skip(1) {
+            if i == chain.len() - 1 && top_is_anchor {
+                continue;
+            }
+            if !c.is_ca {
+                return Err(format!("cert {i} signed another certificate but is not a CA"));
+            }
+            if c.key_cert_sign == Some(false) {
+                return Err(format!("cert {i} is a CA whose key usage forbids signing certificates"));
+            }
+            if let Some(max) = c.path_len {
+                if i - 1 > max as usize {
+                    return Err(format!("cert {i} exceeds its path length constraint of {max}"));
+                }
+            }
+        }
+        if top_is_anchor {
             return Ok(chain.remove(0));
         }
         if let Some(anchor) = trust.anchor_for_subject(&top.issuer) {
@@ -3397,6 +3471,193 @@ pub mod x509 {
             (0x0805, Pub::Rsa(n, e)) => rsa::pss_verify(n, e, rsa::H::Sha384, &signed, sig),
             (0x0806, Pub::Rsa(n, e)) => rsa::pss_verify(n, e, rsa::H::Sha512, &signed, sig),
             _ => false,
+        }
+    }
+
+    /// Chain validation: who may sign whom.
+    #[cfg(test)]
+    mod chain_tests {
+        use super::*;
+
+        const NOW: i64 = 1_850_000_000;
+
+        struct Key {
+            d: Vec<u8>,
+            qx: Vec<u8>,
+            qy: Vec<u8>,
+        }
+        fn key() -> Key {
+            let (d, qx, qy) = ecdsa::p521().generate_keypair().expect("keygen");
+            Key { d, qx, qy }
+        }
+
+        /// What goes in a test certificate's `basicConstraints` and `keyUsage`.
+        struct Spec<'a> {
+            subject: &'a str,
+            issuer: &'a str,
+            /// `None`: no `basicConstraints` extension.
+            ca: Option<(bool, Option<u8>)>,
+            /// `keyUsage` first flag byte; `None`: no `keyUsage` extension.
+            key_usage: Option<u8>,
+            san: Option<&'a str>,
+        }
+
+        /// A P-521 certificate for `subject_key`, signed by `signer`.
+        fn cert(spec: &Spec, subject_key: &Key, signer: &Key) -> Vec<u8> {
+            let sig_alg_id = w_seq(&w_oid(OID_ECDSA_SHA512));
+            let validity = w_seq(
+                &[
+                    w_generalized_time(1_700_000_000),
+                    w_generalized_time(2_000_000_000),
+                ]
+                .concat(),
+            );
+            let ec_params = w_seq(&[w_oid(OID_EC_PUBKEY), w_oid(OID_P521)].concat());
+            let mut point = vec![0x04u8];
+            point.extend_from_slice(&subject_key.qx);
+            point.extend_from_slice(&subject_key.qy);
+            let spki = w_seq(&[ec_params, w_bitstring(&point)].concat());
+
+            let mut exts = Vec::new();
+            if let Some((is_ca, path_len)) = spec.ca {
+                let mut body = Vec::new();
+                if is_ca {
+                    body.extend_from_slice(&w_bool(true));
+                }
+                if let Some(n) = path_len {
+                    body.extend_from_slice(&w_tlv(0x02, &[n]));
+                }
+                exts.push(w_seq(
+                    &[
+                        w_oid(OID_BASIC_CONSTRAINTS),
+                        w_bool(true),
+                        w_octet_string(&w_seq(&body)),
+                    ]
+                    .concat(),
+                ));
+            }
+            if let Some(flags) = spec.key_usage {
+                exts.push(w_seq(
+                    &[
+                        w_oid(OID_KEY_USAGE),
+                        w_bool(true),
+                        w_octet_string(&w_bitstring(&[flags])),
+                    ]
+                    .concat(),
+                ));
+            }
+            if let Some(name) = spec.san {
+                exts.push(w_seq(
+                    &[
+                        w_oid(OID_SAN),
+                        w_octet_string(&w_seq(&w_tlv(0x82, name.as_bytes()))),
+                    ]
+                    .concat(),
+                ));
+            }
+            let tbs = w_seq(
+                &[
+                    w_context(0, &w_uint(&[2])),
+                    w_uint(&[1]),
+                    sig_alg_id.clone(),
+                    w_name(spec.issuer),
+                    validity,
+                    w_name(spec.subject),
+                    spki,
+                    w_context(3, &w_seq(&exts.concat())),
+                ]
+                .concat(),
+            );
+            let hash = crate::sync::crypto::sha512(&tbs);
+            let (r, s) = ecdsa::p521().sign(&signer.d, &hash);
+            let ec_sig = w_seq(&[w_uint(&r), w_uint(&s)].concat());
+            w_seq(&[tbs, sig_alg_id, w_bitstring(&ec_sig)].concat())
+        }
+
+        const KEY_CERT_SIGN: u8 = 0x04;
+        const DIGITAL_SIGNATURE: u8 = 0x80;
+
+        fn root_spec() -> Spec<'static> {
+            Spec { subject: "root", issuer: "root", ca: Some((true, None)), key_usage: Some(KEY_CERT_SIGN), san: None }
+        }
+        fn ca_spec<'a>(subject: &'a str, issuer: &'a str, path_len: Option<u8>) -> Spec<'a> {
+            Spec { subject, issuer, ca: Some((true, path_len)), key_usage: Some(KEY_CERT_SIGN), san: None }
+        }
+        fn leaf_spec<'a>(issuer: &'a str) -> Spec<'a> {
+            Spec { subject: "leaf", issuer, ca: Some((false, None)), key_usage: Some(DIGITAL_SIGNATURE), san: Some("example.test") }
+        }
+        fn trust(root_der: &[u8]) -> TrustStore {
+            TrustStore { anchors: vec![parse_cert(root_der).expect("root parses")] }
+        }
+        fn check(chain: &[&Vec<u8>], root_der: &[u8]) -> Result<(), String> {
+            let chain: Vec<Vec<u8>> = chain.iter().map(|c| (*c).clone()).collect();
+            validate(&chain, "example.test", NOW, &trust(root_der)).map(|_| ())
+        }
+
+        #[test]
+        fn a_proper_chain_validates() {
+            let (rk, ik, lk) = (key(), key(), key());
+            let root = cert(&root_spec(), &rk, &rk);
+            let inter = cert(&ca_spec("inter", "root", None), &ik, &rk);
+            let leaf = cert(&leaf_spec("inter"), &lk, &ik);
+            assert!(check(&[&leaf, &inter], &root).is_ok());
+            assert!(check(&[&leaf, &inter, &root], &root).is_ok(), "the anchor itself may be sent");
+        }
+
+        /// The finding's attack: an ordinary end-entity certificate, with its key, signs a leaf.
+        #[test]
+        fn an_end_entity_certificate_cannot_act_as_an_intermediate() {
+            let (rk, ek, lk) = (key(), key(), key());
+            let root = cert(&root_spec(), &rk, &rk);
+            let ee = cert(&leaf_spec("root"), &ek, &rk); // a leaf the root issued: CA:false
+            let forged = cert(&Spec { subject: "victim", issuer: "leaf", ca: Some((false, None)), key_usage: Some(DIGITAL_SIGNATURE), san: Some("example.test") }, &lk, &ek);
+            let e = check(&[&forged, &ee], &root).unwrap_err();
+            assert!(e.contains("not a CA"), "{e}");
+        }
+
+        #[test]
+        fn an_intermediate_without_basic_constraints_is_refused() {
+            let (rk, ik, lk) = (key(), key(), key());
+            let root = cert(&root_spec(), &rk, &rk);
+            let spec = Spec { subject: "inter", issuer: "root", ca: None, key_usage: None, san: None };
+            let inter = cert(&spec, &ik, &rk);
+            let leaf = cert(&leaf_spec("inter"), &lk, &ik);
+            assert!(check(&[&leaf, &inter], &root).unwrap_err().contains("not a CA"));
+        }
+
+        #[test]
+        fn a_ca_whose_key_usage_forbids_certificate_signing_is_refused() {
+            let (rk, ik, lk) = (key(), key(), key());
+            let root = cert(&root_spec(), &rk, &rk);
+            let spec = Spec { subject: "inter", issuer: "root", ca: Some((true, None)), key_usage: Some(DIGITAL_SIGNATURE), san: None };
+            let inter = cert(&spec, &ik, &rk);
+            let leaf = cert(&leaf_spec("inter"), &lk, &ik);
+            assert!(check(&[&leaf, &inter], &root).unwrap_err().contains("key usage"));
+        }
+
+        #[test]
+        fn a_path_length_constraint_is_enforced() {
+            let (rk, i1k, i2k, lk) = (key(), key(), key(), key());
+            let root = cert(&root_spec(), &rk, &rk);
+            let leaf_of = |pl: u8| {
+                let i1 = cert(&ca_spec("i1", "root", Some(pl)), &i1k, &rk);
+                let i2 = cert(&ca_spec("i2", "i1", None), &i2k, &i1k);
+                let leaf = cert(&leaf_spec("i2"), &lk, &i2k);
+                check(&[&leaf, &i2, &i1], &root)
+            };
+            assert!(leaf_of(1).is_ok(), "i1 allows one intermediate below it");
+            assert!(leaf_of(0).unwrap_err().contains("path length"));
+        }
+
+        #[test]
+        fn parse_cert_reads_the_constraint_fields() {
+            let k = key();
+            let c = parse_cert(&cert(&ca_spec("c", "c", Some(3)), &k, &k)).unwrap();
+            assert!(c.is_ca && c.path_len == Some(3) && c.key_cert_sign == Some(true));
+            let c = parse_cert(&cert(&leaf_spec("c"), &k, &k)).unwrap();
+            assert!(!c.is_ca && c.path_len.is_none() && c.key_cert_sign == Some(false));
+            let c = parse_cert(&cert(&Spec { subject: "c", issuer: "c", ca: None, key_usage: None, san: None }, &k, &k)).unwrap();
+            assert!(!c.is_ca && c.key_cert_sign.is_none());
         }
     }
 
