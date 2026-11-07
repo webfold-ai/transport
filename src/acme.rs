@@ -1209,7 +1209,7 @@ impl AcmeClient {
 
         let key_auth = acme_key_authorization(&challenge.token, &self.account().thumbprint());
         let dns_name = authz.identifier.value.trim_start_matches("*.");
-        let dns_value = b64url(&hashtrinity::crypto::sha256(key_auth.as_bytes()));
+        let dns_value = b64url(&crate::prim::sha256(key_auth.as_bytes()));
         match responder {
             ChallengeResponder::Http(r) => r.serve_token(&challenge.token, &key_auth).await?,
             ChallengeResponder::Dns(r) => r.publish_txt(dns_name, &dns_value).await?,

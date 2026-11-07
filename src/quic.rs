@@ -1,8 +1,8 @@
 #![cfg(feature = "runtime-tokio")]
 
-//! Native QUIC transport — packet/frame layer on hashtrinity-crypto's crypto.
+//! Native QUIC transport — packet/frame layer on the `prim` crypto facade (aws-lc-rs).
 //!
-//! hashtrinity-crypto already has the QUIC packet crypto (`quic_seal`/`quic_open`/`quic_hp_mask`,
+//! `prim` provides the QUIC packet crypto (`quic_seal`/`quic_open`/`quic_hp_mask`,
 //! ChaCha20-Poly1305 AEAD, RFC 9001). This module implements the QUIC transport layer natively:
 //!
 //! - **Variable-length integer encoding** (RFC 9000 §16) — QUIC's VARINT
@@ -22,7 +22,7 @@
 //! - **B/U** = the packet accumulator (packet number space — monotone, ordered)
 //! - **self** = the ACK frame (the medium turned on itself — received → acknowledged)
 
-use hashtrinity::crypto::quic::{quic_seal, quic_open, quic_hp_mask};
+use crate::prim::{quic_hp_mask, quic_open, quic_seal};
 
 // ── Variable-length integer encoding (RFC 9000 §16) ──────────────────────────────
 
@@ -301,9 +301,9 @@ pub fn decode_payload(buf: &[u8]) -> Vec<Frame> {
     frames
 }
 
-// ── Packet protection (wraps hashtrinity-crypto's QUIC crypto) ───────────────────
+// ── Packet protection (wraps the `prim` facade's QUIC crypto) ───────────────────
 
-/// Seal a QUIC packet: encrypt the payload + append tag, using hashtrinity-crypto's AEAD.
+/// Seal a QUIC packet: encrypt the payload + append tag, using the `prim` AEAD (aws-lc-rs).
 pub fn seal_packet(key: &[u8; 32], iv: &[u8; 12], pn: u64, header: &[u8], payload: &[u8]) -> Vec<u8> {
     quic_seal(key, iv, pn, header, payload)
 }

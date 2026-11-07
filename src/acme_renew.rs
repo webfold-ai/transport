@@ -43,7 +43,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use hashtrinity::crypto::sha256;
+use crate::prim::sha256;
 use hashtrinity::Table;
 
 use crate::acme::{days_from_civil, der, AcmeClient, AcmeError, Dns01Responder, Http01Responder, RenewalWindow, RevocationReason};
@@ -1813,7 +1813,7 @@ PfFwXFUdKr72euUqW9E4wdcMVA==\n\
     }
 
     fn temp_dir(tag: &str) -> PathBuf {
-        let id: String = hashtrinity::crypto::rand_bytes(6).iter().map(|b| format!("{b:02x}")).collect();
+        let id: String = crate::prim::random_bytes(6).iter().map(|b| format!("{b:02x}")).collect();
         std::env::temp_dir().join(format!("transport-certstore-{tag}-{id}"))
     }
 

@@ -53,7 +53,8 @@
 
 use super::PeerId;
 use hashtrinity::Table;
-use hashtrinity::crypto::{sha256, to_hex};
+use crate::prim::sha256;
+use hashtrinity::crypto::to_hex;
 
 /// An apex zone this platform is authoritative for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
