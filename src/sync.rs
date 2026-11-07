@@ -5774,7 +5774,14 @@ pub mod sync {
                 .file_type()
                 .map(|t| t.is_dir() && !t.is_symlink())
                 .unwrap_or(false);
-            if !s.exists() {
+            // Look at the source entry itself: `exists()` follows a symlink, so a dangling link
+            // would read as absent and the destination copy of it would be deleted. Only a
+            // genuine "not found" counts as absent; any other error leaves the entry alone.
+            let absent = matches!(
+                fs::symlink_metadata(&s),
+                Err(ref e) if e.kind() == io::ErrorKind::NotFound
+            );
+            if absent {
                 let ok = if dry {
                     true
                 } else if is_dir {
@@ -5793,6 +5800,33 @@ pub mod sync {
                 a
             }
         })
+    }
+
+    #[cfg(all(test, unix))]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn delete_extras_keeps_the_copy_of_a_dangling_symlink() {
+            let base = std::env::temp_dir().join(format!("syncfold_del_{}", std::process::id()));
+            let (src, dst) = (base.join("src"), base.join("dst"));
+            let _ = fs::remove_dir_all(&base);
+            fs::create_dir_all(&src).unwrap();
+            fs::create_dir_all(&dst).unwrap();
+            std::os::unix::fs::symlink("nowhere", src.join("dangling")).unwrap();
+            std::os::unix::fs::symlink("nowhere", dst.join("dangling")).unwrap();
+            fs::write(dst.join("extra"), b"x").unwrap();
+
+            let st = delete_extras(&src, &dst, false);
+            assert_eq!(st.errors, 0);
+            assert_eq!(st.deleted, 1, "only `extra` goes");
+            assert!(!dst.join("extra").exists());
+            assert!(
+                fs::symlink_metadata(dst.join("dangling")).is_ok(),
+                "the destination copy of a dangling source symlink must stay"
+            );
+            let _ = fs::remove_dir_all(&base);
+        }
     }
 }
 pub mod sysio {
