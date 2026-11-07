@@ -30,7 +30,7 @@ use super::dns::{Name, RData, Record};
 use super::signed_dns::{Keypair, SignedDnsError, SignedPacket};
 #[cfg(feature = "native")]
 use super::signed_dns::PublicKey;
-use hashtrinity::crypto::sha256;
+use crate::prim::sha256;
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::time::{SystemTime, UNIX_EPOCH};

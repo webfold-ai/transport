@@ -799,7 +799,7 @@ pub mod sni {
             let material = self.source.cert_for(&name)?;
             let mut digest_input = material.chain_pem.clone().into_bytes();
             digest_input.extend_from_slice(material.key_pem.as_bytes());
-            let digest = hashtrinity::crypto::sha256(&digest_input);
+            let digest = crate::prim::sha256(&digest_input);
 
             let mut cache = self.cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some((d, key)) = cache.get(&name) {

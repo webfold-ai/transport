@@ -25,7 +25,7 @@
 //! see `docs/rfcs/0019-native-p2p-pkarr-removal.md` for what is left to remove.
 
 use crate::{PeerAddr, PeerId};
-use hashtrinity::crypto::sha256;
+use crate::prim::sha256;
 use std::collections::HashMap;
 use std::future::Future;
 use std::net::IpAddr;

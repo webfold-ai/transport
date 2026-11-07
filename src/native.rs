@@ -802,11 +802,11 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let secret_a = {
-            let b = hashtrinity::crypto::rand_bytes(32);
+            let b = crate::prim::random_bytes(32);
             let mut s = [0u8; 32]; s.copy_from_slice(&b); s
         };
         let secret_b = {
-            let b = hashtrinity::crypto::rand_bytes(32);
+            let b = crate::prim::random_bytes(32);
             let mut s = [0u8; 32]; s.copy_from_slice(&b); s
         };
 

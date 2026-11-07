@@ -279,7 +279,7 @@ pub fn chain_top(chain_pem: &str) -> Option<ChainTop> {
 /// SHA-256 of `der` as lower-case hex — how CCADB and the Chrome Root Store identify a root.
 #[must_use]
 pub fn fingerprint_hex(der: &[u8]) -> String {
-    hashtrinity::crypto::sha256(der).iter().map(|b| format!("{b:02x}")).collect()
+    crate::prim::sha256(der).iter().map(|b| format!("{b:02x}")).collect()
 }
 
 #[cfg(test)]
