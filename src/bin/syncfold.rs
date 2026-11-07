@@ -484,6 +484,16 @@ fn cmd_dd(args: &[String]) -> ExitCode {
             eprintln!("syncfold dd: tcp:// destination needs host:port");
             return ExitCode::from(2);
         }
+        // A dry run writes nothing, and a push makes the receiver truncate and overwrite its
+        // destination, so a dry run must not connect at all.
+        if dry_run {
+            if !quiet {
+                eprintln!(
+                    "syncfold dd: dry run, would push {src_s} to tcp://{host}:{port}; nothing was sent"
+                );
+            }
+            return ExitCode::SUCCESS;
+        }
         return match block::push(
             &PathBuf::from(&src_s),
             src_format,

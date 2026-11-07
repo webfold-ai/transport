@@ -92,4 +92,8 @@ name = "syncfold"
 path = "src/bin/syncfold.rs"
 required-features = ["syncfold"]
 
+[[test]]
+name = "syncfold_dd"
+required-features = ["syncfold"]
+
 [workspace]
