@@ -2955,12 +2955,18 @@ pub mod x509 {
         not_after: i64,
         key: Pub,
         sans: Vec<String>,
-        /// `basicConstraints` `cA`; false when the extension is absent.
-        is_ca: bool,
-        /// `basicConstraints` `pathLenConstraint`, when present.
-        path_len: Option<u32>,
-        /// `keyUsage` `keyCertSign`, or `None` when the certificate has no `keyUsage` extension.
-        key_cert_sign: Option<bool>,
+        /// iPAddress SubjectAltNames (4 or 16 raw octets).
+        ip_sans: Vec<Vec<u8>>,
+        /// basicConstraints `(cA, pathLenConstraint)`; `None` when the extension is absent.
+        basic_constraints: Option<(bool, Option<u64>)>,
+        /// keyUsage, bit `n` set for RFC 5280 KeyUsage bit `n`; `None` when absent.
+        key_usage: Option<u16>,
+        /// extKeyUsage purpose OIDs; `None` when absent.
+        ext_key_usage: Option<Vec<Vec<u8>>>,
+        /// Set when the cert carries an unknown critical extension, a duplicate
+        /// extension, or a known extension that does not parse. Such a cert is
+        /// rejected anywhere in a chain except as a trust anchor.
+        ext_problem: Option<&'static str>,
     }
 
     // ── DER reader ─────────────────────────────────────────────────────────────
@@ -2983,6 +2989,9 @@ pub mod x509 {
                 l0 as usize
             } else {
                 let k = (l0 & 0x7f) as usize;
+                if k > std::mem::size_of::<usize>() {
+                    return None;
+                }
                 let mut v = 0usize;
                 for _ in 0..k {
                     v = (v << 8) | *self.b.get(self.p)? as usize;
@@ -2990,7 +2999,7 @@ pub mod x509 {
                 }
                 v
             };
-            let content = self.b.get(self.p..self.p + len)?;
+            let content = self.b.get(self.p..self.p.checked_add(len)?)?;
             self.p += len;
             Some((tag, content, &self.b[start..self.p]))
         }
@@ -3009,9 +3018,13 @@ pub mod x509 {
     const OID_P521: &[u8] = &[0x2b, 0x81, 0x04, 0x00, 0x23]; // 1.3.132.0.35 — go-plugin's AutoMTLS curve
     const OID_ECDSA_SHA512: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x04];
     const OID_BASIC_CONSTRAINTS: &[u8] = &[0x55, 0x1d, 0x13];
-    const OID_KEY_USAGE: &[u8] = &[0x55, 0x1d, 0x0f];
     const OID_COMMON_NAME: &[u8] = &[0x55, 0x04, 0x03];
     const OID_ORG_NAME: &[u8] = &[0x55, 0x04, 0x0a];
+    const OID_KEY_USAGE: &[u8] = &[0x55, 0x1d, 0x0f];
+    const OID_EXT_KEY_USAGE: &[u8] = &[0x55, 0x1d, 0x25];
+    const OID_KP_SERVER_AUTH: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x01];
+    const KU_DIGITAL_SIGNATURE: u16 = 1 << 0;
+    const KU_KEY_CERT_SIGN: u16 = 1 << 5;
 
     fn parse_sig_alg(content: &[u8]) -> Option<SigAlg> {
         let mut d = Der::new(content);
@@ -3324,86 +3337,170 @@ pub mod x509 {
         out
     }
 
-    fn parse_sans(ext_content: &[u8]) -> Vec<String> {
-        let mut out = Vec::new();
-        let mut d = Der::new(ext_content);
-        if let Some((_, seq, _)) = d.tlv() {
-            let mut s = Der::new(seq);
-            while let Some((_, ext, _)) = s.tlv() {
-                let mut e = Der::new(ext);
-                if let Some((_, o, _)) = e.tlv() {
-                    if o == OID_SAN {
-                        let mut octet = None;
-                        while let Some((t, c, _)) = e.tlv() {
-                            if t == 0x04 {
-                                octet = Some(c);
-                            }
-                        }
-                        if let Some(os) = octet {
-                            let mut g = Der::new(os);
-                            if let Some((_, names, _)) = g.tlv() {
-                                let mut gn = Der::new(names);
-                                while let Some((t, c, _)) = gn.tlv() {
-                                    if t == 0x82 {
-                                        if let Ok(s) = std::str::from_utf8(c) {
-                                            out.push(s.to_string());
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        out
+    /// What `parse_extensions` reads out of a certificate's `[3]` extensions block.
+    #[derive(Default)]
+    struct Exts {
+        sans: Vec<String>,
+        ip_sans: Vec<Vec<u8>>,
+        basic_constraints: Option<(bool, Option<u64>)>,
+        key_usage: Option<u16>,
+        ext_key_usage: Option<Vec<Vec<u8>>>,
+        problem: Option<&'static str>,
     }
 
-    /// `(cA, pathLenConstraint, keyCertSign)` from the extensions of a certificate. `cA` is false
-    /// when `basicConstraints` is absent and `keyCertSign` is `None` when `keyUsage` is absent.
-    fn parse_ca_fields(ext_content: &[u8]) -> (bool, Option<u32>, Option<bool>) {
-        let mut is_ca = false;
-        let mut path_len = None;
-        let mut key_cert_sign = None;
-        let mut d = Der::new(ext_content);
-        if let Some((_, seq, _)) = d.tlv() {
-            let mut s = Der::new(seq);
-            while let Some((_, ext, _)) = s.tlv() {
-                let mut e = Der::new(ext);
-                let Some((_, oid, _)) = e.tlv() else { continue };
-                let mut octet = None;
-                while let Some((t, c, _)) = e.tlv() {
-                    if t == 0x04 {
-                        octet = Some(c);
+    /// Read every Extension of the `[3]` block (`content` is its inner
+    /// `SEQUENCE OF Extension`). Extension ::= SEQUENCE { extnID OID,
+    /// critical BOOLEAN DEFAULT FALSE, extnValue OCTET STRING }. An unknown
+    /// extension marked critical must make the certificate unusable (RFC 5280
+    /// section 4.2), so it is recorded in `problem` rather than skipped.
+    fn parse_extensions(content: &[u8]) -> Exts {
+        let mut x = Exts::default();
+        let mut d = Der::new(content);
+        let Some((0x30, seq, _)) = d.tlv() else {
+            x.problem = Some("malformed extensions");
+            return x;
+        };
+        let mut seen: Vec<&[u8]> = Vec::new();
+        let mut s = Der::new(seq);
+        while s.p < seq.len() {
+            let Some((0x30, ext, _)) = s.tlv() else {
+                x.problem = Some("malformed extension");
+                break;
+            };
+            let mut e = Der::new(ext);
+            let Some((0x06, oid, _)) = e.tlv() else {
+                x.problem = Some("malformed extension");
+                break;
+            };
+            let mut next = e.tlv();
+            let mut critical = false;
+            if let Some((0x01, b, _)) = next {
+                critical = b == [0xff];
+                next = e.tlv();
+            }
+            let Some((0x04, value, _)) = next else {
+                x.problem = Some("malformed extension");
+                break;
+            };
+            if seen.contains(&oid) {
+                x.problem = Some("duplicate extension");
+                break;
+            }
+            seen.push(oid);
+            let parsed = match oid {
+                o if o == OID_SAN => parse_san(value, &mut x),
+                o if o == OID_BASIC_CONSTRAINTS => parse_basic_constraints(value)
+                    .map(|bc| x.basic_constraints = Some(bc))
+                    .is_some(),
+                o if o == OID_KEY_USAGE => parse_key_usage(value)
+                    .map(|ku| x.key_usage = Some(ku))
+                    .is_some(),
+                o if o == OID_EXT_KEY_USAGE => parse_ext_key_usage(value)
+                    .map(|eku| x.ext_key_usage = Some(eku))
+                    .is_some(),
+                _ => {
+                    if critical {
+                        x.problem = Some("unknown critical extension");
+                        break;
                     }
+                    true
                 }
-                let Some(value) = octet else { continue };
-                if oid == OID_BASIC_CONSTRAINTS {
-                    let mut v = Der::new(value);
-                    if let Some((_, body, _)) = v.tlv() {
-                        let mut b = Der::new(body);
-                        while let Some((t, c, _)) = b.tlv() {
-                            if t == 0x01 {
-                                is_ca = c.first().is_some_and(|&x| x != 0);
-                            } else if t == 0x02
-                                && c.len() <= 4
-                                && c.first().is_some_and(|&x| x & 0x80 == 0)
-                            {
-                                path_len =
-                                    Some(c.iter().fold(0u32, |a, &x| (a << 8) | u32::from(x)));
-                            }
-                        }
-                    }
-                } else if oid == OID_KEY_USAGE {
-                    let mut v = Der::new(value);
-                    if let Some((0x03, bits, _)) = v.tlv() {
-                        // BIT STRING: an unused-bits byte, then the flags; keyCertSign is bit 5.
-                        key_cert_sign = Some(bits.get(1).is_some_and(|&b| b & 0x04 != 0));
-                    }
+            };
+            if !parsed {
+                x.problem = Some("malformed extension value");
+                break;
+            }
+        }
+        x
+    }
+
+    /// GeneralNames: collect dNSName `[2]` and iPAddress `[7]` entries.
+    fn parse_san(value: &[u8], x: &mut Exts) -> bool {
+        let mut g = Der::new(value);
+        let Some((0x30, names, _)) = g.tlv() else {
+            return false;
+        };
+        let mut gn = Der::new(names);
+        while gn.p < names.len() {
+            let Some((t, c, _)) = gn.tlv() else {
+                return false;
+            };
+            if t == 0x82 {
+                if let Ok(s) = std::str::from_utf8(c) {
+                    x.sans.push(s.to_string());
+                }
+            } else if t == 0x87 && (c.len() == 4 || c.len() == 16) {
+                x.ip_sans.push(c.to_vec());
+            }
+        }
+        true
+    }
+
+    /// BasicConstraints ::= SEQUENCE { cA BOOLEAN DEFAULT FALSE,
+    /// pathLenConstraint INTEGER (0..MAX) OPTIONAL }.
+    fn parse_basic_constraints(value: &[u8]) -> Option<(bool, Option<u64>)> {
+        let mut d = Der::new(value);
+        let (tag, seq, _) = d.tlv()?;
+        if tag != 0x30 {
+            return None;
+        }
+        let mut s = Der::new(seq);
+        let mut ca = false;
+        let mut path_len = None;
+        let mut next = s.tlv();
+        if let Some((0x01, b, _)) = next {
+            ca = b == [0xff];
+            next = s.tlv();
+        }
+        if let Some((tag, n, _)) = next {
+            if tag != 0x02 || n.is_empty() || n[0] & 0x80 != 0 {
+                return None; // not a non-negative INTEGER
+            }
+            let n = strip_int(n);
+            path_len = Some(if n.len() > 8 {
+                u64::MAX
+            } else {
+                n.iter().fold(0u64, |v, &b| (v << 8) | b as u64)
+            });
+        }
+        Some((ca, path_len))
+    }
+
+    /// KeyUsage ::= BIT STRING; bit `n` (MSB first) maps to `1 << n`.
+    fn parse_key_usage(value: &[u8]) -> Option<u16> {
+        let mut d = Der::new(value);
+        let (tag, bits, _) = d.tlv()?;
+        if tag != 0x03 || bits.is_empty() {
+            return None;
+        }
+        let mut ku = 0u16;
+        for n in 0..16usize {
+            if let Some(&byte) = bits.get(1 + n / 8) {
+                if byte & (0x80 >> (n % 8)) != 0 {
+                    ku |= 1 << n;
                 }
             }
         }
-        (is_ca, path_len, key_cert_sign)
+        Some(ku)
+    }
+
+    /// ExtKeyUsageSyntax ::= SEQUENCE SIZE (1..MAX) OF KeyPurposeId (OID).
+    fn parse_ext_key_usage(value: &[u8]) -> Option<Vec<Vec<u8>>> {
+        let mut d = Der::new(value);
+        let (tag, seq, _) = d.tlv()?;
+        if tag != 0x30 {
+            return None;
+        }
+        let mut out = Vec::new();
+        let mut s = Der::new(seq);
+        while s.p < seq.len() {
+            let (t, oid, _) = s.tlv()?;
+            if t != 0x06 {
+                return None;
+            }
+            out.push(oid.to_vec());
+        }
+        Some(out)
     }
 
     pub fn parse_cert(der: &[u8]) -> Option<Cert> {
@@ -3428,12 +3525,13 @@ pub mod x509 {
         let (_, validity, _) = t.tlv()?;
         let (_, _subject, subject_full) = t.tlv()?;
         let (_, spki, _) = t.tlv()?;
-        let mut sans = Vec::new();
-        let (mut is_ca, mut path_len, mut key_cert_sign) = (false, None, None);
-        while let Some((tag, content, _)) = t.tlv() {
+        let mut exts = Exts::default();
+        // The TBSCertificate must be exactly the DER it declares: every element up to its end must
+        // parse, so a malformed element or trailing bytes make the whole certificate unusable.
+        while t.p < tbs_content.len() {
+            let (tag, content, _) = t.tlv()?;
             if tag == 0xa3 {
-                sans = parse_sans(content);
-                (is_ca, path_len, key_cert_sign) = parse_ca_fields(content);
+                exts = parse_extensions(content);
             }
         }
 
@@ -3453,10 +3551,12 @@ pub mod x509 {
             not_before,
             not_after,
             key,
-            sans,
-            is_ca,
-            path_len,
-            key_cert_sign,
+            sans: exts.sans,
+            ip_sans: exts.ip_sans,
+            basic_constraints: exts.basic_constraints,
+            key_usage: exts.key_usage,
+            ext_key_usage: exts.ext_key_usage,
+            ext_problem: exts.problem,
         })
     }
 
@@ -3508,15 +3608,33 @@ pub mod x509 {
         }
     }
 
-    fn host_matches(sans: &[String], host: &str) -> bool {
+    /// RFC 6125 matching of `host` against the leaf's SubjectAltNames. An IP
+    /// literal matches only an iPAddress SAN with the same octets. A DNS name
+    /// matches a dNSName exactly (ASCII case-insensitive) or a `*.suffix` wildcard
+    /// that stands for exactly one non-empty left-most label; the wildcard never
+    /// matches `suffix` itself, and `suffix` needs at least two labels (`*.com` is
+    /// refused).
+    fn host_matches(sans: &[String], ip_sans: &[Vec<u8>], host: &str) -> bool {
+        let bare = host
+            .strip_prefix('[')
+            .and_then(|h| h.strip_suffix(']'))
+            .unwrap_or(host);
+        if let Ok(ip) = bare.parse::<std::net::IpAddr>() {
+            let octets = match ip {
+                std::net::IpAddr::V4(a) => a.octets().to_vec(),
+                std::net::IpAddr::V6(a) => a.octets().to_vec(),
+            };
+            return ip_sans.contains(&octets);
+        }
         let host = host.to_ascii_lowercase();
         sans.iter().any(|s| {
             let s = s.to_ascii_lowercase();
             if let Some(suffix) = s.strip_prefix("*.") {
-                host.strip_suffix(suffix)
-                    .map(|p| p.ends_with('.') && !p[..p.len() - 1].contains('.'))
-                    .unwrap_or(false)
-                    || host == suffix
+                suffix.contains('.')
+                    && host
+                        .strip_suffix(suffix)
+                        .and_then(|p| p.strip_suffix('.'))
+                        .is_some_and(|label| !label.is_empty() && !label.contains('.'))
             } else {
                 host == s
             }
@@ -3622,7 +3740,7 @@ pub mod x509 {
             }
         }
         let leaf = &chain[0];
-        if !host_matches(&leaf.sans, host) {
+        if !host_matches(&leaf.sans, &leaf.ip_sans, host) {
             return Err(format!("hostname {host} not in leaf SAN {:?}", leaf.sans));
         }
         for (i, c) in chain.iter().enumerate() {
@@ -3630,38 +3748,50 @@ pub mod x509 {
                 return Err(format!("cert {i} outside validity window"));
             }
         }
+        // Certificate roles (NET-01). The leaf must be usable for TLS server
+        // authentication; every other cert signs the one below it, so it must be a
+        // CA allowed to sign certificates at this depth. A trust anchor sent at the
+        // top of the chain is trusted as it stands in the store.
+        let last = chain.len() - 1;
+        for (i, c) in chain.iter().enumerate() {
+            if i > 0 && i == last && trust.is_anchor(c) {
+                continue;
+            }
+            if let Some(p) = c.ext_problem {
+                return Err(format!("cert {i}: {p}"));
+            }
+            if let Some(eku) = &c.ext_key_usage {
+                if !eku.iter().any(|o| o == OID_KP_SERVER_AUTH) {
+                    return Err(format!("cert {i}: extendedKeyUsage lacks serverAuth"));
+                }
+            }
+            if i == 0 {
+                if c.key_usage.is_some_and(|ku| ku & KU_DIGITAL_SIGNATURE == 0) {
+                    return Err("leaf keyUsage lacks digitalSignature".into());
+                }
+                continue;
+            }
+            let Some((true, path_len)) = c.basic_constraints else {
+                return Err(format!("cert {i} is not a CA (basicConstraints cA)"));
+            };
+            // CA certs between this one and the leaf.
+            if path_len.is_some_and(|n| (i as u64 - 1) > n) {
+                return Err(format!("cert {i}: pathLenConstraint exceeded"));
+            }
+            if c.key_usage.is_some_and(|ku| ku & KU_KEY_CERT_SIGN == 0) {
+                return Err(format!("cert {i}: keyUsage lacks keyCertSign"));
+            }
+        }
         for i in 0..chain.len() - 1 {
+            if chain[i].issuer != chain[i + 1].subject {
+                return Err(format!("cert {i} issuer is not cert {}'s subject", i + 1));
+            }
             if !verify_link(&chain[i], &chain[i + 1]) {
                 return Err(format!("chain link {i}→{} signature invalid", i + 1));
             }
         }
         let top = chain.last().unwrap();
-        let top_is_anchor = trust.is_anchor(top);
-        // A certificate that signed another must be a CA allowed to sign certificates, within its
-        // path-length limit (RFC 5280 6.1.4 (k) to (m)). A trust anchor is trusted as given.
-        for (i, c) in chain.iter().enumerate().skip(1) {
-            if i == chain.len() - 1 && top_is_anchor {
-                continue;
-            }
-            if !c.is_ca {
-                return Err(format!(
-                    "cert {i} signed another certificate but is not a CA"
-                ));
-            }
-            if c.key_cert_sign == Some(false) {
-                return Err(format!(
-                    "cert {i} is a CA whose key usage forbids signing certificates"
-                ));
-            }
-            if let Some(max) = c.path_len {
-                if i - 1 > max as usize {
-                    return Err(format!(
-                        "cert {i} exceeds its path length constraint of {max}"
-                    ));
-                }
-            }
-        }
-        if top_is_anchor {
+        if trust.is_anchor(top) {
             return Ok(chain.remove(0));
         }
         if let Some(anchor) = trust.anchor_for_subject(&top.issuer) {
@@ -3702,6 +3832,525 @@ pub mod x509 {
             (0x0805, Pub::Rsa(n, e)) => rsa::pss_verify(n, e, rsa::H::Sha384, &signed, sig),
             (0x0806, Pub::Rsa(n, e)) => rsa::pss_verify(n, e, rsa::H::Sha512, &signed, sig),
             _ => false,
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// A DER length field of 2^64 - 1 (or a long-form length with more
+        /// bytes than `usize` holds) must make parsing fail, not overflow.
+        #[test]
+        fn huge_der_lengths_do_not_panic() {
+            let inputs: [&[u8]; 4] = [
+                &[0x30, 0x88, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff],
+                &[0x30, 0x89, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0x00],
+                &[0x30, 0xff],
+                &[0x30, 0x03, 0x30, 0x88, 0xff],
+            ];
+            for der in inputs {
+                let r = std::panic::catch_unwind(|| parse_cert(der).is_none());
+                assert_eq!(r.ok(), Some(true), "input {der:02x?}");
+            }
+        }
+
+        #[test]
+        fn to_pem_round_trips_through_the_existing_pem_decoder() {
+            let curve = ecdsa::p521();
+            let (d, qx, qy) = curve
+                .generate_keypair()
+                .unwrap_or_else(|e| unreachable!("keygen: {e}"));
+            let der = build_self_signed_p521(
+                &d,
+                &qx,
+                &qy,
+                "localhost",
+                &[0x07],
+                1_800_000_000,
+                1_900_000_000,
+            );
+            let pem = to_pem(&der);
+            assert!(pem.starts_with("-----BEGIN CERTIFICATE-----\n"));
+            let decoded = pem_certs(&pem);
+            assert_eq!(decoded.len(), 1);
+            assert_eq!(
+                decoded[0], der,
+                "to_pem -> pem_certs must reconstruct the identical DER"
+            );
+        }
+
+        /// Build a self-signed AutoMTLS-shaped cert, parse it back through the
+        /// SAME `parse_cert` a real peer's cert goes through, and check every
+        /// field the handshake actually needs survives the round trip — subject/
+        /// SAN/validity/public key — AND that the self-signature verifies (the
+        /// cert signs its own TBS with its own key, so `verify_link(&c, &c)` must
+        /// succeed exactly like a real go-plugin AutoMTLS cert self-verifying).
+        #[test]
+        fn self_signed_p521_cert_round_trips_and_self_verifies() {
+            let curve = ecdsa::p521();
+            let (d, qx, qy) = curve
+                .generate_keypair()
+                .unwrap_or_else(|e| unreachable!("keygen: {e}"));
+            let not_before = 1_800_000_000i64;
+            let not_after = not_before + 30 * 365 * 86400;
+            let der = build_self_signed_p521(
+                &d,
+                &qx,
+                &qy,
+                "localhost",
+                &[0x01, 0x02, 0x03],
+                not_before,
+                not_after,
+            );
+
+            let cert =
+                parse_cert(&der).unwrap_or_else(|| unreachable!("must parse back its own DER"));
+            assert_eq!(cert.sans, vec!["localhost".to_string()]);
+            assert_eq!(cert.not_before, not_before);
+            assert_eq!(cert.not_after, not_after);
+            assert_eq!(cert.sig_alg, Some(SigAlg::EcdsaSha512));
+            let Pub::Ec(EcKind::P521, parsed_x, parsed_y) = &cert.key else {
+                unreachable!("expected an EC P521 key, got a different key shape");
+            };
+            assert_eq!(
+                *parsed_x, qx,
+                "SPKI point bytes are raw, not ASN.1 INTEGER-stripped"
+            );
+            assert_eq!(*parsed_y, qy);
+            assert_eq!(
+                cert.subject, cert.issuer,
+                "self-signed: subject and issuer must be identical"
+            );
+
+            assert!(
+                verify_link(&cert, &cert),
+                "a self-signed cert must verify against its own public key"
+            );
+
+            // Tamper one byte of the DER and the signature must stop verifying —
+            // otherwise this would be verifying nothing.
+            let mut tampered = der.clone();
+            let last = tampered.len() - 1;
+            tampered[last] ^= 0x01;
+            if let Some(bad_cert) = parse_cert(&tampered) {
+                assert!(
+                    !verify_link(&bad_cert, &bad_cert),
+                    "tampering the DER must break self-verification"
+                );
+            }
+        }
+    }
+
+    /// Chain-validation regression tests (NET-01). Two certificate sources: PEM
+    /// fixtures made with the `openssl` CLI (`tests/fixtures/tls/*.pem`, P-256,
+    /// valid 2026-11-07 .. 2126) so the parser is checked against an independent
+    /// encoder, and DER built here with this module's own writer for the cases
+    /// openssl makes awkward (missing basicConstraints, pathLen, odd extensions,
+    /// validity windows).
+    #[cfg(test)]
+    mod chain_validation {
+        /// A valid certificate whose TBSCertificate has `junk` appended after its last field.
+        /// The outer structure is rebuilt around the altered TBS; the signature is not checked
+        /// by `parse_cert`, so only the TBS encoding is under test.
+        fn with_tbs_junk(der: &[u8], junk: &[u8]) -> Vec<u8> {
+            let (_, body, _) = Der::new(der).tlv().expect("outer SEQUENCE");
+            let mut d = Der::new(body);
+            let (_, tbs_content, tbs_full) = d.tlv().expect("tbs");
+            let rest = &body[tbs_full.len()..];
+            let mut tbs = tbs_content.to_vec();
+            tbs.extend_from_slice(junk);
+            w_seq(&[w_seq(&tbs), rest.to_vec()].concat())
+        }
+
+        #[test]
+        fn a_tbs_with_malformed_trailing_bytes_is_not_a_certificate() {
+            let p = pki();
+            let good = leaf(&p, &ok_leaf_exts(), (NB, NA));
+            assert!(parse_cert(&good).is_some(), "control: the certificate parses");
+            // a SEQUENCE claiming 5 content bytes with only one present, and a bare tag
+            for junk in [&[0x30u8, 0x05, 0x01][..], &[0x05u8][..]] {
+                let bad = with_tbs_junk(&good, junk);
+                assert!(parse_cert(&bad).is_none(), "junk {junk:02x?} was accepted");
+            }
+        }
+
+        use super::*;
+
+        /// 2027-01-15, inside every fixture's validity window.
+        const NOW: i64 = 1_800_000_000;
+
+        fn pem(name: &str) -> Vec<u8> {
+            let text = match name {
+                "root" => include_str!("../../tests/fixtures/tls/root.pem"),
+                "inter" => include_str!("../../tests/fixtures/tls/inter.pem"),
+                "good" => include_str!("../../tests/fixtures/tls/good.pem"),
+                "attacker" => include_str!("../../tests/fixtures/tls/attacker.pem"),
+                "forged" => include_str!("../../tests/fixtures/tls/forged.pem"),
+                _ => unreachable!("no fixture {name}"),
+            };
+            pem_certs(text).remove(0)
+        }
+
+        fn store(ders: &[&[u8]]) -> TrustStore {
+            TrustStore {
+                anchors: ders
+                    .iter()
+                    .map(|d| parse_cert(d).unwrap_or_else(|| unreachable!("anchor parses")))
+                    .collect(),
+            }
+        }
+
+        // ── the decisive case ─────────────────────────────────────────────────
+
+        /// An attacker holds an ordinary CA-issued leaf (CA:false) for a name they
+        /// control, uses its key to sign a certificate for `victim.example`, and
+        /// presents `[forged, attacker leaf]`. `openssl verify` refuses this chain
+        /// ("invalid CA certificate"); so must we.
+        #[test]
+        fn forged_cert_signed_by_a_non_ca_leaf_is_rejected() {
+            let trust = store(&[&pem("root")]);
+            // The attacker's own leaf is genuinely valid for its own name.
+            assert!(validate(&[pem("attacker")], "attacker.example", NOW, &trust).is_ok());
+            let r = validate(
+                &[pem("forged"), pem("attacker")],
+                "victim.example",
+                NOW,
+                &trust,
+            );
+            assert!(
+                r.is_err(),
+                "a chain through a CA:false leaf must not validate"
+            );
+        }
+
+        #[test]
+        fn root_intermediate_leaf_chain_still_validates() {
+            let trust = store(&[&pem("root")]);
+            let chain = [pem("good"), pem("inter")];
+            assert!(validate(&chain, "good.example", NOW, &trust).is_ok());
+            assert!(validate(&chain, "GOOD.example", NOW, &trust).is_ok());
+            // root included at the top of the chain, as many servers send it
+            let with_root = [pem("good"), pem("inter"), pem("root")];
+            assert!(validate(&with_root, "good.example", NOW, &trust).is_ok());
+            assert!(validate(&chain, "other.example", NOW, &trust).is_err());
+            // outside the window (injected clock)
+            assert!(validate(&chain, "good.example", 1_700_000_000, &trust).is_err());
+            assert!(validate(&chain, "good.example", 5_000_000_000, &trust).is_err());
+            // not anchored in this store
+            assert!(validate(&chain, "good.example", NOW, &store(&[])).is_err());
+        }
+
+        #[test]
+        fn wildcard_matches_exactly_one_left_label() {
+            let trust = store(&[&pem("root")]);
+            let chain = [pem("good"), pem("inter")];
+            assert!(validate(&chain, "a.wild.example", NOW, &trust).is_ok());
+            assert!(
+                validate(&chain, "wild.example", NOW, &trust).is_err(),
+                "*.wild.example must not match the bare wild.example"
+            );
+            assert!(validate(&chain, "a.b.wild.example", NOW, &trust).is_err());
+            assert!(validate(&chain, ".wild.example", NOW, &trust).is_err());
+        }
+
+        #[test]
+        fn ip_host_matches_only_an_ip_san() {
+            let trust = store(&[&pem("root")]);
+            let chain = [pem("good"), pem("inter")];
+            assert!(validate(&chain, "192.0.2.7", NOW, &trust).is_ok());
+            assert!(validate(&chain, "192.0.2.8", NOW, &trust).is_err());
+        }
+
+        // ── hand-built DER for the remaining cases ────────────────────────────
+
+        struct Key {
+            d: Vec<u8>,
+            qx: Vec<u8>,
+            qy: Vec<u8>,
+        }
+        fn key() -> Key {
+            let (d, qx, qy) = ecdsa::p256()
+                .generate_keypair()
+                .unwrap_or_else(|e| unreachable!("keygen: {e}"));
+            Key { d, qx, qy }
+        }
+
+        fn ext(oid: &[u8], critical: bool, value: &[u8]) -> Vec<u8> {
+            let mut parts = w_oid(oid);
+            if critical {
+                parts.extend_from_slice(&w_bool(true));
+            }
+            parts.extend_from_slice(&w_octet_string(value));
+            w_seq(&parts)
+        }
+        fn bc(ca: bool, path_len: Option<u8>) -> Vec<u8> {
+            let mut inner = Vec::new();
+            if ca {
+                inner.extend_from_slice(&w_bool(true));
+            }
+            if let Some(n) = path_len {
+                inner.extend_from_slice(&w_uint(&[n]));
+            }
+            ext(OID_BASIC_CONSTRAINTS, true, &w_seq(&inner))
+        }
+        /// keyUsage from raw BIT STRING content (unused-bits byte first).
+        fn ku(bits: &[u8]) -> Vec<u8> {
+            ext(&[0x55, 0x1d, 0x0f], true, &w_tlv(0x03, bits))
+        }
+        const DIGITAL_SIGNATURE: &[u8] = &[0x07, 0x80];
+        const KEY_ENCIPHERMENT: &[u8] = &[0x05, 0x20];
+        const KEY_CERT_SIGN: &[u8] = &[0x01, 0x06]; // keyCertSign + cRLSign
+        const CRL_SIGN_ONLY: &[u8] = &[0x01, 0x02];
+        const SERVER_AUTH: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x01];
+        const CLIENT_AUTH: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x02];
+        fn eku(oids: &[&[u8]]) -> Vec<u8> {
+            let body: Vec<u8> = oids.iter().flat_map(|o| w_oid(o)).collect();
+            ext(&[0x55, 0x1d, 0x25], false, &w_seq(&body))
+        }
+        fn san(dns: &str) -> Vec<u8> {
+            ext(OID_SAN, false, &w_seq(&w_tlv(0x82, dns.as_bytes())))
+        }
+
+        const NB: i64 = NOW - 86_400;
+        const NA: i64 = NOW + 86_400;
+
+        /// One P-256 / ecdsa-with-SHA256 certificate for `subject_key`, signed by
+        /// `issuer_key` under the name `issuer_cn`.
+        fn cert(
+            cn: &str,
+            subject_key: &Key,
+            issuer_cn: &str,
+            issuer_key: &Key,
+            exts: &[Vec<u8>],
+            window: (i64, i64),
+        ) -> Vec<u8> {
+            let alg = w_seq(&w_oid(OID_ECDSA_SHA256));
+            let mut point = vec![0x04u8];
+            point.extend_from_slice(&subject_key.qx);
+            point.extend_from_slice(&subject_key.qy);
+            let spki = w_seq(
+                &[
+                    w_seq(&[w_oid(OID_EC_PUBKEY), w_oid(OID_P256)].concat()),
+                    w_bitstring(&point),
+                ]
+                .concat(),
+            );
+            let mut tbs_parts = [
+                w_context(0, &w_uint(&[2])),
+                w_uint(&[0x01, cn.len() as u8]),
+                alg.clone(),
+                w_name(issuer_cn),
+                w_seq(&[w_generalized_time(window.0), w_generalized_time(window.1)].concat()),
+                w_name(cn),
+                spki,
+            ]
+            .concat();
+            if !exts.is_empty() {
+                tbs_parts.extend_from_slice(&w_context(3, &w_seq(&exts.concat())));
+            }
+            let tbs = w_seq(&tbs_parts);
+            let (r, s) = ecdsa::p256().sign(&issuer_key.d, &sha256(&tbs));
+            let sig = w_seq(&[w_uint(&r), w_uint(&s)].concat());
+            w_seq(&[tbs, alg, w_bitstring(&sig)].concat())
+        }
+
+        struct Pki {
+            root: Key,
+            root_der: Vec<u8>,
+            inter: Key,
+            leaf: Key,
+        }
+        fn pki() -> Pki {
+            let root = key();
+            let root_der = cert(
+                "Root",
+                &root,
+                "Root",
+                &root,
+                &[bc(true, None), ku(KEY_CERT_SIGN)],
+                (NB, NA),
+            );
+            Pki {
+                root,
+                root_der,
+                inter: key(),
+                leaf: key(),
+            }
+        }
+        fn inter(p: &Pki, exts: &[Vec<u8>]) -> Vec<u8> {
+            cert("Inter", &p.inter, "Root", &p.root, exts, (NB, NA))
+        }
+        fn leaf(p: &Pki, exts: &[Vec<u8>], window: (i64, i64)) -> Vec<u8> {
+            cert("leaf", &p.leaf, "Inter", &p.inter, exts, window)
+        }
+        fn ok_inter(p: &Pki) -> Vec<u8> {
+            inter(p, &[bc(true, None), ku(KEY_CERT_SIGN)])
+        }
+        fn ok_leaf_exts() -> Vec<Vec<u8>> {
+            vec![
+                bc(false, None),
+                ku(DIGITAL_SIGNATURE),
+                eku(&[SERVER_AUTH]),
+                san("h.example"),
+            ]
+        }
+        fn check(p: &Pki, chain: &[Vec<u8>]) -> Result<(), String> {
+            validate(chain, "h.example", NOW, &store(&[&p.root_der])).map(|_| ())
+        }
+
+        #[test]
+        fn hand_built_baseline_chain_validates() {
+            let p = pki();
+            let l = leaf(&p, &ok_leaf_exts(), (NB, NA));
+            assert_eq!(check(&p, &[l.clone(), ok_inter(&p)]), Ok(()));
+            // A leaf with no keyUsage/EKU/basicConstraints at all is still fine.
+            let bare = leaf(&p, &[san("h.example")], (NB, NA));
+            assert_eq!(check(&p, &[bare, ok_inter(&p)]), Ok(()));
+        }
+
+        #[test]
+        fn intermediate_must_assert_ca() {
+            let p = pki();
+            let l = leaf(&p, &ok_leaf_exts(), (NB, NA));
+            let no_bc = inter(&p, &[ku(KEY_CERT_SIGN)]);
+            assert!(
+                check(&p, &[l.clone(), no_bc]).is_err(),
+                "no basicConstraints"
+            );
+            let not_ca = inter(&p, &[bc(false, None), ku(KEY_CERT_SIGN)]);
+            assert!(check(&p, &[l.clone(), not_ca]).is_err(), "cA=false");
+            let no_exts = inter(&p, &[]);
+            assert!(check(&p, &[l, no_exts]).is_err(), "no extensions at all");
+        }
+
+        #[test]
+        fn intermediate_key_usage_must_allow_cert_signing() {
+            let p = pki();
+            let l = leaf(&p, &ok_leaf_exts(), (NB, NA));
+            let crl_only = inter(&p, &[bc(true, None), ku(CRL_SIGN_ONLY)]);
+            assert!(check(&p, &[l.clone(), crl_only]).is_err());
+            // keyUsage absent on a CA is allowed.
+            let no_ku = inter(&p, &[bc(true, None)]);
+            assert_eq!(check(&p, &[l, no_ku]), Ok(()));
+        }
+
+        #[test]
+        fn path_len_constraint_is_honoured() {
+            let p = pki();
+            let sub = key();
+            let l = cert("leaf", &p.leaf, "Sub", &sub, &ok_leaf_exts(), (NB, NA));
+            let sub_ca = cert(
+                "Sub",
+                &sub,
+                "Inter",
+                &p.inter,
+                &[bc(true, None), ku(KEY_CERT_SIGN)],
+                (NB, NA),
+            );
+            let inter_pl0 = inter(&p, &[bc(true, Some(0)), ku(KEY_CERT_SIGN)]);
+            let inter_pl1 = inter(&p, &[bc(true, Some(1)), ku(KEY_CERT_SIGN)]);
+            assert!(
+                check(&p, &[l.clone(), sub_ca.clone(), inter_pl0.clone()]).is_err(),
+                "pathLen 0 forbids a CA below it"
+            );
+            assert_eq!(check(&p, &[l.clone(), sub_ca, inter_pl1]), Ok(()));
+            // pathLen 0 still allows issuing the leaf directly.
+            let direct = leaf(&p, &ok_leaf_exts(), (NB, NA));
+            assert_eq!(check(&p, &[direct, inter_pl0]), Ok(()));
+        }
+
+        #[test]
+        fn unknown_critical_extension_is_rejected() {
+            let p = pki();
+            let unknown_oid: &[u8] = &[0x2b, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x7f];
+            let mut exts = ok_leaf_exts();
+            exts.push(ext(unknown_oid, true, &w_null()));
+            let l = leaf(&p, &exts, (NB, NA));
+            assert!(
+                check(&p, &[l, ok_inter(&p)]).is_err(),
+                "critical unknown on leaf"
+            );
+            let mut exts = ok_leaf_exts();
+            exts.push(ext(unknown_oid, false, &w_null()));
+            let l = leaf(&p, &exts, (NB, NA));
+            assert_eq!(
+                check(&p, &[l.clone(), ok_inter(&p)]),
+                Ok(()),
+                "non-critical is ignored"
+            );
+            let bad_inter = inter(
+                &p,
+                &[
+                    bc(true, None),
+                    ku(KEY_CERT_SIGN),
+                    ext(unknown_oid, true, &w_null()),
+                ],
+            );
+            assert!(
+                check(&p, &[l, bad_inter]).is_err(),
+                "critical unknown on intermediate"
+            );
+        }
+
+        #[test]
+        fn leaf_must_be_usable_for_server_auth() {
+            let p = pki();
+            let client_only = leaf(
+                &p,
+                &[
+                    bc(false, None),
+                    ku(DIGITAL_SIGNATURE),
+                    eku(&[CLIENT_AUTH]),
+                    san("h.example"),
+                ],
+                (NB, NA),
+            );
+            assert!(
+                check(&p, &[client_only, ok_inter(&p)]).is_err(),
+                "EKU clientAuth only"
+            );
+            let both = leaf(
+                &p,
+                &[eku(&[CLIENT_AUTH, SERVER_AUTH]), san("h.example")],
+                (NB, NA),
+            );
+            assert_eq!(check(&p, &[both, ok_inter(&p)]), Ok(()));
+            let no_sig = leaf(&p, &[ku(KEY_ENCIPHERMENT), san("h.example")], (NB, NA));
+            assert!(
+                check(&p, &[no_sig, ok_inter(&p)]).is_err(),
+                "keyUsage without digitalSignature"
+            );
+        }
+
+        #[test]
+        fn issuer_name_must_chain() {
+            let p = pki();
+            // Signed by the intermediate's key, but naming someone else as issuer.
+            let l = cert(
+                "leaf",
+                &p.leaf,
+                "Not Inter",
+                &p.inter,
+                &ok_leaf_exts(),
+                (NB, NA),
+            );
+            assert!(check(&p, &[l, ok_inter(&p)]).is_err());
+        }
+
+        #[test]
+        fn validity_window_uses_the_injected_clock() {
+            let p = pki();
+            let expired = leaf(&p, &ok_leaf_exts(), (NB - 10, NOW - 1));
+            assert!(check(&p, &[expired, ok_inter(&p)]).is_err(), "expired");
+            let future = leaf(&p, &ok_leaf_exts(), (NOW + 1, NA));
+            assert!(check(&p, &[future, ok_inter(&p)]).is_err(), "not yet valid");
+            let edge = leaf(&p, &ok_leaf_exts(), (NOW, NOW));
+            assert_eq!(
+                check(&p, &[edge, ok_inter(&p)]),
+                Ok(()),
+                "bounds are inclusive"
+            );
         }
     }
 
@@ -3912,7 +4561,7 @@ pub mod x509 {
             let leaf = cert(&leaf_spec("inter"), &lk, &ik);
             assert!(check(&[&leaf, &inter], &root)
                 .unwrap_err()
-                .contains("key usage"));
+                .contains("keyCertSign"));
         }
 
         #[test]
@@ -3926,16 +4575,18 @@ pub mod x509 {
                 check(&[&leaf, &i2, &i1], &root)
             };
             assert!(leaf_of(1).is_ok(), "i1 allows one intermediate below it");
-            assert!(leaf_of(0).unwrap_err().contains("path length"));
+            assert!(leaf_of(0).unwrap_err().contains("pathLenConstraint"));
         }
 
         #[test]
         fn parse_cert_reads_the_constraint_fields() {
             let k = key();
             let c = parse_cert(&cert(&ca_spec("c", "c", Some(3)), &k, &k)).unwrap();
-            assert!(c.is_ca && c.path_len == Some(3) && c.key_cert_sign == Some(true));
+            assert_eq!(c.basic_constraints, Some((true, Some(3))));
+            assert!(c.key_usage.is_some_and(|k| k & KU_KEY_CERT_SIGN != 0));
             let c = parse_cert(&cert(&leaf_spec("c"), &k, &k)).unwrap();
-            assert!(!c.is_ca && c.path_len.is_none() && c.key_cert_sign == Some(false));
+            assert_eq!(c.basic_constraints, Some((false, None)));
+            assert!(c.key_usage.is_some_and(|k| k & KU_KEY_CERT_SIGN == 0));
             let c = parse_cert(&cert(
                 &Spec {
                     subject: "c",
@@ -3948,98 +4599,7 @@ pub mod x509 {
                 &k,
             ))
             .unwrap();
-            assert!(!c.is_ca && c.key_cert_sign.is_none());
-        }
-    }
-
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-
-        #[test]
-        fn to_pem_round_trips_through_the_existing_pem_decoder() {
-            let curve = ecdsa::p521();
-            let (d, qx, qy) = curve
-                .generate_keypair()
-                .unwrap_or_else(|e| unreachable!("keygen: {e}"));
-            let der = build_self_signed_p521(
-                &d,
-                &qx,
-                &qy,
-                "localhost",
-                &[0x07],
-                1_800_000_000,
-                1_900_000_000,
-            );
-            let pem = to_pem(&der);
-            assert!(pem.starts_with("-----BEGIN CERTIFICATE-----\n"));
-            let decoded = pem_certs(&pem);
-            assert_eq!(decoded.len(), 1);
-            assert_eq!(
-                decoded[0], der,
-                "to_pem -> pem_certs must reconstruct the identical DER"
-            );
-        }
-
-        /// Build a self-signed AutoMTLS-shaped cert, parse it back through the
-        /// SAME `parse_cert` a real peer's cert goes through, and check every
-        /// field the handshake actually needs survives the round trip — subject/
-        /// SAN/validity/public key — AND that the self-signature verifies (the
-        /// cert signs its own TBS with its own key, so `verify_link(&c, &c)` must
-        /// succeed exactly like a real go-plugin AutoMTLS cert self-verifying).
-        #[test]
-        fn self_signed_p521_cert_round_trips_and_self_verifies() {
-            let curve = ecdsa::p521();
-            let (d, qx, qy) = curve
-                .generate_keypair()
-                .unwrap_or_else(|e| unreachable!("keygen: {e}"));
-            let not_before = 1_800_000_000i64;
-            let not_after = not_before + 30 * 365 * 86400;
-            let der = build_self_signed_p521(
-                &d,
-                &qx,
-                &qy,
-                "localhost",
-                &[0x01, 0x02, 0x03],
-                not_before,
-                not_after,
-            );
-
-            let cert =
-                parse_cert(&der).unwrap_or_else(|| unreachable!("must parse back its own DER"));
-            assert_eq!(cert.sans, vec!["localhost".to_string()]);
-            assert_eq!(cert.not_before, not_before);
-            assert_eq!(cert.not_after, not_after);
-            assert_eq!(cert.sig_alg, Some(SigAlg::EcdsaSha512));
-            let Pub::Ec(EcKind::P521, parsed_x, parsed_y) = &cert.key else {
-                unreachable!("expected an EC P521 key, got a different key shape");
-            };
-            assert_eq!(
-                *parsed_x, qx,
-                "SPKI point bytes are raw, not ASN.1 INTEGER-stripped"
-            );
-            assert_eq!(*parsed_y, qy);
-            assert_eq!(
-                cert.subject, cert.issuer,
-                "self-signed: subject and issuer must be identical"
-            );
-
-            assert!(
-                verify_link(&cert, &cert),
-                "a self-signed cert must verify against its own public key"
-            );
-
-            // Tamper one byte of the DER and the signature must stop verifying —
-            // otherwise this would be verifying nothing.
-            let mut tampered = der.clone();
-            let last = tampered.len() - 1;
-            tampered[last] ^= 0x01;
-            if let Some(bad_cert) = parse_cert(&tampered) {
-                assert!(
-                    !verify_link(&bad_cert, &bad_cert),
-                    "tampering the DER must break self-verification"
-                );
-            }
+            assert!(c.basic_constraints.is_none() && c.key_usage.is_none());
         }
     }
 }
