@@ -1,5 +1,48 @@
 # Changelog
 
+## Unreleased — `sync` module and the `syncfold` binary
+
+Moved here from `hashtrinity::sync` and hashtrinity's `src/bin/syncfold.rs`.
+Behind the new `syncfold` feature, which is off by default.
+
+- **`transport::sync`**: `archive`, `block`, `copy`, `crypto`, `grpc`, `hpack`, `http`, `http2`,
+  `image`, `s3`, `scan`, `sigv4`, `sync`, `sysio` and `tls` (TLS 1.3 client and server, X.509, ECDSA,
+  RSA). Same code as in hashtrinity, with its unit tests, plus the tests for the fixes below: 56
+  pass and 2 are ignored because they spawn a real provider binary.
+- **Binary**: `syncfold`, `required-features = ["syncfold"]`. `swalk` stays in hashtrinity: it uses
+  `tregex`, not `sync`.
+- **No new dependency.** The module is `std` plus `hashtrinity::Table` and `hashtrinity::tregex`,
+  both already dependencies.
+- **Migrating** from hashtrinity: depend on `transport` with `features = ["syncfold"]` and replace
+  `hashtrinity::sync::` with `transport::sync::`. Add `default-features = false` to keep the
+  zero-dependency core.
+### Fixed (found by review of the moved code; the same defects were in `hashtrinity::sync`)
+
+- **`archive::unpack` and `unpack_stream`** wrote outside the restore directory for an entry named
+  `../x`, an absolute path, or a file under an earlier symlink entry. Only plain path components
+  are accepted, no existing ancestor may be a symlink, and a symlink at the destination is replaced.
+- **`tls::x509::validate`** accepted any certificate whose signature verified as an issuer, so a
+  valid end-entity certificate with its key could sign a leaf for another host. Every certificate
+  that signed another, except a trust anchor, must now be a CA whose key usage allows signing
+  certificates, within its path length limit.
+- **`syncfold dd SRC tcp://… --dry-run`** sent the data and made the receiver overwrite its
+  destination. A dry run no longer connects.
+- **`dd serve` onto a block device** left the old bytes in every range the sparse sender omitted.
+  The receiver now writes zeros there.
+- **`scan`** counted a file it could not read, or an object whose GETs failed, as clean, so a scan
+  could report ALL CLEAN and exit 0 without examining it. Such items are now listed as unreadable,
+  the report is not clean, and `--scan` does not upload them.
+- **`--delete`** removed the copy of a symlink whose target was missing. It now looks at the source
+  entry itself.
+- **Chunked responses** on a keep-alive connection left the trailer section unread, which broke the
+  next request with `bad status line`. The trailer is consumed.
+- **`syncfold FILE FILE`, `syncfold dd FILE FILE` and hard links to one file** emptied the source.
+  They are refused before anything is opened for writing.
+- Each fix has a test that fails without it.
+
+- The stale, uncompiled copy `src/sync/main.rs` was not moved: it was an older version of
+  `src/bin/syncfold.rs` that no module declared.
+
 ## 0.4.0 — CA trust resilience, certificate-key hygiene
 
 **BREAKING** (additive types, but struct literals break): `CertStatus` gains `ca`/`migration`;
