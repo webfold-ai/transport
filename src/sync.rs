@@ -705,6 +705,12 @@ pub mod block {
             }
         }
 
+        // The cold path truncates the destination, which would empty a source it is the same
+        // file (or the same device) as.
+        if sysio::same_file(src, dst) {
+            return Err(crate::sync::copy::same_file_error());
+        }
+
         // Is the destination a block device? (Then: no create, no set_len — a device
         // has a fixed size we must not touch.)
         let dst_is_dev = sysio::is_device_path(dst);
@@ -1240,6 +1246,27 @@ pub mod block {
             assert!(got[20480..].iter().all(|&b| b == 0), "trailing hole");
         }
 
+        #[cfg(unix)]
+        #[test]
+        fn dd_refuses_a_file_onto_itself() {
+            let f = std::env::temp_dir().join(format!("syncfold_ddself_{}", std::process::id()));
+            fs::write(&f, vec![9u8; 8192]).unwrap();
+            let opts = Opts {
+                chunk: 4096,
+                threads: 1,
+                sync: false,
+                sparse: true,
+                src_format: Format::Raw,
+                dst_format: Format::Raw,
+                dry_run: false,
+                quiet: true,
+            };
+            let e = super::run(&f, &f, &opts).err().expect("same-file dd must fail");
+            assert!(e.to_string().contains("same file"), "{e}");
+            assert_eq!(fs::read(&f).unwrap(), vec![9u8; 8192], "the source must survive");
+            let _ = fs::remove_file(&f);
+        }
+
         #[test]
         fn a_regular_file_target_is_left_alone_between_frames() {
             // A regular file is truncated and sized before the stream, so there is nothing to zero;
@@ -1271,6 +1298,10 @@ pub mod copy {
 
     /// Copy `src` → `dst`, preserving mode and the source mtime. Returns bytes.
     pub fn copy_one(src: &Path, dst: &Path) -> io::Result<u64> {
+        // Opening the destination truncates it, which would empty a source it is the same file as.
+        if sysio::same_file(src, dst) {
+            return Err(same_file_error());
+        }
         let mut s = File::open(src)?;
         let meta = s.metadata()?;
         let mut oo = File::options();
@@ -1283,6 +1314,58 @@ pub mod copy {
         // Preserve mtime so the next sync's throne-check sees this file unchanged.
         let _ = d.set_times(FileTimes::new().set_modified(meta.modified()?));
         Ok(n)
+    }
+
+    /// The error for a copy whose source and destination are one file.
+    pub fn same_file_error() -> io::Error {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "source and destination are the same file",
+        )
+    }
+
+    #[cfg(all(test, unix))]
+    mod tests {
+        use super::*;
+        use std::fs;
+
+        fn scratch(tag: &str) -> std::path::PathBuf {
+            let d = std::env::temp_dir().join(format!("syncfold_same_{tag}_{}", std::process::id()));
+            let _ = fs::remove_dir_all(&d);
+            fs::create_dir_all(&d).unwrap();
+            d
+        }
+
+        #[test]
+        fn copy_one_refuses_a_file_onto_itself_and_leaves_it_intact() {
+            let d = scratch("copy");
+            let f = d.join("f");
+            fs::write(&f, b"precious").unwrap();
+            assert_eq!(copy_one(&f, &f).unwrap_err().kind(), io::ErrorKind::InvalidInput);
+            assert_eq!(fs::read(&f).unwrap(), b"precious");
+            // A hard link is the same inode under another name.
+            let link = d.join("hard");
+            fs::hard_link(&f, &link).unwrap();
+            assert!(copy_one(&f, &link).is_err());
+            assert_eq!(fs::read(&f).unwrap(), b"precious");
+            // A symlink to it, too.
+            let sym = d.join("sym");
+            std::os::unix::fs::symlink(&f, &sym).unwrap();
+            assert!(copy_one(&sym, &f).is_err());
+            assert_eq!(fs::read(&f).unwrap(), b"precious");
+            let _ = fs::remove_dir_all(&d);
+        }
+
+        #[test]
+        fn copy_one_still_copies_between_different_files() {
+            let d = scratch("diff");
+            fs::write(d.join("a"), b"hello").unwrap();
+            assert_eq!(copy_one(&d.join("a"), &d.join("b")).unwrap(), 5);
+            assert_eq!(fs::read(d.join("b")).unwrap(), b"hello");
+            assert!(!sysio::same_file(&d.join("a"), &d.join("b")));
+            assert!(!sysio::same_file(&d.join("a"), &d.join("missing")));
+            let _ = fs::remove_dir_all(&d);
+        }
     }
 }
 pub mod crypto {
@@ -3006,7 +3089,7 @@ pub mod http {
         extra_headers: &[(String, String)],
         body: &[u8],
     ) -> io::Result<Response> {
-        use std::io::{Read, Write};
+        use std::io::Write;
         let host_hdr = if port == 443 {
             host.to_string()
         } else {
@@ -3059,7 +3142,6 @@ pub mod http {
     /// Read exactly one HTTP/1.1 response from `conn`: the head, then the body by chunked framing
     /// or Content-Length, leaving the connection positioned at the next response.
     fn read_response<R: std::io::Read>(conn: &mut R) -> io::Result<Response> {
-        use std::io::Read;
         // Read one response head, then the body per Content-Length.
         let mut buf = Vec::with_capacity(8192);
         let head_end = loop {
@@ -5592,6 +5674,9 @@ pub mod sync {
     /// Sync `src` → `dst`.
     pub fn run(src: &Path, dst: &Path, opts: &Opts) -> io::Result<Stats> {
         let smeta = fs::symlink_metadata(src)?;
+        if crate::sync::sysio::same_file(src, dst) {
+            return Err(copy::same_file_error());
+        }
         if smeta.is_file() {
             if opts.dry_run {
                 return Ok(Stats {
@@ -5866,6 +5951,20 @@ pub mod sync {
         use super::*;
 
         #[test]
+        fn run_refuses_a_file_onto_itself() {
+            let base = std::env::temp_dir().join(format!("syncfold_runself_{}", std::process::id()));
+            let _ = fs::remove_dir_all(&base);
+            fs::create_dir_all(&base).unwrap();
+            let f = base.join("f");
+            fs::write(&f, b"precious").unwrap();
+            let opts = Opts { threads: 1, delete: false, dry_run: false, quiet: true };
+            let e = run(&f, &f, &opts).err().expect("same-file run must fail");
+            assert!(e.to_string().contains("same file"), "{e}");
+            assert_eq!(fs::read(&f).unwrap(), b"precious");
+            let _ = fs::remove_dir_all(&base);
+        }
+
+        #[test]
         fn delete_extras_keeps_the_copy_of_a_dangling_symlink() {
             let base = std::env::temp_dir().join(format!("syncfold_del_{}", std::process::id()));
             let (src, dst) = (base.join("src"), base.join("dst"));
@@ -5954,6 +6053,26 @@ pub mod sysio {
     pub fn is_device_path(path: &Path) -> bool {
         let s = path.to_string_lossy();
         s.starts_with(r"\\.\") || s.starts_with(r"\\?\")
+    }
+
+    // ───────── same underlying file ─────────
+    /// Whether `a` and `b` name the same underlying file, through hard links and symlinks. False
+    /// when either does not exist. Unix compares device and inode; Windows compares canonical paths,
+    /// so a hard link between two different paths is not detected there.
+    #[cfg(unix)]
+    pub fn same_file(a: &Path, b: &Path) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        match (std::fs::metadata(a), std::fs::metadata(b)) {
+            (Ok(x), Ok(y)) => x.dev() == y.dev() && x.ino() == y.ino(),
+            _ => false,
+        }
+    }
+    #[cfg(windows)]
+    pub fn same_file(a: &Path, b: &Path) -> bool {
+        match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+            (Ok(x), Ok(y)) => x == y,
+            _ => false,
+        }
     }
 
     // ───────── unix mode bits (no-op on Windows) ─────────
