@@ -887,12 +887,13 @@ pub mod block {
     //! `read_at`/`write_at`. Safe `std`, no FFI, no `unsafe`.
 
     use std::fs::File;
-    use std::io::{self, Read, Write};
-    use std::net::{TcpListener, TcpStream};
+    use std::io::{self, Read, Seek, SeekFrom, Write};
+    use std::net::{IpAddr, Ipv4Addr, TcpListener, TcpStream};
     use std::path::Path;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::thread;
 
+    use crate::sync::crypto;
     use crate::sync::image::{Format, Source};
     use crate::sync::sysio;
 
@@ -1234,11 +1235,74 @@ pub mod block {
     // crosses the wire at ~20% of its size. block-duplicator streams every byte
     // (zeros included) down one sequential socket; this is that, minus the drag.
     //
-    //   HELLO : "SFDD" ‖ ver(1) ‖ total_size(u64 LE) ‖ chunk_hint(u32 LE)
-    //   DATA  : 0x01 ‖ offset(u64 LE) ‖ len(u32 LE) ‖ <len bytes>
-    //   END   : 0x00
+    //   HELLO : "SFDD" ‖ ver(1) ‖ total_size(u64 LE) ‖ chunk_hint(u32 LE)      (client → server)
+    //   CHAL  : auth(1) ‖ nonce(32)                                            (server → client)
+    //   PROOF : HMAC-SHA256(key, "SFDD-auth-v2" ‖ nonce ‖ size ‖ hint)         (client → server;
+    //           32 zero bytes when CHAL.auth == 0)
+    //   OK    : 0x01 accepted | 0x00 refused (server closes)                    (server → client)
+    //   DATA  : 0x01 ‖ offset(u64 LE) ‖ len(u32 LE) ‖ <len bytes> [‖ tag(32)]
+    //   END   : 0x00 [‖ tag(32)]
+    //
+    // Version 2 (this framing; version 1 had no CHAL/PROOF/OK and is refused). When the
+    // server holds a pre-shared key (`auth` = 1) the client must prove it before the
+    // destination is opened, and every frame — END included — carries a 32-byte tag
+    // binding it to the session nonce and its sequence number, so an on-path peer can
+    // neither start a session nor inject, reorder or replay frames. The data itself is
+    // NOT encrypted; use a tunnel (ssh -L, WireGuard) if it must be confidential. The
+    // server bounds everything the peer declares: size ≤ `max_size` (and ≤ the device
+    // length for a block device), len ≤ WIRE_CHUNK, offset + len ≤ size.
 
     const WIRE_CHUNK: usize = 4 << 20; // 4 MiB read granularity on the sender
+    const WIRE_VERSION: u8 = 2;
+    /// Shortest pre-shared key accepted (bytes). Keys come from a file or the
+    /// environment, never from argv; this only rejects obviously trivial ones.
+    pub const MIN_KEY_LEN: usize = 16;
+    /// Default ceiling on the size a peer may declare (64 TiB).
+    pub const DEFAULT_MAX_SIZE: u64 = 1 << 46;
+    /// How long a peer may stall during the handshake / between data frames.
+    const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+    const FRAME_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+    fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+        a.len() == b.len() && a.iter().zip(b).fold(0u8, |d, (x, y)| d | (x ^ y)) == 0
+    }
+
+    fn random_nonce() -> io::Result<[u8; 32]> {
+        let mut n = [0u8; 32];
+        File::open("/dev/urandom")?.read_exact(&mut n)?;
+        Ok(n)
+    }
+
+    fn check_key(key: &[u8]) -> io::Result<()> {
+        if key.len() < MIN_KEY_LEN {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("dd key must be at least {MIN_KEY_LEN} bytes"),
+            ));
+        }
+        Ok(())
+    }
+
+    fn auth_proof(key: &[u8], nonce: &[u8; 32], size: u64, hint: u32) -> [u8; 32] {
+        let mut m = Vec::with_capacity(12 + 32 + 12);
+        m.extend_from_slice(b"SFDD-auth-v2");
+        m.extend_from_slice(nonce);
+        m.extend_from_slice(&size.to_le_bytes());
+        m.extend_from_slice(&hint.to_le_bytes());
+        crypto::hmac_sha256(key, &m)
+    }
+
+    /// Tag for one frame: the HMAC of a SHA-256 over (label ‖ nonce ‖ seq ‖ head ‖ data),
+    /// hashed first so the multi-MiB payload is never copied.
+    fn frame_tag(key: &[u8], nonce: &[u8; 32], seq: u64, head: &[u8], data: &[u8]) -> [u8; 32] {
+        let mut h = crypto::Sha256::new();
+        h.update(b"SFDD-frame-v2");
+        h.update(nonce);
+        h.update(&seq.to_le_bytes());
+        h.update(head);
+        h.update(data);
+        crypto::hmac_sha256(key, &h.finalize())
+    }
 
     /// Rate-limit a progress line to ~10 Hz so it doesn't flood stderr (one carriage
     /// -return refresh, not one per chunk).
@@ -1257,13 +1321,36 @@ pub mod block {
         }
     }
 
-    fn send_data_frame(w: &mut impl Write, off: u64, run: &[u8]) -> io::Result<()> {
+    /// Per-session frame authenticator (present only when a pre-shared key is in use).
+    struct Tagger {
+        key: Vec<u8>,
+        nonce: [u8; 32],
+        seq: u64,
+    }
+    impl Tagger {
+        fn next(&mut self, head: &[u8], data: &[u8]) -> [u8; 32] {
+            let t = frame_tag(&self.key, &self.nonce, self.seq, head, data);
+            self.seq += 1;
+            t
+        }
+    }
+
+    fn send_data_frame(
+        w: &mut impl Write,
+        tagger: &mut Option<Tagger>,
+        off: u64,
+        run: &[u8],
+    ) -> io::Result<()> {
         let mut hdr = [0u8; 13];
         hdr[0] = 0x01;
         hdr[1..9].copy_from_slice(&off.to_le_bytes());
         hdr[9..13].copy_from_slice(&(run.len() as u32).to_le_bytes());
         w.write_all(&hdr)?;
-        w.write_all(run)
+        w.write_all(run)?;
+        if let Some(t) = tagger {
+            w.write_all(&t.next(&hdr, run))?;
+        }
+        Ok(())
     }
 
     /// Read-back verification: re-read source and destination through their formats
@@ -1315,6 +1402,8 @@ pub mod block {
 
     /// Push a local source to `host:port`, hole-skipping over the wire (unless the
     /// caller turns sparse off — e.g. a true device clone where zeros are meaningful).
+    /// `key` is the pre-shared key the receiver was started with (required when the
+    /// receiver demands one; ignored otherwise).
     pub fn push(
         src: &Path,
         fmt: Format,
@@ -1322,7 +1411,11 @@ pub mod block {
         port: u16,
         sparse: bool,
         quiet: bool,
+        key: Option<&[u8]>,
     ) -> io::Result<Stats> {
+        if let Some(k) = key {
+            check_key(k)?;
+        }
         let s = Source::open(src, fmt)?;
         let size = s.size()?;
         let mut stream = TcpStream::connect((host, port))?;
@@ -1330,10 +1423,40 @@ pub mod block {
 
         let mut hello = Vec::with_capacity(17);
         hello.extend_from_slice(b"SFDD");
-        hello.push(1u8);
+        hello.push(WIRE_VERSION);
         hello.extend_from_slice(&size.to_le_bytes());
         hello.extend_from_slice(&(WIRE_CHUNK as u32).to_le_bytes());
         stream.write_all(&hello)?;
+
+        // challenge → proof → verdict
+        let mut chal = [0u8; 33];
+        stream.read_exact(&mut chal)?;
+        let nonce: [u8; 32] = chal[1..].try_into().unwrap();
+        let mut proof = [0u8; 32];
+        let mut tagger = None;
+        if chal[0] == 1 {
+            let Some(k) = key else {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "the receiver requires a key (--key-file or SYNCFOLD_DD_KEY)",
+                ));
+            };
+            proof = auth_proof(k, &nonce, size, WIRE_CHUNK as u32);
+            tagger = Some(Tagger {
+                key: k.to_vec(),
+                nonce,
+                seq: 0,
+            });
+        }
+        stream.write_all(&proof)?;
+        let mut verdict = [0u8; 1];
+        stream.read_exact(&mut verdict)?;
+        if verdict[0] != 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "the receiver refused this session (wrong key, or version/size/destination refused)",
+            ));
+        }
 
         let mut buf = vec![0u8; WIRE_CHUNK];
         let mut acc = Stats::ZERO;
@@ -1347,12 +1470,12 @@ pub mod block {
             }
             if sparse {
                 let data = for_each_extent(&buf[..n], off, |o, run| {
-                    send_data_frame(&mut stream, o, run)
+                    send_data_frame(&mut stream, &mut tagger, o, run)
                 })?;
                 acc.bytes_copied += data;
                 acc.bytes_zero += n as u64 - data;
             } else {
-                send_data_frame(&mut stream, off, &buf[..n])?;
+                send_data_frame(&mut stream, &mut tagger, off, &buf[..n])?;
                 acc.bytes_copied += n as u64;
             }
             acc.blocks_copied += 1;
@@ -1370,6 +1493,9 @@ pub mod block {
             }
         }
         stream.write_all(&[0x00])?; // END
+        if let Some(t) = &mut tagger {
+            stream.write_all(&t.next(&[0x00], &[]))?;
+        }
         stream.flush()?;
         if !quiet {
             eprintln!();
@@ -1377,52 +1503,210 @@ pub mod block {
         Ok(acc)
     }
 
-    /// Serve as the receiving sink: accept ONE connection on `port` and write the
-    /// streamed extents into `dst` (file or device). Returns when the peer sends END.
-    pub fn serve(dst: &Path, port: u16, quiet: bool) -> io::Result<Stats> {
-        let listener = TcpListener::bind(("0.0.0.0", port))?;
-        if !quiet {
+    /// Settings for [`serve`].
+    pub struct ServeOpts {
+        /// Address to listen on. Default `127.0.0.1`; anything that is not a loopback
+        /// address (including `0.0.0.0`) requires `key`.
+        pub bind: IpAddr,
+        /// TCP port to listen on.
+        pub port: u16,
+        /// Pre-shared key (at least [`MIN_KEY_LEN`] bytes) the pushing peer must prove.
+        pub key: Option<Vec<u8>>,
+        /// Allow replacing an existing non-empty regular file (it is truncated first).
+        pub force: bool,
+        /// Largest total size a peer may declare.
+        pub max_size: u64,
+        /// Suppress progress and status lines on stderr.
+        pub quiet: bool,
+    }
+
+    impl ServeOpts {
+        /// Loopback-only, no key, no `--force`, default size cap.
+        pub fn new(port: u16) -> Self {
+            ServeOpts {
+                bind: IpAddr::V4(Ipv4Addr::LOCALHOST),
+                port,
+                key: None,
+                force: false,
+                max_size: DEFAULT_MAX_SIZE,
+                quiet: false,
+            }
+        }
+    }
+
+    fn check_serve_policy(ip: IpAddr, key: Option<&[u8]>) -> io::Result<()> {
+        if let Some(k) = key {
+            check_key(k)?;
+        }
+        if !ip.is_loopback() && key.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "refusing to listen on {ip} without authentication: supply a key \
+                     (--key-file, or the SYNCFOLD_DD_KEY environment variable) or bind a loopback address"
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    fn refuse(stream: &mut TcpStream, why: &str) -> io::Error {
+        let _ = stream.write_all(&[0x00]);
+        io::Error::new(io::ErrorKind::PermissionDenied, why.to_string())
+    }
+
+    /// Serve as the receiving sink: accept a connection on `opts.bind:opts.port` and
+    /// write the streamed extents into `dst` (file or device). Returns when a peer
+    /// completes a session (END). A peer that fails the handshake (bad magic or
+    /// version, wrong key) is dropped and the next connection is accepted; `dst` is
+    /// not opened until the handshake — including the key proof — has passed.
+    pub fn serve(dst: &Path, opts: &ServeOpts) -> io::Result<Stats> {
+        check_serve_policy(opts.bind, opts.key.as_deref())?;
+        let listener = TcpListener::bind((opts.bind, opts.port))?;
+        serve_on(&listener, dst, opts)
+    }
+
+    /// [`serve`] on an already-bound listener (`opts.bind`/`opts.port` are ignored; the
+    /// listener's own address is checked against the key policy).
+    pub fn serve_on(listener: &TcpListener, dst: &Path, opts: &ServeOpts) -> io::Result<Stats> {
+        let local = listener.local_addr()?;
+        check_serve_policy(local.ip(), opts.key.as_deref())?;
+        if !opts.quiet {
             eprintln!(
-                "syncfold dd serve: listening on 0.0.0.0:{port} → {}",
+                "syncfold dd serve: listening on {local}{} → {}",
+                if opts.key.is_some() {
+                    " (key required)"
+                } else {
+                    ""
+                },
                 dst.display()
             );
         }
-        let (mut stream, peer) = listener.accept()?;
-        stream.set_nodelay(true)?;
-        if !quiet {
-            eprintln!("syncfold dd serve: connection from {peer}");
+        loop {
+            let (mut stream, peer) = listener.accept()?;
+            stream.set_nodelay(true)?;
+            if !opts.quiet {
+                eprintln!("syncfold dd serve: connection from {peer}");
+            }
+            match serve_session(&mut stream, dst, opts) {
+                Ok(st) => return Ok(st),
+                Err(SessionErr::Handshake(e)) => {
+                    // Not a valid, authorised peer: never touched dst. Keep listening.
+                    if !opts.quiet {
+                        eprintln!("syncfold dd serve: dropped {peer}: {e}");
+                    }
+                }
+                Err(SessionErr::Fatal(e)) => return Err(e),
+            }
+        }
+    }
+
+    enum SessionErr {
+        /// Failed before the peer was authenticated and dst opened.
+        Handshake(io::Error),
+        /// Failed afterwards (protocol violation, I/O error): the session is over.
+        Fatal(io::Error),
+    }
+    impl From<io::Error> for SessionErr {
+        fn from(e: io::Error) -> Self {
+            SessionErr::Fatal(e)
+        }
+    }
+
+    fn serve_session(
+        stream: &mut TcpStream,
+        dst: &Path,
+        opts: &ServeOpts,
+    ) -> Result<Stats, SessionErr> {
+        let hs = |e: io::Error| SessionErr::Handshake(e);
+        let bad = |m: &str| io::Error::new(io::ErrorKind::InvalidData, m.to_string());
+        stream
+            .set_read_timeout(Some(HANDSHAKE_TIMEOUT))
+            .map_err(hs)?;
+        stream
+            .set_write_timeout(Some(HANDSHAKE_TIMEOUT))
+            .map_err(hs)?;
+
+        let mut head = [0u8; 17];
+        stream.read_exact(&mut head).map_err(hs)?;
+        if &head[..4] != b"SFDD" {
+            return Err(hs(bad("bad magic (not a syncfold dd stream)")));
+        }
+        if head[4] != WIRE_VERSION {
+            return Err(hs(bad("unsupported dd protocol version (need 2)")));
+        }
+        let size = u64::from_le_bytes(head[5..13].try_into().unwrap());
+        let hint = u32::from_le_bytes(head[13..17].try_into().unwrap());
+
+        // challenge → proof → verdict
+        let nonce = random_nonce().map_err(hs)?;
+        let mut chal = [0u8; 33];
+        chal[0] = opts.key.is_some() as u8;
+        chal[1..].copy_from_slice(&nonce);
+        stream.write_all(&chal).map_err(hs)?;
+        let mut proof = [0u8; 32];
+        stream.read_exact(&mut proof).map_err(hs)?;
+        let mut tagger = None;
+        if let Some(k) = &opts.key {
+            if !ct_eq(&proof, &auth_proof(k, &nonce, size, hint)) {
+                return Err(hs(refuse(stream, "bad key proof")));
+            }
+            tagger = Some(Tagger {
+                key: k.clone(),
+                nonce,
+                seq: 0,
+            });
         }
 
-        let mut magic = [0u8; 4];
-        stream.read_exact(&mut magic)?;
-        if &magic != b"SFDD" {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "bad magic (not a syncfold dd stream)",
-            ));
+        // Authenticated (or loopback-only unkeyed). Validate what the peer declares
+        // BEFORE touching the destination.
+        if size > opts.max_size {
+            let _ = stream.write_all(&[0x00]);
+            return Err(bad("declared size exceeds the --max-size limit").into());
         }
-        let mut one = [0u8; 1];
-        stream.read_exact(&mut one)?; // version
-        let mut sz = [0u8; 8];
-        stream.read_exact(&mut sz)?;
-        let size = u64::from_le_bytes(sz);
-        let mut ck = [0u8; 4];
-        stream.read_exact(&mut ck)?; // chunk hint — informational
-
         let dst_is_dev = sysio::is_device_path(dst);
         let mut oo = File::options();
-        oo.read(true).write(true).create(true);
-        if !dst_is_dev {
-            oo.truncate(true);
+        oo.read(true).write(true);
+        if dst_is_dev {
+            // never create or truncate a device node
+        } else {
+            oo.create(true);
         }
-        let d = oo.open(dst)?;
-        if !dst_is_dev {
+        let mut d = match oo.open(dst) {
+            Ok(d) => d,
+            Err(e) => {
+                let _ = stream.write_all(&[0x00]);
+                return Err(e.into());
+            }
+        };
+        let meta = d.metadata()?;
+        if dst_is_dev {
+            let dev_len = d.seek(SeekFrom::End(0))?;
+            if size > dev_len {
+                let _ = stream.write_all(&[0x00]);
+                return Err(bad("declared size is larger than the destination device").into());
+            }
+        } else {
+            if meta.is_file() && meta.len() > 0 && !opts.force {
+                let _ = stream.write_all(&[0x00]);
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!(
+                        "{} is a non-empty file; refusing to overwrite it (pass --force)",
+                        dst.display()
+                    ),
+                )
+                .into());
+            }
+            d.set_len(0)?; // start from nothing: stale bytes must not survive in the holes
             d.set_len(size)?; // sparse-zero base; unsent (hole) regions stay zero
         }
+        stream.write_all(&[0x01])?; // OK
+        stream.set_read_timeout(Some(FRAME_TIMEOUT))?;
+        stream.set_write_timeout(Some(FRAME_TIMEOUT))?;
 
-        // A device keeps whatever it held before, so the sender's omitted all-zero extents must be
-        // written as zeros there; a regular file was truncated and sized above and reads zero.
-        recv_extents(&mut stream, &d, size, dst_is_dev, quiet)
+        let acc = recv_extents(stream, &mut tagger, &d, size, dst_is_dev, opts.quiet)?;
+        Ok(acc)
     }
 
     /// Write zeros over `[from, to)` of `d`.
@@ -1437,16 +1721,22 @@ pub mod block {
         Ok(())
     }
 
-    /// Read DATA frames from `r` until END and write each into `d` at its offset. With `zero_gaps`
-    /// the ranges the sender left out (all-zero extents) are written as zeros: between frames, and
-    /// from the last frame to `size`. The sender emits frames in increasing offset order.
+    /// Read DATA frames from `r` until END and write each into `d` at its offset, bounded by
+    /// `size`. When `tagger` is set (a pre-shared key was proved) every frame and END must carry
+    /// a valid tag, checked before the frame is written. With `zero_gaps` the ranges the sender
+    /// left out (all-zero extents) are written as zeros: between frames, and from the last frame
+    /// to `size`. That is needed for a device, which keeps whatever it held before; a regular
+    /// file was truncated and sized by the caller and already reads zero. The sender emits frames
+    /// in increasing offset order.
     fn recv_extents(
         r: &mut dyn Read,
+        tagger: &mut Option<Tagger>,
         d: &File,
         size: u64,
         zero_gaps: bool,
         quiet: bool,
     ) -> io::Result<Stats> {
+        let bad = |m: &str| io::Error::new(io::ErrorKind::InvalidData, m.to_string());
         let mut acc = Stats::ZERO;
         let mut hdr = [0u8; 13];
         let mut data = vec![0u8; WIRE_CHUNK];
@@ -1455,21 +1745,36 @@ pub mod block {
         loop {
             r.read_exact(&mut hdr[..1])?;
             if hdr[0] == 0x00 {
+                if let Some(t) = tagger {
+                    let mut got = [0u8; 32];
+                    r.read_exact(&mut got)?;
+                    if !ct_eq(&got, &t.next(&hdr[..1], &[])) {
+                        return Err(bad("bad END tag"));
+                    }
+                }
                 break; // END
             }
             if hdr[0] != 0x01 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "unknown frame tag",
-                ));
+                return Err(bad("unknown frame tag"));
             }
             r.read_exact(&mut hdr[1..13])?;
             let off = u64::from_le_bytes(hdr[1..9].try_into().unwrap());
             let len = u32::from_le_bytes(hdr[9..13].try_into().unwrap()) as usize;
-            if len > data.len() {
-                data.resize(len, 0);
+            if len > WIRE_CHUNK {
+                return Err(bad("frame length exceeds the wire chunk limit"));
+            }
+            match off.checked_add(len as u64) {
+                Some(end) if end <= size => {}
+                _ => return Err(bad("frame lies outside the declared size")),
             }
             r.read_exact(&mut data[..len])?;
+            if let Some(t) = tagger {
+                let mut got = [0u8; 32];
+                r.read_exact(&mut got)?;
+                if !ct_eq(&got, &t.next(&hdr, &data[..len])) {
+                    return Err(bad("bad frame tag"));
+                }
+            }
             if zero_gaps && off > cursor {
                 zero_fill(d, cursor, off)?;
             }
@@ -1529,6 +1834,389 @@ pub mod block {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use std::net::SocketAddr;
+        use std::path::PathBuf;
+
+        const KEY: &[u8] = b"0123456789abcdef-test-key";
+
+        fn scratch(tag: &str) -> PathBuf {
+            let d = std::env::temp_dir().join(format!("sfdd_{tag}_{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&d);
+            std::fs::create_dir_all(&d).unwrap();
+            d
+        }
+
+        fn quiet(key: Option<&[u8]>) -> ServeOpts {
+            let mut o = ServeOpts::new(0);
+            o.quiet = true;
+            o.key = key.map(<[u8]>::to_vec);
+            o
+        }
+
+        /// Serve `dst` on an ephemeral loopback port in a thread.
+        fn spawn_server(
+            dst: &Path,
+            opts: ServeOpts,
+        ) -> (SocketAddr, thread::JoinHandle<io::Result<Stats>>) {
+            let l = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let addr = l.local_addr().unwrap();
+            let dst = dst.to_path_buf();
+            (addr, thread::spawn(move || serve_on(&l, &dst, &opts)))
+        }
+
+        /// A source image: 3 data bytes, a big hole, 3 more data bytes.
+        fn make_src(dir: &Path) -> (PathBuf, Vec<u8>) {
+            let mut v = vec![0u8; 3 << 20];
+            v[..3].copy_from_slice(b"abc");
+            let n = v.len();
+            v[n - 3..].copy_from_slice(b"xyz");
+            let p = dir.join("src.img");
+            std::fs::write(&p, &v).unwrap();
+            (p, v)
+        }
+
+        fn push_to(addr: SocketAddr, src: &Path, key: Option<&[u8]>) -> io::Result<Stats> {
+            push(src, Format::Raw, "127.0.0.1", addr.port(), true, true, key)
+        }
+
+        /// A raw peer speaking the v2 framing by hand.
+        struct Raw {
+            s: TcpStream,
+            nonce: [u8; 32],
+            auth: bool,
+            seq: u64,
+            key: Option<Vec<u8>>,
+            verdict: u8,
+        }
+        impl Raw {
+            fn open(addr: SocketAddr, size: u64, key: Option<&[u8]>) -> Raw {
+                let mut s = TcpStream::connect(addr).unwrap();
+                s.set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                    .unwrap();
+                let mut h = b"SFDD".to_vec();
+                h.push(WIRE_VERSION);
+                h.extend_from_slice(&size.to_le_bytes());
+                h.extend_from_slice(&(WIRE_CHUNK as u32).to_le_bytes());
+                s.write_all(&h).unwrap();
+                let mut chal = [0u8; 33];
+                s.read_exact(&mut chal).unwrap();
+                let nonce: [u8; 32] = chal[1..].try_into().unwrap();
+                let proof = match (chal[0], key) {
+                    (1, Some(k)) => auth_proof(k, &nonce, size, WIRE_CHUNK as u32),
+                    _ => [0u8; 32],
+                };
+                s.write_all(&proof).unwrap();
+                let mut v = [0u8; 1];
+                let verdict = if s.read_exact(&mut v).is_ok() {
+                    v[0]
+                } else {
+                    0
+                };
+                Raw {
+                    s,
+                    nonce,
+                    auth: chal[0] == 1,
+                    seq: 0,
+                    key: key.map(<[u8]>::to_vec),
+                    verdict,
+                }
+            }
+            fn tag(&mut self, head: &[u8], data: &[u8]) -> Vec<u8> {
+                if !self.auth {
+                    return Vec::new();
+                }
+                let k = self.key.clone().unwrap();
+                let t = frame_tag(&k, &self.nonce, self.seq, head, data).to_vec();
+                self.seq += 1;
+                t
+            }
+            fn frame_raw(&mut self, off: u64, len_field: u32, data: &[u8], tag: Option<Vec<u8>>) {
+                let mut hdr = vec![1u8];
+                hdr.extend_from_slice(&off.to_le_bytes());
+                hdr.extend_from_slice(&len_field.to_le_bytes());
+                let t = tag.unwrap_or_else(|| self.tag(&hdr, data));
+                let mut f = hdr;
+                f.extend_from_slice(data);
+                f.extend_from_slice(&t);
+                let _ = self.s.write_all(&f);
+            }
+            fn frame(&mut self, off: u64, data: &[u8]) {
+                self.frame_raw(off, data.len() as u32, data, None);
+            }
+            fn end(&mut self) {
+                let t = self.tag(&[0], &[]);
+                let mut f = vec![0u8];
+                f.extend_from_slice(&t);
+                let _ = self.s.write_all(&f);
+            }
+        }
+
+        // ---- policy ----
+
+        #[test]
+        fn default_bind_is_loopback() {
+            assert!(ServeOpts::new(9000).bind.is_loopback());
+            assert!(ServeOpts::new(9000).key.is_none());
+            assert!(!ServeOpts::new(9000).force);
+        }
+
+        #[test]
+        fn non_loopback_bind_without_key_is_refused() {
+            let d = scratch("policy");
+            for ip in ["0.0.0.0", "::", "192.0.2.1"] {
+                let mut o = quiet(None);
+                o.bind = ip.parse().unwrap();
+                // run in a thread: a regression would block in accept(), not return
+                let (tx, rx) = std::sync::mpsc::channel();
+                let dst = d.join("dst");
+                thread::spawn(move || {
+                    let _ = tx.send(serve(&dst, &o).err().map(|e| e.kind()));
+                });
+                let got = rx.recv_timeout(std::time::Duration::from_secs(5));
+                assert_eq!(got, Ok(Some(io::ErrorKind::InvalidInput)), "{ip}");
+            }
+            // a key makes a wildcard bind legal (bound on an ephemeral port)
+            let mut o = quiet(Some(KEY));
+            o.bind = "127.0.0.1".parse().unwrap();
+            assert!(check_serve_policy("0.0.0.0".parse().unwrap(), o.key.as_deref()).is_ok());
+            // ... but a trivial key does not
+            assert!(check_serve_policy("127.0.0.1".parse().unwrap(), Some(b"short")).is_err());
+            let _ = std::fs::remove_dir_all(&d);
+        }
+
+        #[test]
+        fn short_key_is_refused_by_push() {
+            let d = scratch("shortkey");
+            let (src, _) = make_src(&d);
+            let e = push(&src, Format::Raw, "127.0.0.1", 1, true, true, Some(b"x"))
+                .err()
+                .expect("expected an error");
+            assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
+            let _ = std::fs::remove_dir_all(&d);
+        }
+
+        // ---- authentication ----
+
+        #[test]
+        fn roundtrip_without_key_on_loopback() {
+            let d = scratch("rt_nokey");
+            let (src, want) = make_src(&d);
+            let dst = d.join("dst.img");
+            let (addr, t) = spawn_server(&dst, quiet(None));
+            let st = push_to(addr, &src, None).unwrap();
+            t.join().unwrap().unwrap();
+            assert_eq!(std::fs::read(&dst).unwrap(), want);
+            assert!(st.bytes_zero > 0, "the hole must not cross the wire");
+            let _ = std::fs::remove_dir_all(&d);
+        }
+
+        #[test]
+        fn roundtrip_with_key() {
+            let d = scratch("rt_key");
+            let (src, want) = make_src(&d);
+            let dst = d.join("dst.img");
+            let (addr, t) = spawn_server(&dst, quiet(Some(KEY)));
+            push_to(addr, &src, Some(KEY)).unwrap();
+            t.join().unwrap().unwrap();
+            assert_eq!(std::fs::read(&dst).unwrap(), want);
+            let _ = std::fs::remove_dir_all(&d);
+        }
+
+        #[test]
+        fn wrong_or_missing_key_is_rejected_and_destination_untouched() {
+            let d = scratch("wrongkey");
+            let (src, want) = make_src(&d);
+            let dst = d.join("dst.img");
+            let (addr, t) = spawn_server(&dst, quiet(Some(KEY)));
+
+            let e = push_to(addr, &src, Some(b"a-different-16+byte-key"))
+                .err()
+                .expect("expected an error");
+            assert_eq!(e.kind(), io::ErrorKind::PermissionDenied, "{e}");
+            let e = push_to(addr, &src, None).err().expect("expected an error");
+            assert_eq!(e.kind(), io::ErrorKind::PermissionDenied, "{e}");
+            let r = Raw::open(addr, 8, Some(b"yet-another-16+byte-key"));
+            assert_eq!(r.verdict, 0);
+            drop(r);
+            assert!(
+                !dst.exists(),
+                "an unauthenticated peer caused the destination to be created"
+            );
+
+            // the server is still listening and the right key still works
+            push_to(addr, &src, Some(KEY)).unwrap();
+            t.join().unwrap().unwrap();
+            assert_eq!(std::fs::read(&dst).unwrap(), want);
+            let _ = std::fs::remove_dir_all(&d);
+        }
+
+        #[test]
+        fn forged_frame_tag_is_rejected_before_writing() {
+            let d = scratch("forge");
+            let dst = d.join("dst.img");
+            let (addr, t) = spawn_server(&dst, quiet(Some(KEY)));
+            let mut r = Raw::open(addr, 16, Some(KEY));
+            assert_eq!(r.verdict, 1);
+            r.frame_raw(0, 4, b"EVIL", Some(vec![0u8; 32]));
+            let e = t.join().unwrap().err().expect("expected an error");
+            assert_eq!(e.kind(), io::ErrorKind::InvalidData, "{e}");
+            assert_eq!(
+                std::fs::read(&dst).unwrap(),
+                vec![0u8; 16],
+                "forged frame was written"
+            );
+            let _ = std::fs::remove_dir_all(&d);
+        }
+
+        #[test]
+        fn replayed_frame_is_rejected() {
+            // Same bytes, same valid tag for seq 0, sent twice: the second must fail.
+            let d = scratch("replay");
+            let dst = d.join("dst.img");
+            let (addr, t) = spawn_server(&dst, quiet(Some(KEY)));
+            let mut r = Raw::open(addr, 16, Some(KEY));
+            let mut hdr = vec![1u8];
+            hdr.extend_from_slice(&0u64.to_le_bytes());
+            hdr.extend_from_slice(&4u32.to_le_bytes());
+            let tag = frame_tag(KEY, &r.nonce, 0, &hdr, b"ABCD").to_vec();
+            r.frame_raw(0, 4, b"ABCD", Some(tag.clone()));
+            r.frame_raw(0, 4, b"ABCD", Some(tag));
+            assert!(t.join().unwrap().is_err());
+            let _ = std::fs::remove_dir_all(&d);
+        }
+
+        #[test]
+        fn old_protocol_version_is_refused_without_touching_destination() {
+            let d = scratch("v1");
+            let dst = d.join("dst.img");
+            let (addr, t) = spawn_server(&dst, quiet(None));
+            let mut s = TcpStream::connect(addr).unwrap();
+            let mut h = b"SFDD".to_vec();
+            h.push(1);
+            h.extend_from_slice(&16u64.to_le_bytes());
+            h.extend_from_slice(&0u32.to_le_bytes());
+            s.write_all(&h).unwrap();
+            drop(s);
+            assert!(!dst.exists());
+            // server survives; finish it with a good session
+            let r = Raw::open(addr, 4, None);
+            assert_eq!(r.verdict, 1);
+            let mut r = r;
+            r.end();
+            t.join().unwrap().unwrap();
+            let _ = std::fs::remove_dir_all(&d);
+        }
+
+        // ---- bounds on what the peer declares ----
+
+        #[test]
+        fn frame_beyond_declared_size_is_refused() {
+            let d = scratch("oob");
+            let dst = d.join("dst.img");
+            let (addr, t) = spawn_server(&dst, quiet(None));
+            let mut r = Raw::open(addr, 16, None);
+            r.frame(1 << 30, b"EVIL");
+            let e = t.join().unwrap().err().expect("expected an error");
+            assert_eq!(e.kind(), io::ErrorKind::InvalidData, "{e}");
+            assert_eq!(
+                std::fs::metadata(&dst).unwrap().len(),
+                16,
+                "file grew past the declared size"
+            );
+            let _ = std::fs::remove_dir_all(&d);
+        }
+
+        #[test]
+        fn frame_straddling_declared_size_or_overflowing_is_refused() {
+            for (off, len) in [(14u64, 4usize), (u64::MAX - 1, 4)] {
+                let d = scratch("straddle");
+                let dst = d.join("dst.img");
+                let (addr, t) = spawn_server(&dst, quiet(None));
+                let mut r = Raw::open(addr, 16, None);
+                r.frame(off, &vec![7u8; len]);
+                assert!(t.join().unwrap().is_err(), "off={off} len={len}");
+                assert_eq!(std::fs::read(&dst).unwrap(), vec![0u8; 16]);
+                let _ = std::fs::remove_dir_all(&d);
+            }
+        }
+
+        #[test]
+        fn oversized_frame_length_is_refused_without_reading_the_payload() {
+            let d = scratch("biglen");
+            let dst = d.join("dst.img");
+            let (addr, t) = spawn_server(&dst, quiet(None));
+            // size is large enough that the bound-vs-size check alone would not stop it
+            let mut r = Raw::open(addr, 1 << 40, None);
+            r.frame_raw(0, u32::MAX, &[], None); // header only; the socket stays open
+            let e = t.join().unwrap().err().expect("expected an error");
+            assert_eq!(e.kind(), io::ErrorKind::InvalidData, "{e}");
+            drop(r);
+            let _ = std::fs::remove_dir_all(&d);
+        }
+
+        #[test]
+        fn absurd_declared_size_is_refused_before_set_len() {
+            let d = scratch("hugesize");
+            let dst = d.join("dst.img");
+            let mut o = quiet(None);
+            o.max_size = 1 << 20;
+            let (addr, t) = spawn_server(&dst, o);
+            let r = Raw::open(addr, (1 << 20) + 1, None);
+            assert_eq!(r.verdict, 0);
+            assert!(t.join().unwrap().is_err());
+            assert!(!dst.exists() || std::fs::metadata(&dst).unwrap().len() == 0);
+            let _ = std::fs::remove_dir_all(&d);
+
+            // and the default cap rejects a u64::MAX declaration
+            let d = scratch("hugesize2");
+            let dst = d.join("dst.img");
+            let (addr, t) = spawn_server(&dst, quiet(None));
+            let r = Raw::open(addr, u64::MAX, None);
+            assert_eq!(r.verdict, 0);
+            assert!(t.join().unwrap().is_err());
+            assert!(!dst.exists() || std::fs::metadata(&dst).unwrap().len() == 0);
+            let _ = std::fs::remove_dir_all(&d);
+        }
+
+        #[test]
+        fn existing_nonempty_file_is_not_truncated_without_force() {
+            let d = scratch("force");
+            let (src, want) = make_src(&d);
+            let dst = d.join("dst.img");
+            std::fs::write(&dst, b"precious data").unwrap();
+            let (addr, t) = spawn_server(&dst, quiet(None));
+            let e = push_to(addr, &src, None).err().expect("expected an error");
+            assert_eq!(e.kind(), io::ErrorKind::PermissionDenied, "{e}");
+            let e = t.join().unwrap().err().expect("expected an error");
+            assert_eq!(e.kind(), io::ErrorKind::AlreadyExists, "{e}");
+            assert_eq!(std::fs::read(&dst).unwrap(), b"precious data");
+
+            // with force the file is replaced, and stale bytes do not survive in the holes
+            std::fs::write(&dst, vec![0xEEu8; 4 << 20]).unwrap();
+            let mut o = quiet(None);
+            o.force = true;
+            let (addr, t) = spawn_server(&dst, o);
+            push_to(addr, &src, None).unwrap();
+            t.join().unwrap().unwrap();
+            assert_eq!(std::fs::read(&dst).unwrap(), want);
+            let _ = std::fs::remove_dir_all(&d);
+        }
+
+        #[test]
+        fn empty_existing_file_needs_no_force() {
+            let d = scratch("emptyok");
+            let (src, want) = make_src(&d);
+            let dst = d.join("dst.img");
+            std::fs::write(&dst, b"").unwrap();
+            let (addr, t) = spawn_server(&dst, quiet(None));
+            push_to(addr, &src, None).unwrap();
+            t.join().unwrap().unwrap();
+            assert_eq!(std::fs::read(&dst).unwrap(), want);
+            let _ = std::fs::remove_dir_all(&d);
+        }
+
+        // ---- sparse device targets (zero_gaps) and same-file refusal ----
+
         use std::fs;
 
         fn frame(off: u64, data: &[u8]) -> Vec<u8> {
@@ -1557,7 +2245,7 @@ pub mod block {
             wire.extend(frame(16384, &[2u8; 4096]));
             wire.push(0x00); // END
             let mut r = &wire[..];
-            let st = recv_extents(&mut r, &d, size, zero_gaps, true).unwrap();
+            let st = recv_extents(&mut r, &mut None, &d, size, zero_gaps, true).unwrap();
             assert_eq!(st.bytes_copied, 8192);
             let got = fs::read(&path).unwrap();
             let _ = fs::remove_file(&path);

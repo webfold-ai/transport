@@ -31,7 +31,7 @@
 #![allow(clippy::collapsible_if)]
 
 // Same module tree as `lib.rs` (this crate is usable as a library too, e.g. by
-// Galvanize's tfplugin6 client for HPACK/HTTP2/gRPC/cert-gen reuse) — these
+// a sibling project's Terraform-plugin client for HPACK/HTTP2/gRPC/cert-gen reuse) — these
 // `use` aliases keep every module reference below resolving exactly as it did
 // when they were local `mod` declarations. Only the ones this binary's own CLI
 // dispatch references directly; the rest (crypto/grpc/hpack/http2/tls/etc.)
@@ -406,6 +406,7 @@ fn cmd_dd(args: &[String]) -> ExitCode {
     let mut verify = false;
     let mut dry_run = false;
     let mut quiet = false;
+    let mut key_file: Option<String> = None;
     let mut src_fmt: Option<image::Format> = None;
     let mut dst_fmt: Option<image::Format> = None;
 
@@ -417,6 +418,13 @@ fn cmd_dd(args: &[String]) -> ExitCode {
             "--verify" => verify = true,
             "-n" | "--dry-run" => dry_run = true,
             "-q" | "--quiet" => quiet = true,
+            "--key-file" => match it.next() {
+                Some(f) => key_file = Some(f.clone()),
+                None => {
+                    eprintln!("syncfold dd: --key-file needs a path");
+                    return ExitCode::from(2);
+                }
+            },
             "--src-format" => match it.next().and_then(|v| image::Format::parse(v)) {
                 Some(f) => src_fmt = Some(f),
                 None => {
@@ -469,9 +477,12 @@ fn cmd_dd(args: &[String]) -> ExitCode {
         _ => {
             eprintln!("usage: syncfold dd <src> <dst> [--sync] [--bs SIZE] [-j N] [-n] [-q]");
             eprintln!(
-                "       syncfold dd <src> tcp://host:port      (push over network, holes skipped)"
+                "       syncfold dd <src> tcp://host:port [--key-file F]  (push over network, holes skipped)"
             );
-            eprintln!("       syncfold dd serve <dst> [--port N]     (receive a pushed stream)");
+            eprintln!(
+                "       syncfold dd serve <dst> [--port N] [--bind ADDR] [--key-file F] [--force]"
+            );
+            eprintln!("                                              (receive a pushed stream)");
             eprintln!("       syncfold dd if=<src> of=<dst> [bs=SIZE] [--sync]");
             return ExitCode::from(2);
         }
@@ -501,6 +512,13 @@ fn cmd_dd(args: &[String]) -> ExitCode {
             }
             return ExitCode::SUCCESS;
         }
+        let key = match load_dd_key(key_file.as_deref()) {
+            Ok(k) => k,
+            Err(e) => {
+                eprintln!("syncfold dd: {e}");
+                return ExitCode::from(2);
+            }
+        };
         return match block::push(
             &PathBuf::from(&src_s),
             src_format,
@@ -508,6 +526,7 @@ fn cmd_dd(args: &[String]) -> ExitCode {
             port,
             sparse,
             quiet,
+            key.as_deref(),
         ) {
             Ok(st) => {
                 if !quiet {
@@ -610,22 +629,60 @@ fn cmd_dd_verify(args: &[String]) -> ExitCode {
     }
 }
 
-/// `syncfold dd serve <dst> [--port N]` — receive one pushed stream into <dst>.
+/// The pre-shared `dd` key: `--key-file PATH` (trailing newline stripped) or, failing
+/// that, the `SYNCFOLD_DD_KEY` environment variable. Never taken from the command line.
+fn load_dd_key(key_file: Option<&str>) -> Result<Option<Vec<u8>>, String> {
+    if let Some(f) = key_file {
+        let mut k = std::fs::read(f).map_err(|e| format!("cannot read key file {f}: {e}"))?;
+        while matches!(k.last(), Some(b'\n' | b'\r')) {
+            k.pop();
+        }
+        return Ok(Some(k));
+    }
+    match std::env::var("SYNCFOLD_DD_KEY") {
+        Ok(v) if !v.is_empty() => Ok(Some(v.into_bytes())),
+        _ => Ok(None),
+    }
+}
+
+const DD_SERVE_USAGE: &str =
+    "usage: syncfold dd serve <dst> [--port N] [--bind ADDR] [--key-file FILE] [--force] [-q]\n\
+     \x20 listens on 127.0.0.1 by default; --bind ADDR listens elsewhere and then REQUIRES a key\n\
+     \x20 (--key-file FILE, or the SYNCFOLD_DD_KEY environment variable; at least 16 bytes).\n\
+     \x20 An existing non-empty regular file is only overwritten with --force.";
+
+/// `syncfold dd serve <dst> [--port N] [--bind ADDR] [--key-file F] [--force]` — receive
+/// one pushed stream into <dst>.
 fn cmd_dd_serve(args: &[String]) -> ExitCode {
     let mut dst: Option<String> = None;
-    let mut port: u16 = 9000;
-    let mut quiet = false;
+    let mut opts = block::ServeOpts::new(9000);
+    let mut key_file: Option<String> = None;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--port" => match it.next().and_then(|v| v.parse::<u16>().ok()) {
-                Some(p) => port = p,
+                Some(p) => opts.port = p,
                 None => {
                     eprintln!("syncfold dd serve: --port needs a number");
                     return ExitCode::from(2);
                 }
             },
-            "-q" | "--quiet" => quiet = true,
+            "--bind" => match it.next().and_then(|v| v.parse::<std::net::IpAddr>().ok()) {
+                Some(ip) => opts.bind = ip,
+                None => {
+                    eprintln!("syncfold dd serve: --bind needs an IP address (e.g. 0.0.0.0)");
+                    return ExitCode::from(2);
+                }
+            },
+            "--key-file" => match it.next() {
+                Some(f) => key_file = Some(f.clone()),
+                None => {
+                    eprintln!("syncfold dd serve: --key-file needs a path");
+                    return ExitCode::from(2);
+                }
+            },
+            "--force" => opts.force = true,
+            "-q" | "--quiet" => opts.quiet = true,
             s if s.starts_with('-') => {
                 eprintln!("syncfold dd serve: unknown option {s}");
                 return ExitCode::from(2);
@@ -634,10 +691,18 @@ fn cmd_dd_serve(args: &[String]) -> ExitCode {
         }
     }
     let Some(dst) = dst else {
-        eprintln!("usage: syncfold dd serve <dst> [--port N]");
+        eprintln!("{DD_SERVE_USAGE}");
         return ExitCode::from(2);
     };
-    match block::serve(&PathBuf::from(&dst), port, quiet) {
+    opts.key = match load_dd_key(key_file.as_deref()) {
+        Ok(k) => k,
+        Err(e) => {
+            eprintln!("syncfold dd serve: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let quiet = opts.quiet;
+    match block::serve(&PathBuf::from(&dst), &opts) {
         Ok(st) => {
             if !quiet {
                 let mib = |b: u64| b as f64 / (1024.0 * 1024.0);
@@ -652,7 +717,11 @@ fn cmd_dd_serve(args: &[String]) -> ExitCode {
         }
         Err(e) => {
             eprintln!("syncfold dd serve: {e}");
-            ExitCode::from(1)
+            ExitCode::from(if e.kind() == std::io::ErrorKind::InvalidInput {
+                2
+            } else {
+                1
+            })
         }
     }
 }
@@ -747,8 +816,13 @@ fn print_help() {
          \x20                                        --verify reads the result back,\n\
          \x20                                        -j N for multi-device (default: sequential)\n\
          \x20                                        .qcow2/.vhdx in/out converts (--src/--dst-format raw|qcow2|vhdx)\n\
-         \x20 dd  <src> tcp://host:port             push a disk/image over TCP (holes skipped)\n\
-         \x20 dd  serve <dst> [--port N]            receive a pushed stream into <dst>\n\
+         \x20 dd  <src> tcp://host:port [--key-file F]  push a disk/image over TCP (holes skipped)\n\
+         \x20 dd  serve <dst> [--port N] [--bind ADDR] [--key-file F] [--force]\n\
+         \x20                                        receive a pushed stream into <dst>; listens on\n\
+         \x20                                        127.0.0.1 unless --bind is given, which requires a\n\
+         \x20                                        key (--key-file F or $SYNCFOLD_DD_KEY, >= 16 bytes,\n\
+         \x20                                        never on the command line); --force replaces a\n\
+         \x20                                        non-empty regular file\n\
          \x20 s3 backup|restore|sync|scan ...        sovereign S3 over our own TLS\n\
          \x20 scan <dir>                             friction scan (the Web encircle)"
     );
