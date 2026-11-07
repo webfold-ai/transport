@@ -32,13 +32,37 @@ pub mod archive {
         Ok(out)
     }
 
-    fn rel_bytes(rel: &Path) -> io::Result<&[u8]> {
-        rel.to_str().map(str::as_bytes).ok_or_else(|| {
+    /// Archive entry paths always use `/`. `Path::join` yields native separators, so on Windows a
+    /// nested entry would otherwise be stored as `dir\file` and refused by the unpackers.
+    fn archive_sep(s: &str) -> String {
+        s.replace('\\', "/")
+    }
+
+    fn rel_bytes(rel: &Path) -> io::Result<Vec<u8>> {
+        let s = rel.to_str().ok_or_else(|| {
             Error::new(
                 ErrorKind::InvalidData,
                 format!("non-UTF8 path: {}", rel.display()),
             )
+        })?;
+        Ok(if cfg!(windows) {
+            archive_sep(s).into_bytes()
+        } else {
+            s.as_bytes().to_vec()
         })
+    }
+
+    #[cfg(test)]
+    mod separator_tests {
+        use super::*;
+
+        #[test]
+        fn native_windows_separators_become_slashes() {
+            assert_eq!(archive_sep("dir\\sub\\file"), "dir/sub/file");
+            assert_eq!(archive_sep("a/b"), "a/b");
+            // what the unpackers accept
+            assert!(entry_segments(&archive_sep("dir\\sub\\file")).is_ok());
+        }
     }
 
     fn pack_dir(abs: &Path, rel: &Path, out: &mut Vec<u8>) -> io::Result<()> {
@@ -47,7 +71,7 @@ pub mod archive {
         for de in entries {
             let crel = rel.join(de.file_name());
             let ft = de.file_type()?;
-            let pb = rel_bytes(&crel)?.to_vec();
+            let pb = rel_bytes(&crel)?;
             if ft.is_symlink() {
                 let target = fs::read_link(de.path())?;
                 let tb = target
@@ -115,7 +139,7 @@ pub mod archive {
         for de in entries {
             let crel = rel.join(de.file_name());
             let ft = de.file_type()?;
-            let pb = rel_bytes(&crel)?.to_vec();
+            let pb = rel_bytes(&crel)?;
             if ft.is_symlink() {
                 let target = fs::read_link(de.path())?;
                 let tb = target
@@ -1267,10 +1291,25 @@ pub mod block {
         a.len() == b.len() && a.iter().zip(b).fold(0u8, |d, (x, y)| d | (x ^ y)) == 0
     }
 
+    /// A fresh session nonce from the operating system's CSPRNG (portable: `getrandom`/`arc4random`
+    /// on Unix, `BCryptGenRandom` on Windows), not a `/dev/urandom` path that Windows lacks.
     fn random_nonce() -> io::Result<[u8; 32]> {
         let mut n = [0u8; 32];
-        File::open("/dev/urandom")?.read_exact(&mut n)?;
+        aws_lc_rs::rand::fill(&mut n).map_err(|_| io::Error::other("system RNG failure"))?;
         Ok(n)
+    }
+
+    #[cfg(test)]
+    mod nonce_tests {
+        #[test]
+        fn nonces_are_fresh_and_not_zero() {
+            let (a, b) = (
+                super::random_nonce().unwrap(),
+                super::random_nonce().unwrap(),
+            );
+            assert_ne!(a, b);
+            assert_ne!(a, [0u8; 32]);
+        }
     }
 
     fn check_key(key: &[u8]) -> io::Result<()> {
@@ -4129,25 +4168,19 @@ pub mod http {
         extra_headers: &[(String, String)],
         body: &[u8],
     ) -> io::Result<Response> {
-        use std::io::Read;
         use std::net::TcpStream;
         let mut c = TcpStream::connect((host, port))?;
         c.set_read_timeout(Some(PLAIN_IO_TIMEOUT))?;
         c.set_write_timeout(Some(PLAIN_IO_TIMEOUT))?;
         write_request(&mut c, host, port, method, path, extra_headers, body)?;
-        let max = max_response_bytes();
-        // head + body + chunk framing slack; the Vec grows as bytes arrive
-        let limit = max
-            .saturating_add(max / 64)
-            .saturating_add(MAX_HEAD_BYTES as u64);
-        let mut raw = Vec::new();
-        (&mut c)
-            .take(limit.saturating_add(1))
-            .read_to_end(&mut raw)?;
-        if raw.len() as u64 > limit {
-            return Err(too_large());
-        }
-        parse_response(&raw, method.eq_ignore_ascii_case("HEAD"), max)
+        // Stream-decode with the cap on the decoded body: a valid chunked answer is not rejected for
+        // its framing overhead, and an oversized one is refused as soon as it crosses the cap.
+        read_response_ext(
+            &mut c,
+            method.eq_ignore_ascii_case("HEAD"),
+            max_response_bytes(),
+            true,
+        )
     }
 
     /// One plain HTTP request on an EXISTING connection, keep-alive: writes the request, reads
@@ -4211,7 +4244,20 @@ pub mod http {
     /// set for a HEAD request. Every length the peer declares is checked against `max` before
     /// anything is buffered for it.
     fn read_response<R: Read>(conn: &mut R, head_only: bool, max: u64) -> io::Result<Response> {
-        // Read one response head, then the body per its framing.
+        read_response_ext(conn, head_only, max, false)
+    }
+
+    /// Read one response: head, then the body per its framing, enforcing `max` on the DECODED body
+    /// as the bytes arrive (a chunked body costs more on the wire than it holds; that framing
+    /// overhead is bounded per line, never by a share of the body cap). `until_close` is for a
+    /// `Connection: close` request: a response with neither Content-Length nor chunking then
+    /// runs to end of stream, still capped at `max`.
+    fn read_response_ext<R: Read>(
+        conn: &mut R,
+        head_only: bool,
+        max: u64,
+        until_close: bool,
+    ) -> io::Result<Response> {
         let mut buf = Vec::with_capacity(8192);
         let head_end = loop {
             let mut b = [0u8; 1];
@@ -4242,11 +4288,15 @@ pub mod http {
             .and_then(|s| s.parse::<u16>().ok())
             .ok_or_else(|| io::Error::other("bad status line"))?;
         let mut content_length = 0u64;
+        let mut has_length = false;
         let mut chunked = false;
+        let mut headers: Vec<(String, String)> = Vec::new();
         for l in lines {
             if let Some((k, v)) = l.split_once(':') {
+                headers.push((k.trim().to_string(), v.trim().to_string()));
                 let (k, v) = (k.trim().to_ascii_lowercase(), v.trim());
                 if k == "content-length" {
+                    has_length = true;
                     content_length = v
                         .parse()
                         .map_err(|_| Error::new(ErrorKind::InvalidData, "bad Content-Length"))?;
@@ -4313,12 +4363,22 @@ pub mod http {
                 ));
             }
             out
+        } else if until_close && !has_length {
+            // close-delimited body: read to end of stream, one byte past the cap so overflow is seen
+            let mut out = Vec::new();
+            (&mut *conn)
+                .take(max.saturating_add(1))
+                .read_to_end(&mut out)?;
+            if out.len() as u64 > max {
+                return Err(too_large());
+            }
+            out
         } else {
             Vec::new()
         };
         Ok(Response {
             status,
-            headers: vec![],
+            headers,
             body,
         })
     }
@@ -4717,6 +4777,63 @@ pub mod http {
                 b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nx\r\n0\r\nX-Sum: 1\r\n";
             let mut r = &wire[..];
             assert!(read_response(&mut r, false, max_response_bytes()).is_err());
+        }
+
+        /// `n` one-byte chunks: the worst framing ratio (6 wire bytes per body byte).
+        fn one_byte_chunks(n: usize, head: &str) -> Vec<u8> {
+            let mut w =
+                format!("HTTP/1.1 200 OK\r\n{head}Transfer-Encoding: chunked\r\n\r\n").into_bytes();
+            for _ in 0..n {
+                w.extend_from_slice(b"1\r\nx\r\n");
+            }
+            w.extend_from_slice(b"0\r\n\r\n");
+            w
+        }
+
+        #[test]
+        fn the_body_cap_counts_decoded_bytes_not_framing() {
+            // 4096 body bytes sent as 4096 one-byte chunks is ~24 KiB on the wire; with a cap of
+            // exactly 4096 it must be accepted (framing overhead is not body).
+            let wire = one_byte_chunks(4096, "");
+            let mut r = &wire[..];
+            let resp = read_response_ext(&mut r, false, 4096, true).unwrap();
+            assert_eq!(resp.body.len(), 4096);
+            // one byte over the decoded cap is refused
+            let wire = one_byte_chunks(4097, "");
+            let mut r = &wire[..];
+            assert!(read_response_ext(&mut r, false, 4096, true).is_err());
+        }
+
+        #[test]
+        fn request_plain_accepts_a_valid_response_in_tiny_chunks() {
+            let l = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let port = l.local_addr().unwrap().port();
+            let wire = one_byte_chunks(20_000, "ETag: \"abc\"\r\n");
+            let t = std::thread::spawn(move || {
+                let (mut c, _) = l.accept().unwrap();
+                let mut head = [0u8; 1024];
+                let _ = c.read(&mut head);
+                c.write_all(&wire).unwrap();
+            });
+            let resp = request_plain("127.0.0.1", port, "GET", "/", &[], &[]).unwrap();
+            t.join().unwrap();
+            assert_eq!(resp.status, 200);
+            assert_eq!(resp.body.len(), 20_000);
+            assert_eq!(resp.header("etag"), Some("\"abc\""));
+        }
+
+        #[test]
+        fn a_close_delimited_body_is_read_to_the_end_and_capped() {
+            let wire = b"HTTP/1.1 200 OK\r\nX-Id: 7\r\n\r\nhello".to_vec();
+            let mut r = &wire[..];
+            let resp = read_response_ext(&mut r, false, 1024, true).unwrap();
+            assert_eq!(resp.body, b"hello");
+            assert_eq!(resp.header("x-id"), Some("7"));
+            let mut r = &wire[..];
+            assert!(read_response_ext(&mut r, false, 4, true).is_err());
+            // the keep-alive reader still treats a frameless body as empty
+            let mut r = &wire[..];
+            assert!(read_response(&mut r, false, 1024).unwrap().body.is_empty());
         }
     }
 }
