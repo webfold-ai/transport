@@ -4507,7 +4507,7 @@ pub mod image {
 
     // ───────────────────────── qcow2 (READ) ─────────────────────────
     //
-    // Spec: QEMU `docs/interop/qcow2.txt`. All multi-byte fields big-endian. We read   CITATION-EXEMPT: the QEMU qcow2 spec, a tree outside `fold`
+    // Spec: QEMU `docs/interop/qcow2.txt`. All multi-byte fields big-endian. We read
     // the header, then flatten the two-level L1/L2 table into one guest-cluster →
     // host-offset map (0 = unallocated → zeros). Uncompressed, no backing file, no
     // encryption — the common `qemu-img convert -O qcow2` output.
@@ -4515,6 +4515,8 @@ pub mod image {
     const QCOW_MAGIC: u32 = 0x5146_49fb; // "QFI\xfb"
     const OFFSET_MASK: u64 = 0x00ff_ffff_ffff_ffff & !0x1ff; // bits 9..55 = offset
     const L2E_COMPRESSED: u64 = 1 << 62;
+    /// Largest guest-cluster map `Qcow2::open` will build (4 GiB = 512M clusters).
+    const MAX_QCOW2_MAP_BYTES: u64 = 4 << 30;
 
     pub struct Qcow2 {
         file: File,
@@ -4555,10 +4557,35 @@ pub mod image {
 
             let l2_entries = cluster / 8;
             let nclusters = size.div_ceil(cluster);
-            let mut map = vec![0u64; nclusters as usize];
+            // Every size below is declared by the (untrusted) header, so check it against
+            // what the file can actually hold before allocating from it.
+            let file_len = file.metadata()?.len();
+            if nclusters > l1_size * l2_entries {
+                return Err(bad(
+                    "qcow2 L1 table is too small for the declared virtual size",
+                ));
+            }
+            let l1_bytes = l1_size * 8; // l1_size is a u32: no overflow
+            if l1_size > 0
+                && l1_off
+                    .checked_add(l1_bytes)
+                    .is_none_or(|end| end > file_len)
+            {
+                return Err(bad("qcow2 L1 table lies beyond the end of the file"));
+            }
+            if nclusters > MAX_QCOW2_MAP_BYTES / 8 {
+                return Err(bad("qcow2 virtual size too large"));
+            }
+            let mut map: Vec<u64> = Vec::new();
+            map.try_reserve_exact(nclusters as usize)
+                .map_err(|_| bad("cannot allocate the qcow2 cluster map"))?;
+            map.resize(nclusters as usize, 0);
 
             // Read each referenced L2 table once, fill the slice of `map` it covers.
-            let mut l1 = vec![0u8; (l1_size * 8) as usize];
+            let mut l1: Vec<u8> = Vec::new();
+            l1.try_reserve_exact(l1_bytes as usize)
+                .map_err(|_| bad("cannot allocate the qcow2 L1 table"))?;
+            l1.resize(l1_bytes as usize, 0);
             if l1_size > 0 {
                 read_full_at(&file, &mut l1, l1_off)?;
             }
@@ -4909,9 +4936,13 @@ pub mod image {
             if &rt[0..4] != b"regi" {
                 return Err(bad("bad VHDX region table signature"));
             }
-            let entry_count = le32(&rt, 8);
+            let file_len = file.metadata()?.len();
+            let entry_count = le32(&rt, 8) as usize;
+            if entry_count > (rt.len() - 16) / 32 {
+                return Err(bad("VHDX region table entry count exceeds the table"));
+            }
             let (mut bat_off, mut bat_len, mut meta_off) = (0u64, 0u64, 0u64);
-            for i in 0..entry_count as usize {
+            for i in 0..entry_count {
                 let e = 16 + i * 32;
                 let guid = &rt[e..e + 16];
                 let off = le64(&rt, e + 16);
@@ -4926,6 +4957,12 @@ pub mod image {
             if bat_off == 0 || meta_off == 0 {
                 return Err(bad("VHDX region table missing BAT or metadata"));
             }
+            if bat_off
+                .checked_add(bat_len)
+                .is_none_or(|end| end > file_len)
+            {
+                return Err(bad("VHDX BAT region lies beyond the end of the file"));
+            }
 
             // Metadata: virtual size, block size, logical sector size.
             let mut md = vec![0u8; 65536];
@@ -4936,8 +4973,16 @@ pub mod image {
             let mcount = u16::from_le_bytes(md[10..12].try_into().unwrap());
             let (mut size, mut block, mut lss) = (0u64, 0u64, 512u64);
             // metadata items may sit beyond 64 KB — read more if needed via a helper.
-            let read_item = |rel: u32, len: u32| -> io::Result<Vec<u8>> {
-                let mut v = vec![0u8; len as usize];
+            // Only the first `need` bytes of an item are used, so read just those, and
+            // only if the item (as declared) lies inside the file.
+            let read_item = |rel: u32, len: u32, need: usize| -> io::Result<Vec<u8>> {
+                let end = meta_off
+                    .checked_add(rel as u64 + len as u64)
+                    .filter(|&e| e <= file_len);
+                if (len as usize) < need || end.is_none() {
+                    return Err(bad("VHDX metadata item lies beyond the end of the file"));
+                }
+                let mut v = vec![0u8; need];
                 read_full_at(&file, &mut v, meta_off + rel as u64)?;
                 Ok(v)
             };
@@ -4950,11 +4995,11 @@ pub mod image {
                 let off = le32(&md, e + 16);
                 let len = le32(&md, e + 20);
                 if guid == GUID_VDISK_SIZE {
-                    size = le64(&read_item(off, len)?, 0);
+                    size = le64(&read_item(off, len, 8)?, 0);
                 } else if guid == GUID_FILE_PARAMS {
-                    block = le32(&read_item(off, len)?, 0) as u64;
+                    block = le32(&read_item(off, len, 4)?, 0) as u64;
                 } else if guid == GUID_LOGICAL_SS {
-                    lss = le32(&read_item(off, len)?, 0) as u64;
+                    lss = le32(&read_item(off, len, 4)?, 0) as u64;
                 }
             }
             if block == 0 || size == 0 {
@@ -4963,9 +5008,23 @@ pub mod image {
                     return Err(bad("VHDX metadata missing block size"));
                 }
             }
+            // The spec's ranges: block 1 MiB..=256 MiB (power of two), sector 512 or 4096,
+            // virtual size at most 64 TiB. This also keeps `chunk_ratio` non-zero.
+            if !block.is_power_of_two() || !(MB..=256 * MB).contains(&block) {
+                return Err(bad("implausible VHDX block size"));
+            }
+            if lss != 512 && lss != 4096 {
+                return Err(bad("implausible VHDX logical sector size"));
+            }
+            if size > 64 << 40 {
+                return Err(bad("VHDX virtual size exceeds the format limit"));
+            }
             let chunk_ratio = (8_388_608u64 * lss) / block;
 
-            let mut batb = vec![0u8; bat_len as usize];
+            let mut batb: Vec<u8> = Vec::new();
+            batb.try_reserve_exact(bat_len as usize)
+                .map_err(|_| bad("cannot allocate the VHDX BAT"))?;
+            batb.resize(bat_len as usize, 0);
             read_full_at(&file, &mut batb, bat_off)?;
             let bat: Vec<u64> = batb
                 .chunks_exact(8)
@@ -5143,9 +5202,241 @@ pub mod image {
 
     #[cfg(test)]
     mod tests {
+        use super::*;
+        use std::path::PathBuf;
+
         #[test]
         fn crc32c_vector() {
             assert_eq!(super::crc32c(b"123456789"), 0xE306_9283);
+        }
+
+        // ---- hostile-image tests (NET-08) ----
+
+        fn scratch(tag: &str) -> PathBuf {
+            let d = std::env::temp_dir().join(format!("img_{tag}_{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&d);
+            std::fs::create_dir_all(&d).unwrap();
+            d
+        }
+
+        /// A raw image with data at both ends and a hole between.
+        fn raw_image(dir: &Path, len: usize) -> (PathBuf, Vec<u8>) {
+            let mut v = vec![0u8; len];
+            v[..4].copy_from_slice(b"HEAD");
+            v[len - 4..].copy_from_slice(b"TAIL");
+            let p = dir.join("in.raw");
+            std::fs::write(&p, &v).unwrap();
+            (p, v)
+        }
+
+        fn read_all(s: &Source) -> Vec<u8> {
+            let mut out = vec![0u8; s.size().unwrap() as usize];
+            let n = s.read_at(0, &mut out).unwrap();
+            assert_eq!(n, out.len());
+            out
+        }
+
+        fn valid_qcow2(dir: &Path) -> PathBuf {
+            let (raw, _) = raw_image(dir, 3 << 20);
+            let dst = dir.join("v.qcow2");
+            write_qcow2(&Source::open(&raw, Format::Raw).unwrap(), &dst, 16).unwrap();
+            dst
+        }
+
+        fn valid_vhdx(dir: &Path) -> PathBuf {
+            let (raw, _) = raw_image(dir, 5 << 20);
+            let dst = dir.join("v.vhdx");
+            write_vhdx(&Source::open(&raw, Format::Raw).unwrap(), &dst, 512).unwrap();
+            dst
+        }
+
+        fn patch(path: &Path, at: u64, bytes: &[u8]) {
+            use std::io::{Seek, SeekFrom, Write};
+            let mut f = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+            f.seek(SeekFrom::Start(at)).unwrap();
+            f.write_all(bytes).unwrap();
+        }
+
+        fn open_err(path: &Path, fmt: Format) -> io::Error {
+            match Source::open(path, fmt) {
+                Ok(_) => panic!("hostile image was accepted"),
+                Err(e) => e,
+            }
+        }
+
+        #[test]
+        fn valid_images_still_round_trip() {
+            let d = scratch("rt");
+            let (raw, want) = raw_image(&d, 3 << 20);
+            let q = d.join("a.qcow2");
+            write_qcow2(&Source::open(&raw, Format::Raw).unwrap(), &q, 16).unwrap();
+            assert_eq!(read_all(&Source::open(&q, Format::Qcow2).unwrap()), want);
+            let (raw, want) = raw_image(&d, 5 << 20);
+            let v = d.join("a.vhdx");
+            write_vhdx(&Source::open(&raw, Format::Raw).unwrap(), &v, 512).unwrap();
+            assert_eq!(read_all(&Source::open(&v, Format::Vhdx).unwrap()), want);
+            let _ = std::fs::remove_dir_all(&d);
+        }
+
+        #[test]
+        fn qcow2_header_declaring_an_absurd_virtual_size_is_rejected() {
+            let d = scratch("q_huge");
+            let p = d.join("evil.qcow2");
+            let mut h = vec![0u8; 4096];
+            h[0..4].copy_from_slice(&QCOW_MAGIC.to_be_bytes());
+            h[4..8].copy_from_slice(&3u32.to_be_bytes());
+            h[20..24].copy_from_slice(&9u32.to_be_bytes()); // 512-byte clusters
+            h[24..32].copy_from_slice(&(1u64 << 62).to_be_bytes());
+            h[36..40].copy_from_slice(&1u32.to_be_bytes());
+            h[40..48].copy_from_slice(&512u64.to_be_bytes());
+            std::fs::write(&p, &h).unwrap();
+            assert_eq!(
+                open_err(&p, Format::Qcow2).kind(),
+                io::ErrorKind::InvalidData
+            );
+            let _ = std::fs::remove_dir_all(&d);
+        }
+
+        #[test]
+        fn qcow2_l1_size_beyond_the_file_is_rejected() {
+            let d = scratch("q_l1");
+            let p = valid_qcow2(&d);
+            patch(&p, 36, &u32::MAX.to_be_bytes());
+            assert_eq!(
+                open_err(&p, Format::Qcow2).kind(),
+                io::ErrorKind::InvalidData
+            );
+            let _ = std::fs::remove_dir_all(&d);
+        }
+
+        #[test]
+        fn qcow2_l1_table_offset_beyond_the_file_is_rejected() {
+            let d = scratch("q_l1off");
+            let p = valid_qcow2(&d);
+            patch(&p, 40, &(1u64 << 40).to_be_bytes());
+            assert_eq!(
+                open_err(&p, Format::Qcow2).kind(),
+                io::ErrorKind::InvalidData
+            );
+            let _ = std::fs::remove_dir_all(&d);
+        }
+
+        #[test]
+        fn qcow2_l1_too_small_for_the_declared_size_is_rejected() {
+            let d = scratch("q_small");
+            let p = valid_qcow2(&d);
+            patch(&p, 24, &(100u64 << 30).to_be_bytes()); // claims 100 GiB, L1 covers 3 MiB
+            assert_eq!(
+                open_err(&p, Format::Qcow2).kind(),
+                io::ErrorKind::InvalidData
+            );
+            let _ = std::fs::remove_dir_all(&d);
+        }
+
+        /// (offset of the region-table entry for `guid`, its file offset field, its length field)
+        fn region_entry(path: &Path, guid: &[u8; 16]) -> (u64, u64) {
+            let f = File::open(path).unwrap();
+            let mut rt = vec![0u8; 65536];
+            read_full_at(&f, &mut rt, 0x30000).unwrap();
+            let n = le32(&rt, 8) as usize;
+            for i in 0..n {
+                let e = 16 + i * 32;
+                if &rt[e..e + 16] == guid {
+                    return (0x30000 + e as u64, le64(&rt, e + 16));
+                }
+            }
+            panic!("region not found");
+        }
+
+        /// Absolute file offset of the 32-byte metadata table entry for `guid`.
+        fn meta_entry(path: &Path, guid: &[u8; 16]) -> u64 {
+            let (_, meta_off) = region_entry(path, &GUID_METADATA);
+            let f = File::open(path).unwrap();
+            let mut md = vec![0u8; 65536];
+            read_full_at(&f, &mut md, meta_off).unwrap();
+            let n = u16::from_le_bytes(md[10..12].try_into().unwrap()) as usize;
+            for i in 0..n {
+                let e = 32 + i * 32;
+                if &md[e..e + 16] == guid {
+                    return meta_off + e as u64;
+                }
+            }
+            panic!("metadata item not found");
+        }
+
+        #[test]
+        fn vhdx_region_table_entry_count_beyond_the_table_is_rejected() {
+            let d = scratch("v_rt");
+            let p = valid_vhdx(&d);
+            patch(&p, 0x30000 + 8, &u32::MAX.to_le_bytes());
+            assert_eq!(
+                open_err(&p, Format::Vhdx).kind(),
+                io::ErrorKind::InvalidData
+            );
+            let _ = std::fs::remove_dir_all(&d);
+        }
+
+        #[test]
+        fn vhdx_bat_region_longer_than_the_file_is_rejected() {
+            let d = scratch("v_bat");
+            let p = valid_vhdx(&d);
+            let (e, _) = region_entry(&p, &GUID_BAT);
+            patch(&p, e + 24, &(256u32 << 20).to_le_bytes());
+            assert_eq!(
+                open_err(&p, Format::Vhdx).kind(),
+                io::ErrorKind::InvalidData
+            );
+            let _ = std::fs::remove_dir_all(&d);
+        }
+
+        #[test]
+        fn vhdx_metadata_item_length_beyond_the_file_is_rejected() {
+            let d = scratch("v_item");
+            let p = valid_vhdx(&d);
+            let e = meta_entry(&p, &GUID_VDISK_SIZE);
+            patch(&p, e + 20, &u32::MAX.to_le_bytes());
+            assert_eq!(
+                open_err(&p, Format::Vhdx).kind(),
+                io::ErrorKind::InvalidData
+            );
+            let _ = std::fs::remove_dir_all(&d);
+        }
+
+        #[test]
+        fn vhdx_zero_logical_sector_size_is_rejected_not_a_division_by_zero() {
+            let d = scratch("v_lss");
+            let p = valid_vhdx(&d);
+            let (_, meta_off) = region_entry(&p, &GUID_METADATA);
+            let e = meta_entry(&p, &GUID_LOGICAL_SS);
+            let f = File::open(&p).unwrap();
+            let mut ent = [0u8; 32];
+            read_full_at(&f, &mut ent, e).unwrap();
+            let item = meta_off + le32(&ent, 16) as u64;
+            patch(&p, item, &0u32.to_le_bytes());
+            // either open refuses, or reading must not panic
+            match Source::open(&p, Format::Vhdx) {
+                Err(e) => assert_eq!(e.kind(), io::ErrorKind::InvalidData),
+                Ok(s) => panic!("accepted a zero logical sector size ({})", s.describe()),
+            }
+            let _ = std::fs::remove_dir_all(&d);
+        }
+
+        #[test]
+        fn vhdx_implausible_block_size_is_rejected() {
+            let d = scratch("v_block");
+            let p = valid_vhdx(&d);
+            let (_, meta_off) = region_entry(&p, &GUID_METADATA);
+            let e = meta_entry(&p, &GUID_FILE_PARAMS);
+            let f = File::open(&p).unwrap();
+            let mut ent = [0u8; 32];
+            read_full_at(&f, &mut ent, e).unwrap();
+            let item = meta_off + le32(&ent, 16) as u64;
+            patch(&p, item, &3u32.to_le_bytes()); // not a power of two, far below 1 MiB
+            assert_eq!(
+                open_err(&p, Format::Vhdx).kind(),
+                io::ErrorKind::InvalidData
+            );
+            let _ = std::fs::remove_dir_all(&d);
         }
     }
 }
