@@ -4652,10 +4652,12 @@ pub mod s3 {
                     scanned: 0,
                     clean: 0,
                     threats: Vec::new(),
+                    unreadable: Vec::new(),
                 });
             }
             let threats: std::sync::Mutex<Vec<(String, Vec<String>)>> =
                 std::sync::Mutex::new(Vec::new());
+            let unreadable: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
             let clean = AtomicU64::new(0);
             let p = threads.max(1).min(n);
             let per = n.div_ceil(p);
@@ -4667,7 +4669,7 @@ pub mod s3 {
                     if lo >= hi {
                         continue;
                     }
-                    let (threats, clean) = (&threats, &clean);
+                    let (threats, unreadable, clean) = (&threats, &unreadable, &clean);
                     s.spawn(move || {
                         let mut conn: Option<TlsClient> = self.dial().ok();
                         for key in &keys_ref[lo..hi] {
@@ -4686,7 +4688,12 @@ pub mod s3 {
                                     }
                                 }
                             }
-                            let hits = scan::residual(&body.unwrap_or_default(), sigs);
+                            let Some(body) = body else {
+                                // Every GET failed: the object was not examined, so it is not clean.
+                                unreadable.lock().unwrap().push(key.clone());
+                                continue;
+                            };
+                            let hits = scan::residual(&body, sigs);
                             if hits.is_empty() {
                                 clean.fetch_add(1, Ordering::Relaxed);
                             } else {
@@ -4701,10 +4708,13 @@ pub mod s3 {
             });
             let mut threats = threats.into_inner().unwrap();
             threats.sort_by(|a, b| a.0.cmp(&b.0));
+            let mut unreadable = unreadable.into_inner().unwrap();
+            unreadable.sort();
             Ok(scan::ScanReport {
                 scanned: n as u64,
                 clean: clean.into_inner(),
                 threats,
+                unreadable,
             })
         }
 
@@ -5174,12 +5184,15 @@ pub mod scan {
         pub clean: u64,
         /// (name, matched signatures) for each node whose residual ≠ 0.
         pub threats: Vec<(String, Vec<String>)>,
+        /// Nodes whose bytes could not be read or fetched. They were not examined, so they are
+        /// neither clean nor a threat, and a report with any of them is not clean.
+        pub unreadable: Vec<String>,
     }
 
     impl ScanReport {
-        /// The encircle readout: clean iff every node's residual is 0.
+        /// The encircle readout: clean iff every node was read and its residual is 0.
         pub fn is_clean(&self) -> bool {
-            self.threats.is_empty()
+            self.threats.is_empty() && self.unreadable.is_empty()
         }
     }
 
@@ -5226,9 +5239,11 @@ pub mod scan {
                 scanned: 0,
                 clean: 0,
                 threats: Vec::new(),
+                unreadable: Vec::new(),
             };
         }
         let threats: Mutex<Vec<(String, Vec<String>)>> = Mutex::new(Vec::new());
+        let unreadable: Mutex<Vec<String>> = Mutex::new(Vec::new());
         let clean = std::sync::atomic::AtomicU64::new(0);
         let p = threads.max(1).min(n);
         let per = n.div_ceil(p);
@@ -5239,10 +5254,13 @@ pub mod scan {
                 if lo >= hi {
                     continue;
                 }
-                let (threats, clean, fetch) = (&threats, &clean, &fetch);
+                let (threats, unreadable, clean, fetch) = (&threats, &unreadable, &clean, &fetch);
                 s.spawn(move || {
                     for (item, name) in &items[lo..hi] {
-                        let data = fetch(item).unwrap_or_default();
+                        let Some(data) = fetch(item) else {
+                            unreadable.lock().unwrap().push(name.clone());
+                            continue;
+                        };
                         let hits = residual(&data, sigs);
                         if hits.is_empty() {
                             clean.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -5258,10 +5276,13 @@ pub mod scan {
         });
         let mut threats = threats.into_inner().unwrap();
         threats.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut unreadable = unreadable.into_inner().unwrap();
+        unreadable.sort();
         ScanReport {
             scanned: n as u64,
             clean: clean.into_inner(),
             threats,
+            unreadable,
         }
     }
 
@@ -5283,6 +5304,21 @@ pub mod scan {
             buf.extend_from_slice(eicar);
             buf.extend_from_slice(&[0u8; 1000]);
             assert!(!residual(&buf, &sigs).is_empty());
+        }
+
+        #[test]
+        fn an_item_that_cannot_be_fetched_is_not_certified_clean() {
+            let sigs = default_sigs();
+            let items = vec![(0u8, "ok".to_string()), (1u8, "gone".to_string())];
+            let r = scan_named(&items, &sigs, 2, |&i| (i == 0).then(|| b"hello".to_vec()));
+            assert_eq!(r.scanned, 2);
+            assert_eq!(r.clean, 1, "only the item that was read is clean");
+            assert_eq!(r.unreadable, vec!["gone".to_string()]);
+            assert!(r.threats.is_empty());
+            assert!(!r.is_clean(), "an unexamined item must not give ALL CLEAN");
+
+            let r = scan_named(&items, &sigs, 2, |_| Some(b"hello".to_vec()));
+            assert!(r.is_clean() && r.clean == 2 && r.unreadable.is_empty());
         }
     }
 }

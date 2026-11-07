@@ -280,14 +280,21 @@ fn cmd_s3(args: &[String]) -> ExitCode {
                 let r = scan::scan_named(&files, &sigs, threads, |t| std::fs::read(t).ok());
                 if !r.is_clean() {
                     eprintln!(
-                        "syncfold s3: scan found {} THREAT(S) — quarantined, NOT uploaded:",
-                        r.threats.len()
+                        "syncfold s3: scan found {} THREAT(S) and {} UNREADABLE file(s) — not uploaded:",
+                        r.threats.len(),
+                        r.unreadable.len()
                     );
                     for (name, hits) in &r.threats {
                         eprintln!("  ⛔ {name} — {}", hits.join(", "));
                     }
+                    for name in &r.unreadable {
+                        eprintln!("  ? {name} — could not be read, so it was not scanned");
+                    }
                     let mut bad = hashtrinity::Table::new();
                     for (n, _) in &r.threats {
+                        bad.mark(n.clone());
+                    }
+                    for n in &r.unreadable {
                         bad.mark(n.clone());
                     }
                     files.retain(|(_, key)| !bad.has(key));
@@ -671,13 +678,17 @@ fn report_scan(r: &scan::ScanReport) -> ExitCode {
         ExitCode::SUCCESS
     } else {
         eprintln!(
-            "syncfold scan: {} scanned, {} clean, {} THREAT(S):",
+            "syncfold scan: {} scanned, {} clean, {} THREAT(S), {} UNREADABLE (not scanned):",
             r.scanned,
             r.clean,
-            r.threats.len()
+            r.threats.len(),
+            r.unreadable.len()
         );
         for (name, hits) in &r.threats {
             eprintln!("  ⛔ {name} — {}", hits.join(", "));
+        }
+        for name in &r.unreadable {
+            eprintln!("  ? {name} — could not be read");
         }
         ExitCode::from(1)
     }
