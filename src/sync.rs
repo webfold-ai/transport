@@ -1,5 +1,5 @@
-//! Library surface for `syncfold` — lets other crates (e.g. Galvanize's
-//! tfplugin6 client) reuse the protocol-layer pieces (HPACK, HTTP/2 framing,
+//! Library surface for `syncfold` — lets other crates (e.g. a sibling project's
+//! Terraform-plugin client) reuse the protocol-layer pieces (HPACK, HTTP/2 framing,
 //! gRPC message framing, ECDSA/X.509 cert generation) without depending on
 //! the sync tool's own binary. `main.rs` is a thin CLI wrapper over this same
 //! module tree — one set of modules, two crate roots (lib + bin), the
