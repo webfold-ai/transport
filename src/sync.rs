@@ -210,7 +210,7 @@ pub mod archive {
             let plen = c.u16()?;
             let path = std::str::from_utf8(c.take(plen)?)
                 .map_err(|_| Error::new(ErrorKind::InvalidData, "bad path"))?;
-            let dst = root.join(path);
+            let dst = confined(root, path)?;
             match kind {
                 b'd' => {
                     fs::create_dir_all(&dst)?;
@@ -234,6 +234,7 @@ pub mod archive {
                     if let Some(parent) = dst.parent() {
                         fs::create_dir_all(parent)?;
                     }
+                    clear_symlink(&dst)?;
                     fs::write(&dst, data)?;
                     sysio::set_mode_path(&dst, mode)?;
                     let mt = SystemTime::UNIX_EPOCH + Duration::new(secs, nanos);
@@ -273,7 +274,7 @@ pub mod archive {
             r.read_exact(&mut pbytes)?;
             let path = std::str::from_utf8(&pbytes)
                 .map_err(|_| Error::new(ErrorKind::InvalidData, "bad path"))?;
-            let dst = root.join(path);
+            let dst = confined(root, path)?;
             match k[0] {
                 b'd' => {
                     fs::create_dir_all(&dst)?;
@@ -298,6 +299,7 @@ pub mod archive {
                     if let Some(p) = dst.parent() {
                         fs::create_dir_all(p)?;
                     }
+                    clear_symlink(&dst)?;
                     let mut f = File::create(&dst)?;
                     let mut remaining = len;
                     let mut buf = vec![0u8; 1 << 20];
@@ -351,6 +353,50 @@ pub mod archive {
         Ok(u64::from_be_bytes(b))
     }
 
+    /// The destination for an archive entry, or an error if the entry would land outside `root`.
+    ///
+    /// Only plain path components are accepted: an absolute path, a `..` component or a path with no
+    /// component is refused. No existing ancestor below `root` may be a symlink, so an earlier
+    /// symlink entry cannot redirect a later entry out of the tree.
+    fn confined(root: &Path, rel: &str) -> io::Result<std::path::PathBuf> {
+        use std::path::Component;
+        let bad = || Error::new(ErrorKind::InvalidData, format!("unsafe archive path: {rel:?}"));
+        let mut names = Vec::new();
+        for c in Path::new(rel).components() {
+            match c {
+                Component::Normal(n) => names.push(n),
+                Component::CurDir => {}
+                _ => return Err(bad()),
+            }
+        }
+        let Some((_, parents)) = names.split_last() else {
+            return Err(bad());
+        };
+        let mut cur = root.to_path_buf();
+        for n in parents {
+            cur.push(n);
+            match fs::symlink_metadata(&cur) {
+                Ok(m) if m.file_type().is_symlink() => return Err(bad()),
+                Ok(_) => {}
+                Err(e) if e.kind() == ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+        }
+        let mut dst = root.to_path_buf();
+        dst.extend(names);
+        Ok(dst)
+    }
+
+    /// Remove a symlink at `dst` so that creating a file there cannot write through it.
+    fn clear_symlink(dst: &Path) -> io::Result<()> {
+        match fs::symlink_metadata(dst) {
+            Ok(m) if m.file_type().is_symlink() => fs::remove_file(dst),
+            Ok(_) => Ok(()),
+            Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Count of leaf files in a tree (for reporting "N objects → 1").
     pub fn count_files(root: &Path) -> u64 {
         fn rec(p: &Path) -> u64 {
@@ -391,6 +437,97 @@ pub mod archive {
                 fs::read(dst.join("sub/b.bin")).unwrap(),
                 vec![0u8, 1, 2, 3, 255]
             );
+            let _ = fs::remove_dir_all(&base);
+        }
+
+        /// One archive entry: `kind`, path, then the kind's fields.
+        fn entry(kind: u8, path: &str, rest: &[u8]) -> Vec<u8> {
+            let mut e = vec![kind];
+            e.extend_from_slice(&(path.len() as u16).to_be_bytes());
+            e.extend_from_slice(path.as_bytes());
+            e.extend_from_slice(rest);
+            e
+        }
+        fn file_fields(data: &[u8]) -> Vec<u8> {
+            let mut f = 0o644u32.to_be_bytes().to_vec();
+            f.extend_from_slice(&0u64.to_be_bytes());
+            f.extend_from_slice(&0u32.to_be_bytes());
+            f.extend_from_slice(&(data.len() as u64).to_be_bytes());
+            f.extend_from_slice(data);
+            f
+        }
+        fn link_fields(target: &str) -> Vec<u8> {
+            let mut f = (target.len() as u32).to_be_bytes().to_vec();
+            f.extend_from_slice(target.as_bytes());
+            f
+        }
+        fn blob(entries: &[Vec<u8>]) -> Vec<u8> {
+            let mut b = MAGIC.to_vec();
+            for e in entries {
+                b.extend_from_slice(e);
+            }
+            b
+        }
+
+        /// Both extractors, on the same blob: neither may write outside `root`.
+        fn refuses(b: &[u8], root: &Path) {
+            assert!(unpack(b, root).is_err(), "unpack accepted an escaping entry");
+            let mut r = b;
+            assert!(unpack_stream(&mut r, root).is_err(), "unpack_stream accepted an escaping entry");
+        }
+
+        #[test]
+        fn unpack_refuses_dotdot_and_absolute_paths() {
+            let base = std::env::temp_dir().join(format!("sfar_esc_{}", std::process::id()));
+            let _ = fs::remove_dir_all(&base);
+            let root = base.join("root");
+            fs::create_dir_all(&base).unwrap();
+            let outside = base.join("outside");
+            let abs = base.join("abs_target");
+            refuses(&blob(&[entry(b'f', "../outside", &file_fields(b"x"))]), &root);
+            refuses(&blob(&[entry(b'f', "a/../../outside", &file_fields(b"x"))]), &root);
+            refuses(&blob(&[entry(b'f', abs.to_str().unwrap(), &file_fields(b"x"))]), &root);
+            refuses(&blob(&[entry(b'd', "../outdir", &[])]), &root);
+            refuses(&blob(&[entry(b'f', "", &file_fields(b"x"))]), &root);
+            assert!(!outside.exists() && !abs.exists() && !base.join("outdir").exists());
+            let _ = fs::remove_dir_all(&base);
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn unpack_does_not_write_through_a_symlink_entry() {
+            let base = std::env::temp_dir().join(format!("sfar_lnk_{}", std::process::id()));
+            let _ = fs::remove_dir_all(&base);
+            let root = base.join("root");
+            let outside = base.join("outside_dir");
+            fs::create_dir_all(&outside).unwrap();
+            // A symlink entry that points out of the tree, then a file entry beneath it.
+            let b = blob(&[
+                entry(b'l', "link", &link_fields(outside.to_str().unwrap())),
+                entry(b'f', "link/pwned", &file_fields(b"x")),
+            ]);
+            refuses(&b, &root);
+            assert!(!outside.join("pwned").exists());
+            let _ = fs::remove_dir_all(&base);
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn unpack_replaces_a_symlink_at_the_destination_instead_of_following_it() {
+            let base = std::env::temp_dir().join(format!("sfar_dst_{}", std::process::id()));
+            let _ = fs::remove_dir_all(&base);
+            let root = base.join("root");
+            fs::create_dir_all(&root).unwrap();
+            let victim = base.join("victim");
+            fs::write(&victim, b"keep").unwrap();
+            std::os::unix::fs::symlink(&victim, root.join("f")).unwrap();
+            let b = blob(&[entry(b'f', "f", &file_fields(b"new"))]);
+            unpack(&b, &root).unwrap();
+            let mut r = &b[..];
+            unpack_stream(&mut r, &root).unwrap();
+            assert_eq!(fs::read(&victim).unwrap(), b"keep");
+            assert_eq!(fs::read(root.join("f")).unwrap(), b"new");
+            assert!(!fs::symlink_metadata(root.join("f")).unwrap().file_type().is_symlink());
             let _ = fs::remove_dir_all(&base);
         }
     }
