@@ -3359,9 +3359,40 @@ pub mod http {
 
     #![allow(dead_code)]
 
-    use std::io::{self, Error, ErrorKind, Write};
+    use std::io::{self, Error, ErrorKind, Read, Write};
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     use crate::sync::tls::client::TlsClient;
+
+    /// Default ceiling on a response body (1 GiB); see [`set_max_response_bytes`].
+    pub const DEFAULT_MAX_RESPONSE_BYTES: u64 = 1 << 30;
+    static MAX_RESPONSE_BYTES: AtomicU64 = AtomicU64::new(DEFAULT_MAX_RESPONSE_BYTES);
+    /// Longest response head (status line + headers) the plain client will buffer.
+    const MAX_HEAD_BYTES: usize = 64 * 1024;
+    /// Longest chunk-size line the plain client will buffer.
+    const MAX_CHUNK_LINE: usize = 1024;
+    /// Idle limit on plain-HTTP sockets (connect-to-close reads/writes).
+    const PLAIN_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+    /// Cap the response body this client will accept from a peer (default
+    /// [`DEFAULT_MAX_RESPONSE_BYTES`]). A response that declares or delivers more is
+    /// refused with `InvalidData`; buffers grow as data arrives, never from a declared
+    /// length. Raise it for objects larger than 1 GiB. Process-wide.
+    pub fn set_max_response_bytes(n: u64) {
+        MAX_RESPONSE_BYTES.store(n, Ordering::Relaxed);
+    }
+
+    /// The current response-body cap (see [`set_max_response_bytes`]).
+    pub fn max_response_bytes() -> u64 {
+        MAX_RESPONSE_BYTES.load(Ordering::Relaxed)
+    }
+
+    fn too_large() -> Error {
+        Error::new(
+            ErrorKind::InvalidData,
+            "HTTP response larger than the configured maximum (see http::set_max_response_bytes)",
+        )
+    }
 
     pub struct Response {
         pub status: u16,
@@ -3392,7 +3423,11 @@ pub mod http {
         let mut c = TlsClient::connect(host, port, verify)?;
         write_request(&mut c, host, port, method, path, extra_headers, body)?;
         let raw = c.recv_all()?; // the Web sweep: decrypt records across all cores
-        parse_response(&raw)
+        parse_response(
+            &raw,
+            method.eq_ignore_ascii_case("HEAD"),
+            max_response_bytes(),
+        )
     }
 
     /// One plain HTTP/1.1 request over TCP (no TLS) — for loopback S3 reads where the data and
@@ -3409,10 +3444,22 @@ pub mod http {
         use std::io::Read;
         use std::net::TcpStream;
         let mut c = TcpStream::connect((host, port))?;
+        c.set_read_timeout(Some(PLAIN_IO_TIMEOUT))?;
+        c.set_write_timeout(Some(PLAIN_IO_TIMEOUT))?;
         write_request(&mut c, host, port, method, path, extra_headers, body)?;
+        let max = max_response_bytes();
+        // head + body + chunk framing slack; the Vec grows as bytes arrive
+        let limit = max
+            .saturating_add(max / 64)
+            .saturating_add(MAX_HEAD_BYTES as u64);
         let mut raw = Vec::new();
-        c.read_to_end(&mut raw)?;
-        parse_response(&raw)
+        (&mut c)
+            .take(limit.saturating_add(1))
+            .read_to_end(&mut raw)?;
+        if raw.len() as u64 > limit {
+            return Err(too_large());
+        }
+        parse_response(&raw, method.eq_ignore_ascii_case("HEAD"), max)
     }
 
     /// One plain HTTP request on an EXISTING connection, keep-alive: writes the request, reads
@@ -3428,7 +3475,182 @@ pub mod http {
         extra_headers: &[(String, String)],
         body: &[u8],
     ) -> io::Result<Response> {
-        use std::io::Write;
+        request_plain_on_max(
+            conn,
+            host,
+            port,
+            method,
+            path,
+            extra_headers,
+            body,
+            max_response_bytes(),
+        )
+    }
+
+    /// One CRLF-terminated line, including the CRLF, read a byte at a time so nothing past it is
+    /// consumed from a keep-alive connection. At most `max` bytes are buffered for it.
+    fn read_crlf_line<R: Read>(conn: &mut R, what: &str, max: usize) -> io::Result<Vec<u8>> {
+        let mut line = Vec::new();
+        let mut b = [0u8; 1];
+        loop {
+            match conn.read(&mut b) {
+                Ok(0) => {
+                    return Err(Error::new(
+                        ErrorKind::UnexpectedEof,
+                        format!("eof in {what}"),
+                    ))
+                }
+                Ok(_) => {
+                    line.push(b[0]);
+                    if line.ends_with(b"\r\n") {
+                        return Ok(line);
+                    }
+                    if line.len() > max {
+                        return Err(Error::new(
+                            ErrorKind::InvalidData,
+                            format!("{what} too long"),
+                        ));
+                    }
+                }
+                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// Read exactly one HTTP/1.1 response from `conn`: the head, then the body by chunked framing
+    /// or Content-Length, leaving the connection positioned at the next response. `head_only` is
+    /// set for a HEAD request. Every length the peer declares is checked against `max` before
+    /// anything is buffered for it.
+    fn read_response<R: Read>(conn: &mut R, head_only: bool, max: u64) -> io::Result<Response> {
+        // Read one response head, then the body per its framing.
+        let mut buf = Vec::with_capacity(8192);
+        let head_end = loop {
+            let mut b = [0u8; 1];
+            match conn.read(&mut b) {
+                Ok(0) => {
+                    return Err(Error::new(
+                        ErrorKind::UnexpectedEof,
+                        "eof in response head",
+                    ))
+                }
+                Ok(_) => {
+                    buf.push(b[0]);
+                    if buf.len() >= 4 && &buf[buf.len() - 4..] == b"\r\n\r\n" {
+                        break buf.len();
+                    }
+                    if buf.len() > MAX_HEAD_BYTES {
+                        return Err(Error::new(
+                            ErrorKind::InvalidData,
+                            "response head too large",
+                        ));
+                    }
+                }
+                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            }
+        };
+        let head =
+            std::str::from_utf8(&buf[..head_end]).map_err(|_| io::Error::other("non-utf8 head"))?;
+        let mut lines = head.split("\r\n");
+        let status = lines
+            .next()
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|s| s.parse::<u16>().ok())
+            .ok_or_else(|| io::Error::other("bad status line"))?;
+        let mut content_length = 0u64;
+        let mut chunked = false;
+        for l in lines {
+            if let Some((k, v)) = l.split_once(':') {
+                let (k, v) = (k.trim().to_ascii_lowercase(), v.trim());
+                if k == "content-length" {
+                    content_length = v
+                        .parse()
+                        .map_err(|_| Error::new(ErrorKind::InvalidData, "bad Content-Length"))?;
+                }
+                if k == "transfer-encoding" && v.to_ascii_lowercase().contains("chunked") {
+                    chunked = true;
+                }
+            }
+        }
+        let body = if head_only || status == 204 || status == 304 {
+            Vec::new() // no body follows, whatever the headers declare
+        } else if chunked {
+            let mut out: Vec<u8> = Vec::new();
+            loop {
+                let size_line = read_crlf_line(conn, "chunk size", MAX_CHUNK_LINE)?;
+                let size = u64::from_str_radix(
+                    std::str::from_utf8(&size_line[..size_line.len() - 2])
+                        .unwrap_or("")
+                        .split(';')
+                        .next()
+                        .unwrap_or("0")
+                        .trim(),
+                    16,
+                )
+                .map_err(|_| Error::new(ErrorKind::InvalidData, "bad chunk size"))?;
+                if size == 0 {
+                    // Consume the trailer section, up to and including its blank line, so the
+                    // next response on this connection starts at its own status line.
+                    loop {
+                        if read_crlf_line(conn, "chunk trailer", MAX_HEAD_BYTES)?.len() == 2 {
+                            break;
+                        }
+                    }
+                    break;
+                }
+                if size > max.saturating_sub(out.len() as u64) {
+                    return Err(too_large());
+                }
+                let got = (&mut *conn).take(size).read_to_end(&mut out)? as u64;
+                if got != size {
+                    return Err(Error::new(ErrorKind::UnexpectedEof, "truncated chunk"));
+                }
+                let mut crlf = [0u8; 2];
+                conn.read_exact(&mut crlf)?;
+                if &crlf != b"\r\n" {
+                    return Err(Error::new(
+                        ErrorKind::InvalidData,
+                        "missing chunk terminator",
+                    ));
+                }
+            }
+            out
+        } else if content_length > 0 {
+            if content_length > max {
+                return Err(too_large());
+            }
+            // grow as bytes arrive: never allocate from the declared length
+            let mut out = Vec::new();
+            let got = (&mut *conn).take(content_length).read_to_end(&mut out)? as u64;
+            if got != content_length {
+                return Err(Error::new(
+                    ErrorKind::UnexpectedEof,
+                    "truncated response body",
+                ));
+            }
+            out
+        } else {
+            Vec::new()
+        };
+        Ok(Response {
+            status,
+            headers: vec![],
+            body,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn request_plain_on_max(
+        conn: &mut std::net::TcpStream,
+        host: &str,
+        port: u16,
+        method: &str,
+        path: &str,
+        extra_headers: &[(String, String)],
+        body: &[u8],
+        max: u64,
+    ) -> io::Result<Response> {
         let host_hdr = if port == 443 {
             host.to_string()
         } else {
@@ -3446,124 +3668,7 @@ pub mod http {
         }
         conn.flush()?;
 
-        read_response(conn)
-    }
-
-    /// One CRLF-terminated line, including the CRLF, read a byte at a time so nothing past it is
-    /// consumed from a keep-alive connection.
-    fn read_crlf_line<R: std::io::Read>(conn: &mut R, what: &str) -> io::Result<Vec<u8>> {
-        const MAX: usize = 64 * 1024;
-        let mut line = Vec::new();
-        let mut b = [0u8; 1];
-        loop {
-            match conn.read(&mut b) {
-                Ok(0) => {
-                    return Err(io::Error::new(
-                        ErrorKind::UnexpectedEof,
-                        format!("eof in {what}"),
-                    ))
-                }
-                Ok(_) => {
-                    line.push(b[0]);
-                    if line.ends_with(b"\r\n") {
-                        return Ok(line);
-                    }
-                    if line.len() > MAX {
-                        return Err(io::Error::other(format!("{what} line too long")));
-                    }
-                }
-                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
-                Err(e) => return Err(e),
-            }
-        }
-    }
-
-    /// Read exactly one HTTP/1.1 response from `conn`: the head, then the body by chunked framing
-    /// or Content-Length, leaving the connection positioned at the next response.
-    fn read_response<R: std::io::Read>(conn: &mut R) -> io::Result<Response> {
-        // Read one response head, then the body per Content-Length.
-        let mut buf = Vec::with_capacity(8192);
-        let head_end = loop {
-            let mut b = [0u8; 1];
-            match conn.read(&mut b) {
-                Ok(0) => {
-                    return Err(io::Error::new(
-                        ErrorKind::UnexpectedEof,
-                        "eof in response head",
-                    ))
-                }
-                Ok(_) => {
-                    buf.push(b[0]);
-                    if buf.len() >= 4 && &buf[buf.len() - 4..] == b"\r\n\r\n" {
-                        break buf.len();
-                    }
-                }
-                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
-                Err(e) => return Err(e),
-            }
-        };
-        let head =
-            std::str::from_utf8(&buf[..head_end]).map_err(|_| io::Error::other("non-utf8 head"))?;
-        let mut lines = head.split("\r\n");
-        let status = lines
-            .next()
-            .and_then(|l| l.split_whitespace().nth(1))
-            .and_then(|s| s.parse::<u16>().ok())
-            .ok_or_else(|| io::Error::other("bad status line"))?;
-        let mut content_length = 0usize;
-        let mut chunked = false;
-        for l in lines {
-            if let Some((k, v)) = l.split_once(':') {
-                let (k, v) = (k.trim().to_ascii_lowercase(), v.trim());
-                if k == "content-length" {
-                    content_length = v.parse().unwrap_or(0);
-                }
-                if k == "transfer-encoding" && v.to_ascii_lowercase().contains("chunked") {
-                    chunked = true;
-                }
-            }
-        }
-        let body = if chunked {
-            let mut out = Vec::new();
-            loop {
-                let size_line = read_crlf_line(conn, "chunk size")?;
-                let size = usize::from_str_radix(
-                    std::str::from_utf8(&size_line[..size_line.len() - 2])
-                        .unwrap_or("")
-                        .split(';')
-                        .next()
-                        .unwrap_or("0")
-                        .trim(),
-                    16,
-                )
-                .map_err(|_| io::Error::other("bad chunk size"))?;
-                if size == 0 {
-                    // Consume the trailer section, up to and including its blank line, so the
-                    // next response on this connection starts at its own status line.
-                    loop {
-                        if read_crlf_line(conn, "chunk trailer")?.len() == 2 {
-                            break;
-                        }
-                    }
-                    break;
-                }
-                let mut chunk = vec![0u8; size + 2];
-                conn.read_exact(&mut chunk)?;
-                out.extend_from_slice(&chunk[..size]);
-            }
-            out
-        } else if content_length > 0 {
-            let mut out = vec![0u8; content_length];
-            conn.read_exact(&mut out)?;
-            out
-        } else {
-            Vec::new()
-        };
-        Ok(Response {
-            status,
-            headers: vec![],
-            body,
-        })
+        read_response(conn, method.eq_ignore_ascii_case("HEAD"), max)
     }
 
     fn write_request<W: Write>(
@@ -3594,7 +3699,7 @@ pub mod http {
         Ok(())
     }
 
-    fn parse_response(raw: &[u8]) -> io::Result<Response> {
+    fn parse_response(raw: &[u8], head_only: bool, max: u64) -> io::Result<Response> {
         let sep = find(raw, b"\r\n\r\n")
             .ok_or_else(|| Error::new(ErrorKind::InvalidData, "no header terminator"))?;
         let head = std::str::from_utf8(&raw[..sep])
@@ -3613,6 +3718,7 @@ pub mod http {
             })?;
         let mut headers = Vec::new();
         let mut chunked = false;
+        let mut content_length: Option<u64> = None;
         for l in lines {
             if let Some((k, v)) = l.split_once(':') {
                 let k = k.trim().to_string();
@@ -3621,13 +3727,36 @@ pub mod http {
                 {
                     chunked = true;
                 }
+                if k.eq_ignore_ascii_case("content-length") {
+                    content_length =
+                        Some(v.parse().map_err(|_| {
+                            Error::new(ErrorKind::InvalidData, "bad Content-Length")
+                        })?);
+                }
                 headers.push((k, v));
             }
         }
         let body_raw = &raw[sep + 4..];
-        let body = if chunked {
-            dechunk(body_raw)?
+        let body = if head_only || status == 204 || status == 304 {
+            Vec::new() // no body follows, whatever the headers declare
+        } else if chunked {
+            dechunk(body_raw, max)?
+        } else if let Some(cl) = content_length {
+            // a body shorter than declared is a truncated transfer, not a complete answer
+            if cl > max {
+                return Err(too_large());
+            }
+            if (body_raw.len() as u64) < cl {
+                return Err(Error::new(
+                    ErrorKind::UnexpectedEof,
+                    "truncated response body (shorter than Content-Length)",
+                ));
+            }
+            body_raw[..cl as usize].to_vec()
         } else {
+            if body_raw.len() as u64 > max {
+                return Err(too_large());
+            }
             body_raw.to_vec()
         };
         Ok(Response {
@@ -3637,7 +3766,7 @@ pub mod http {
         })
     }
 
-    fn dechunk(mut b: &[u8]) -> io::Result<Vec<u8>> {
+    fn dechunk(mut b: &[u8], max: u64) -> io::Result<Vec<u8>> {
         let mut out = Vec::new();
         loop {
             let nl = find(b, b"\r\n")
@@ -3649,11 +3778,23 @@ pub mod http {
             if size == 0 {
                 break;
             }
-            if b.len() < size {
-                return Err(Error::new(ErrorKind::InvalidData, "truncated chunk"));
+            if (size as u64) > max.saturating_sub(out.len() as u64) {
+                return Err(too_large());
+            }
+            // data + its CRLF must both be present (a response cut right after the data
+            // has no terminator); checked_add so a huge declared size cannot wrap
+            let end = size
+                .checked_add(2)
+                .filter(|&e| e <= b.len())
+                .ok_or_else(|| Error::new(ErrorKind::InvalidData, "truncated chunk"))?;
+            if &b[size..end] != b"\r\n" {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    "missing chunk terminator",
+                ));
             }
             out.extend_from_slice(&b[..size]);
-            b = &b[size + 2..]; // skip data + CRLF
+            b = &b[end..];
         }
         Ok(out)
     }
@@ -3665,6 +3806,194 @@ pub mod http {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use std::io::Read;
+        use std::net::{TcpListener, TcpStream};
+
+        fn parse(raw: &[u8]) -> io::Result<Response> {
+            parse_response(raw, false, max_response_bytes())
+        }
+
+        const CHUNKED: &str = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+
+        fn chunked(body: &str) -> Vec<u8> {
+            format!("{CHUNKED}{body}").into_bytes()
+        }
+
+        #[test]
+        fn chunked_response_without_its_final_crlf_is_an_error_not_a_panic() {
+            for body in [
+                "5\r\nabcde",
+                "5\r\nabcdeX",
+                "5\r\nabcde\r",
+                "5\r\nabcdeXY0\r\n\r\n",
+            ] {
+                let e = parse(&chunked(body))
+                    .err()
+                    .unwrap_or_else(|| panic!("{body:?} accepted"));
+                assert_eq!(e.kind(), ErrorKind::InvalidData, "{body:?}");
+            }
+        }
+
+        #[test]
+        fn well_formed_chunked_responses_still_parse() {
+            let r = parse(&chunked("5\r\nabcde\r\n0\r\n\r\n")).unwrap();
+            assert_eq!(r.body, b"abcde");
+            let r = parse(&chunked("3;ext=1\r\nabc\r\n2\r\nde\r\n0\r\n\r\n")).unwrap();
+            assert_eq!(r.body, b"abcde");
+            let r = parse(&chunked("0\r\n\r\n")).unwrap();
+            assert!(r.body.is_empty());
+        }
+
+        #[test]
+        fn huge_declared_chunk_size_is_an_error() {
+            for sz in ["ffffffffffffffff", "fffffffffffffffe", "7fffffffffffffff"] {
+                let e = parse(&chunked(&format!("{sz}\r\nab\r\n")))
+                    .err()
+                    .expect("accepted");
+                assert_eq!(e.kind(), ErrorKind::InvalidData, "{sz}");
+            }
+        }
+
+        #[test]
+        fn body_shorter_than_content_length_is_rejected() {
+            let e = parse(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nabc")
+                .err()
+                .expect("truncated body accepted");
+            assert_eq!(e.kind(), ErrorKind::UnexpectedEof);
+            let r = parse(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabc").unwrap();
+            assert_eq!(r.body, b"abc");
+            // surplus bytes beyond the declared length are not part of the body
+            let r = parse(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabcdef").unwrap();
+            assert_eq!(r.body, b"abc");
+            // no Content-Length: read-to-close framing, unchanged
+            let r = parse(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nabcdef").unwrap();
+            assert_eq!(r.body, b"abcdef");
+        }
+
+        #[test]
+        fn head_and_bodiless_statuses_ignore_content_length() {
+            let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 1234\r\n\r\n";
+            let r = parse_response(raw, true, max_response_bytes()).unwrap();
+            assert!(r.body.is_empty());
+            let r = parse(b"HTTP/1.1 304 Not Modified\r\nContent-Length: 1234\r\n\r\n").unwrap();
+            assert_eq!(r.status, 304);
+        }
+
+        #[test]
+        fn default_response_cap_is_one_gib() {
+            assert_eq!(DEFAULT_MAX_RESPONSE_BYTES, 1 << 30);
+            assert_eq!(max_response_bytes(), 1 << 30);
+        }
+
+        /// A one-shot server: read the request head, send `reply`, then close.
+        fn serve_once(reply: Vec<u8>) -> (TcpStream, std::thread::JoinHandle<()>) {
+            let l = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let addr = l.local_addr().unwrap();
+            let t = std::thread::spawn(move || {
+                let (mut s, _) = l.accept().unwrap();
+                let mut seen = Vec::new();
+                let mut b = [0u8; 1];
+                while !seen.ends_with(b"\r\n\r\n") {
+                    if s.read(&mut b).unwrap_or(0) == 0 {
+                        break;
+                    }
+                    seen.push(b[0]);
+                }
+                let _ = s.write_all(&reply);
+            });
+            let c = TcpStream::connect(addr).unwrap();
+            c.set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                .unwrap();
+            (c, t)
+        }
+
+        fn get_plain(reply: &[u8], method: &str) -> io::Result<Response> {
+            let (mut c, t) = serve_once(reply.to_vec());
+            let r = request_plain_on(&mut c, "h", 80, method, "/", &[], &[]);
+            let _ = t.join();
+            r
+        }
+
+        #[test]
+        fn plain_on_refuses_a_huge_declared_content_length_without_allocating() {
+            let e = get_plain(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 99999999999\r\n\r\nabc",
+                "GET",
+            )
+            .err()
+            .expect("accepted");
+            assert_eq!(e.kind(), ErrorKind::InvalidData, "{e}");
+        }
+
+        #[test]
+        fn plain_on_chunk_size_that_wraps_is_an_error_not_a_panic() {
+            let e = get_plain(&chunked("ffffffffffffffff\r\nabc"), "GET")
+                .err()
+                .expect("accepted");
+            assert_eq!(e.kind(), ErrorKind::InvalidData, "{e}");
+        }
+
+        #[test]
+        fn plain_on_refuses_a_chunk_larger_than_the_cap() {
+            let e = get_plain(&chunked("100000000\r\nabc"), "GET")
+                .err()
+                .expect("accepted");
+            assert_eq!(e.kind(), ErrorKind::InvalidData, "{e}");
+        }
+
+        #[test]
+        fn plain_on_truncated_body_is_an_error() {
+            let e = get_plain(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n0123456789",
+                "GET",
+            )
+            .err()
+            .expect("accepted");
+            assert_eq!(e.kind(), ErrorKind::UnexpectedEof, "{e}");
+        }
+
+        #[test]
+        fn plain_on_chunk_without_terminator_is_an_error() {
+            let e = get_plain(&chunked("5\r\nabcdeXY"), "GET")
+                .err()
+                .expect("accepted");
+            assert_eq!(e.kind(), ErrorKind::InvalidData, "{e}");
+        }
+
+        #[test]
+        fn plain_on_good_responses_still_work() {
+            let r = get_plain(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello", "GET").unwrap();
+            assert_eq!((r.status, r.body.as_slice()), (200, &b"hello"[..]));
+            let r = get_plain(&chunked("5\r\nhello\r\n0\r\n\r\n"), "GET").unwrap();
+            assert_eq!(r.body, b"hello");
+            let r = get_plain(b"HTTP/1.1 200 OK\r\nContent-Length: 77\r\n\r\n", "HEAD").unwrap();
+            assert!(r.body.is_empty());
+        }
+
+        #[test]
+        fn plain_on_oversized_response_head_is_refused() {
+            let mut reply = b"HTTP/1.1 200 OK\r\nX: ".to_vec();
+            reply.extend(std::iter::repeat_n(b'a', 200 * 1024));
+            let e = get_plain(&reply, "GET").err().expect("accepted");
+            assert_eq!(e.kind(), ErrorKind::InvalidData, "{e}");
+        }
+
+        #[test]
+        fn configurable_cap_applies_to_declared_and_chunked_bodies() {
+            let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\n01234567890";
+            assert!(parse_response(raw, false, 10).is_err());
+            assert_eq!(parse_response(raw, false, 11).unwrap().body.len(), 11);
+            let raw = chunked("6\r\n012345\r\n6\r\n012345\r\n0\r\n\r\n");
+            assert!(parse_response(&raw, false, 11).is_err());
+            assert_eq!(parse_response(&raw, false, 12).unwrap().body.len(), 12);
+            let (mut c, t) =
+                serve_once(b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\n01234567890".to_vec());
+            let e = request_plain_on_max(&mut c, "h", 80, "GET", "/", &[], &[], 10)
+                .err()
+                .expect("accepted");
+            assert_eq!(e.kind(), ErrorKind::InvalidData);
+            let _ = t.join();
+        }
 
         /// Two keep-alive responses back to back on one stream: the second must start at its own
         /// status line, so the first has to consume its trailer section and final blank line.
@@ -3673,9 +4002,9 @@ pub mod http {
             let wire = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nx\r\n0\r\n\r\n\
                          HTTP/1.1 201 Created\r\nTransfer-Encoding: chunked\r\n\r\n1\r\ny\r\n0\r\n\r\n";
             let mut r = &wire[..];
-            let a = read_response(&mut r).unwrap();
+            let a = read_response(&mut r, false, max_response_bytes()).unwrap();
             assert_eq!((a.status, a.body.as_slice()), (200, &b"x"[..]));
-            let b = read_response(&mut r).unwrap();
+            let b = read_response(&mut r, false, max_response_bytes()).unwrap();
             assert_eq!((b.status, b.body.as_slice()), (201, &b"y"[..]));
             assert!(r.is_empty());
         }
@@ -3685,8 +4014,18 @@ pub mod http {
             let wire = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nhi\r\n0\r\nX-Sum: 1\r\nX-More: 2\r\n\r\n\
                          HTTP/1.1 204 No Content\r\n\r\n";
             let mut r = &wire[..];
-            assert_eq!(read_response(&mut r).unwrap().body, b"hi");
-            assert_eq!(read_response(&mut r).unwrap().status, 204);
+            assert_eq!(
+                read_response(&mut r, false, max_response_bytes())
+                    .unwrap()
+                    .body,
+                b"hi"
+            );
+            assert_eq!(
+                read_response(&mut r, false, max_response_bytes())
+                    .unwrap()
+                    .status,
+                204
+            );
         }
 
         #[test]
@@ -3694,7 +4033,7 @@ pub mod http {
             let wire =
                 b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nx\r\n0\r\nX-Sum: 1\r\n";
             let mut r = &wire[..];
-            assert!(read_response(&mut r).is_err());
+            assert!(read_response(&mut r, false, max_response_bytes()).is_err());
         }
     }
 }
