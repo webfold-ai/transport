@@ -1,5 +1,5 @@
-//! Library surface for `syncfold` — lets other crates (e.g. Galvanize's
-//! tfplugin6 client) reuse the protocol-layer pieces (HPACK, HTTP/2 framing,
+//! Library surface for `syncfold` — lets other crates (e.g. a sibling project's
+//! Terraform-plugin client) reuse the protocol-layer pieces (HPACK, HTTP/2 framing,
 //! gRPC message framing, ECDSA/X.509 cert generation) without depending on
 //! the sync tool's own binary. `main.rs` is a thin CLI wrapper over this same
 //! module tree — one set of modules, two crate roots (lib + bin), the
@@ -17,7 +17,7 @@ pub mod archive {
 
     use std::fs::{self, File, FileTimes};
     use std::io::{self, Error, ErrorKind, Read, Write};
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use crate::sync::sysio;
@@ -32,13 +32,37 @@ pub mod archive {
         Ok(out)
     }
 
-    fn rel_bytes(rel: &Path) -> io::Result<&[u8]> {
-        rel.to_str().map(str::as_bytes).ok_or_else(|| {
+    /// Archive entry paths always use `/`. `Path::join` yields native separators, so on Windows a
+    /// nested entry would otherwise be stored as `dir\file` and refused by the unpackers.
+    fn archive_sep(s: &str) -> String {
+        s.replace('\\', "/")
+    }
+
+    fn rel_bytes(rel: &Path) -> io::Result<Vec<u8>> {
+        let s = rel.to_str().ok_or_else(|| {
             Error::new(
                 ErrorKind::InvalidData,
                 format!("non-UTF8 path: {}", rel.display()),
             )
+        })?;
+        Ok(if cfg!(windows) {
+            archive_sep(s).into_bytes()
+        } else {
+            s.as_bytes().to_vec()
         })
+    }
+
+    #[cfg(test)]
+    mod separator_tests {
+        use super::*;
+
+        #[test]
+        fn native_windows_separators_become_slashes() {
+            assert_eq!(archive_sep("dir\\sub\\file"), "dir/sub/file");
+            assert_eq!(archive_sep("a/b"), "a/b");
+            // what the unpackers accept
+            assert!(entry_segments(&archive_sep("dir\\sub\\file")).is_ok());
+        }
     }
 
     fn pack_dir(abs: &Path, rel: &Path, out: &mut Vec<u8>) -> io::Result<()> {
@@ -47,7 +71,7 @@ pub mod archive {
         for de in entries {
             let crel = rel.join(de.file_name());
             let ft = de.file_type()?;
-            let pb = rel_bytes(&crel)?.to_vec();
+            let pb = rel_bytes(&crel)?;
             if ft.is_symlink() {
                 let target = fs::read_link(de.path())?;
                 let tb = target
@@ -115,7 +139,7 @@ pub mod archive {
         for de in entries {
             let crel = rel.join(de.file_name());
             let ft = de.file_type()?;
-            let pb = rel_bytes(&crel)?.to_vec();
+            let pb = rel_bytes(&crel)?;
             if ft.is_symlink() {
                 let target = fs::read_link(de.path())?;
                 let tb = target
@@ -177,11 +201,13 @@ pub mod archive {
     }
     impl<'a> Cur<'a> {
         fn take(&mut self, n: usize) -> io::Result<&'a [u8]> {
-            if self.p + n > self.b.len() {
-                return Err(Error::new(ErrorKind::UnexpectedEof, "truncated archive"));
-            }
-            let s = &self.b[self.p..self.p + n];
-            self.p += n;
+            let end = self
+                .p
+                .checked_add(n)
+                .filter(|&e| e <= self.b.len())
+                .ok_or_else(|| Error::new(ErrorKind::UnexpectedEof, "truncated archive"))?;
+            let s = &self.b[self.p..end];
+            self.p = end;
             Ok(s)
         }
         fn u16(&mut self) -> io::Result<usize> {
@@ -195,7 +221,127 @@ pub mod archive {
         }
     }
 
+    /// Longest symlink target `unpack`/`unpack_stream` accept (Linux `PATH_MAX`); the
+    /// length is a peer-controlled u32, so it is bounded before anything is allocated.
+    const MAX_LINK_TARGET: usize = 4096;
+
+    fn bad_entry(msg: &str) -> Error {
+        Error::new(ErrorKind::InvalidData, msg.to_string())
+    }
+
+    /// Split an archive entry path into its components. Only plain relative paths are
+    /// accepted: every `/`-separated segment must be non-empty, not `.` or `..`, and free
+    /// of NUL (so absolute paths, `a//b`, `a/`, `./a` and traversal are all refused). On
+    /// Windows `\` and `:` are refused too, so no backslash or drive-prefix form can
+    /// smuggle in an absolute or parent-relative path.
+    fn entry_segments(path: &str) -> io::Result<Vec<&str>> {
+        let segs: Vec<&str> = path.split('/').collect();
+        for s in &segs {
+            let bad = s.is_empty()
+                || *s == "."
+                || *s == ".."
+                || s.contains('\0')
+                || (cfg!(windows) && (s.contains('\\') || s.contains(':')));
+            if bad {
+                return Err(bad_entry("unsafe path in archive entry"));
+            }
+        }
+        Ok(segs)
+    }
+
+    /// A symlink target is accepted only if it is relative and, resolved from the
+    /// link's own directory (`depth` real directories below the root), cannot leave the
+    /// root: `..` may appear only as a leading run, never after a normal segment, and
+    /// the run may not be longer than `depth`. (A purely lexical "does it stay inside"
+    /// check is fooled by `l1 -> .` followed by `l2 -> l1/..`.) Empty and `.` segments
+    /// are ignored; absolute targets and NUL are refused.
+    fn check_link_target(target: &str, depth: usize) -> io::Result<()> {
+        if target.is_empty()
+            || target.starts_with('/')
+            || target.contains('\0')
+            || (cfg!(windows) && (target.contains('\\') || target.contains(':')))
+        {
+            return Err(bad_entry("unsafe symlink target in archive"));
+        }
+        let mut ups = 0usize;
+        let mut normal = false;
+        for seg in target.split('/') {
+            match seg {
+                "" | "." => {}
+                ".." => {
+                    if normal {
+                        return Err(bad_entry("unsafe symlink target in archive"));
+                    }
+                    ups += 1;
+                }
+                _ => normal = true,
+            }
+        }
+        if ups > depth {
+            return Err(bad_entry("symlink target escapes the restore root"));
+        }
+        Ok(())
+    }
+
+    /// Create the parent directories of `segs` below `root` one component at a time,
+    /// refusing any component that is a symlink (or not a directory), so nothing is
+    /// ever created through a link. Returns the destination path.
+    fn prepare_dest(root: &Path, segs: &[&str], make_last_dir: bool) -> io::Result<PathBuf> {
+        let mut cur = root.to_path_buf();
+        let n = if make_last_dir {
+            segs.len()
+        } else {
+            segs.len() - 1
+        };
+        for s in &segs[..n] {
+            cur.push(s);
+            match fs::symlink_metadata(&cur) {
+                Ok(m) if m.file_type().is_symlink() => {
+                    return Err(bad_entry("archive entry passes through a symlink"));
+                }
+                Ok(m) if m.is_dir() => {}
+                Ok(_) => return Err(bad_entry("archive entry parent is not a directory")),
+                Err(e) if e.kind() == ErrorKind::NotFound => fs::create_dir(&cur)?,
+                Err(e) => return Err(e),
+            }
+        }
+        if !make_last_dir {
+            cur.push(segs[segs.len() - 1]);
+        }
+        Ok(cur)
+    }
+
+    /// Create the file for a file entry. Whatever already sits at `dst` (a symlink in
+    /// particular) is removed first and the file is made with `create_new` (`O_EXCL`),
+    /// so the write can never be redirected through a pre-existing link.
+    fn create_dest_file(dst: &Path) -> io::Result<File> {
+        match fs::symlink_metadata(dst) {
+            Ok(m) if m.is_dir() => {
+                return Err(bad_entry("archive file entry collides with a directory"));
+            }
+            Ok(_) => fs::remove_file(dst)?,
+            Err(e) if e.kind() == ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+        File::options().write(true).create_new(true).open(dst)
+    }
+
+    /// Place a symlink entry (target already vetted by `check_link_target`).
+    fn place_symlink(dst: &Path, target: &str) -> io::Result<()> {
+        if let Ok(m) = fs::symlink_metadata(dst) {
+            if m.is_dir() {
+                return Err(bad_entry("archive symlink entry collides with a directory"));
+            }
+            fs::remove_file(dst)?;
+        }
+        sysio::symlink(target.as_ref(), dst)
+    }
+
     /// Unpack a blob into `root`, recreating the tree bit-exact (mode + mtime).
+    ///
+    /// The blob is untrusted: entry paths must be plain relative paths, nothing is
+    /// created through a symlink, symlink targets must be relative and stay inside
+    /// `root`, and setuid/setgid/sticky bits are never restored.
     pub fn unpack(blob: &[u8], root: &Path) -> io::Result<()> {
         if !blob.starts_with(MAGIC) {
             return Err(Error::new(ErrorKind::InvalidData, "not an SFAR archive"));
@@ -210,37 +356,35 @@ pub mod archive {
             let plen = c.u16()?;
             let path = std::str::from_utf8(c.take(plen)?)
                 .map_err(|_| Error::new(ErrorKind::InvalidData, "bad path"))?;
-            let dst = confined(root, path)?;
+            let segs = entry_segments(path)?;
             match kind {
                 b'd' => {
-                    fs::create_dir_all(&dst)?;
+                    prepare_dest(root, &segs, true)?;
                 }
                 b'l' => {
                     let tlen = c.u32()? as usize;
+                    if tlen > MAX_LINK_TARGET {
+                        return Err(bad_entry("symlink target too long"));
+                    }
                     let target = std::str::from_utf8(c.take(tlen)?)
                         .map_err(|_| Error::new(ErrorKind::InvalidData, "bad symlink"))?;
-                    if let Some(parent) = dst.parent() {
-                        fs::create_dir_all(parent)?;
-                    }
-                    let _ = fs::remove_file(&dst);
-                    sysio::symlink(target.as_ref(), &dst)?;
+                    check_link_target(target, segs.len() - 1)?;
+                    let dst = prepare_dest(root, &segs, false)?;
+                    place_symlink(&dst, target)?;
                 }
                 b'f' => {
                     let mode = c.u32()?;
                     let secs = c.u64()?;
                     let nanos = c.u32()?;
-                    let len = c.u64()? as usize;
+                    let len = usize::try_from(c.u64()?)
+                        .map_err(|_| Error::new(ErrorKind::UnexpectedEof, "truncated archive"))?;
                     let data = c.take(len)?;
-                    if let Some(parent) = dst.parent() {
-                        fs::create_dir_all(parent)?;
-                    }
-                    clear_symlink(&dst)?;
-                    fs::write(&dst, data)?;
-                    sysio::set_mode_path(&dst, mode)?;
+                    let dst = prepare_dest(root, &segs, false)?;
+                    let mut f = create_dest_file(&dst)?;
+                    f.write_all(data)?;
+                    sysio::set_mode_file(&f, mode)?;
                     let mt = SystemTime::UNIX_EPOCH + Duration::new(secs, nanos);
-                    if let Ok(f) = File::options().write(true).open(&dst) {
-                        let _ = f.set_times(FileTimes::new().set_modified(mt));
-                    }
+                    let _ = f.set_times(FileTimes::new().set_modified(mt));
                 }
                 other => {
                     return Err(Error::new(
@@ -274,33 +418,31 @@ pub mod archive {
             r.read_exact(&mut pbytes)?;
             let path = std::str::from_utf8(&pbytes)
                 .map_err(|_| Error::new(ErrorKind::InvalidData, "bad path"))?;
-            let dst = confined(root, path)?;
+            let segs = entry_segments(path)?;
             match k[0] {
                 b'd' => {
-                    fs::create_dir_all(&dst)?;
+                    prepare_dest(root, &segs, true)?;
                 }
                 b'l' => {
                     let tlen = read_u32(r)? as usize;
+                    if tlen > MAX_LINK_TARGET {
+                        return Err(bad_entry("symlink target too long"));
+                    }
                     let mut t = vec![0u8; tlen];
                     r.read_exact(&mut t)?;
                     let target = std::str::from_utf8(&t)
                         .map_err(|_| Error::new(ErrorKind::InvalidData, "bad symlink"))?;
-                    if let Some(p) = dst.parent() {
-                        fs::create_dir_all(p)?;
-                    }
-                    let _ = fs::remove_file(&dst);
-                    sysio::symlink(target.as_ref(), &dst)?;
+                    check_link_target(target, segs.len() - 1)?;
+                    let dst = prepare_dest(root, &segs, false)?;
+                    place_symlink(&dst, target)?;
                 }
                 b'f' => {
                     let mode = read_u32(r)?;
                     let secs = read_u64(r)?;
                     let nanos = read_u32(r)?;
                     let len = read_u64(r)?;
-                    if let Some(p) = dst.parent() {
-                        fs::create_dir_all(p)?;
-                    }
-                    clear_symlink(&dst)?;
-                    let mut f = File::create(&dst)?;
+                    let dst = prepare_dest(root, &segs, false)?;
+                    let mut f = create_dest_file(&dst)?;
                     let mut remaining = len;
                     let mut buf = vec![0u8; 1 << 20];
                     while remaining > 0 {
@@ -353,55 +495,6 @@ pub mod archive {
         Ok(u64::from_be_bytes(b))
     }
 
-    /// The destination for an archive entry, or an error if the entry would land outside `root`.
-    ///
-    /// Only plain path components are accepted: an absolute path, a `..` component or a path with no
-    /// component is refused. No existing ancestor below `root` may be a symlink, so an earlier
-    /// symlink entry cannot redirect a later entry out of the tree.
-    fn confined(root: &Path, rel: &str) -> io::Result<std::path::PathBuf> {
-        use std::path::Component;
-        let bad = || {
-            Error::new(
-                ErrorKind::InvalidData,
-                format!("unsafe archive path: {rel:?}"),
-            )
-        };
-        let mut names = Vec::new();
-        for c in Path::new(rel).components() {
-            match c {
-                Component::Normal(n) => names.push(n),
-                Component::CurDir => {}
-                _ => return Err(bad()),
-            }
-        }
-        let Some((_, parents)) = names.split_last() else {
-            return Err(bad());
-        };
-        let mut cur = root.to_path_buf();
-        for n in parents {
-            cur.push(n);
-            match fs::symlink_metadata(&cur) {
-                Ok(m) if m.file_type().is_symlink() => return Err(bad()),
-                Ok(_) => {}
-                Err(e) if e.kind() == ErrorKind::NotFound => {}
-                Err(e) => return Err(e),
-            }
-        }
-        let mut dst = root.to_path_buf();
-        dst.extend(names);
-        Ok(dst)
-    }
-
-    /// Remove a symlink at `dst` so that creating a file there cannot write through it.
-    fn clear_symlink(dst: &Path) -> io::Result<()> {
-        match fs::symlink_metadata(dst) {
-            Ok(m) if m.file_type().is_symlink() => fs::remove_file(dst),
-            Ok(_) => Ok(()),
-            Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(e),
-        }
-    }
-
     /// Count of leaf files in a tree (for reporting "N objects → 1").
     pub fn count_files(root: &Path) -> u64 {
         fn rec(p: &Path) -> u64 {
@@ -424,6 +517,7 @@ pub mod archive {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use std::path::PathBuf;
 
         #[test]
         fn pack_unpack_roundtrip() {
@@ -553,6 +647,244 @@ pub mod archive {
                 .is_symlink());
             let _ = fs::remove_dir_all(&base);
         }
+
+        // ---- hostile-archive tests (NET-03 / NET-04 / NET-11) ----
+
+        /// Build SFAR bytes entry by entry (the on-disk framing `pack` emits).
+        struct Sfar(Vec<u8>);
+        impl Sfar {
+            fn new() -> Self {
+                Sfar(MAGIC.to_vec())
+            }
+            fn path(&mut self, kind: u8, path: &[u8]) {
+                self.0.push(kind);
+                self.0.extend_from_slice(&(path.len() as u16).to_be_bytes());
+                self.0.extend_from_slice(path);
+            }
+            fn dir(mut self, path: &str) -> Self {
+                self.path(b'd', path.as_bytes());
+                self
+            }
+            fn link(mut self, path: &str, target: &str) -> Self {
+                self.path(b'l', path.as_bytes());
+                self.0
+                    .extend_from_slice(&(target.len() as u32).to_be_bytes());
+                self.0.extend_from_slice(target.as_bytes());
+                self
+            }
+            fn file_mode(mut self, path: &[u8], mode: u32, data: &[u8]) -> Self {
+                self.path(b'f', path);
+                self.0.extend_from_slice(&mode.to_be_bytes());
+                self.0.extend_from_slice(&0u64.to_be_bytes());
+                self.0.extend_from_slice(&0u32.to_be_bytes());
+                self.0.extend_from_slice(&(data.len() as u64).to_be_bytes());
+                self.0.extend_from_slice(data);
+                self
+            }
+            fn file(self, path: &str, data: &[u8]) -> Self {
+                self.file_mode(path.as_bytes(), 0o644, data)
+            }
+        }
+
+        fn scratch(tag: &str) -> PathBuf {
+            let base = std::env::temp_dir().join(format!("sfar_{tag}_{}", std::process::id()));
+            let _ = fs::remove_dir_all(&base);
+            fs::create_dir_all(&base).unwrap();
+            base
+        }
+
+        /// Run both unpackers on `blob` into `<base>/root`; each must fail.
+        fn assert_both_refuse(blob: &[u8], base: &Path) {
+            let r1 = base.join("root1");
+            let r2 = base.join("root2");
+            assert!(
+                unpack(blob, &r1).is_err(),
+                "unpack accepted a hostile archive"
+            );
+            assert!(
+                unpack_stream(&mut &blob[..], &r2).is_err(),
+                "unpack_stream accepted a hostile archive"
+            );
+        }
+
+        #[test]
+        fn rejects_parent_dir_traversal() {
+            let base = scratch("dotdot");
+            let blob = Sfar::new().file("../escape", b"pwn").0;
+            assert_both_refuse(&blob, &base);
+            assert!(!base.join("escape").exists(), "file escaped the root");
+            let blob = Sfar::new().dir("a").file("a/../../escape2", b"pwn").0;
+            assert_both_refuse(&blob, &base);
+            assert!(!base.join("escape2").exists(), "file escaped the root");
+            let _ = fs::remove_dir_all(&base);
+        }
+
+        #[test]
+        fn rejects_absolute_path() {
+            let base = scratch("abs");
+            let outside = base.join("outside_abs");
+            let blob = Sfar::new().file(outside.to_str().unwrap(), b"pwn").0;
+            assert_both_refuse(&blob, &base);
+            assert!(!outside.exists(), "absolute entry wrote outside the root");
+            let _ = fs::remove_dir_all(&base);
+        }
+
+        #[test]
+        fn rejects_empty_dot_and_nul_components() {
+            let base = scratch("odd");
+            for bad in ["a//b", "./a", "a/./b", "a/", "", "a\0b"] {
+                let blob = Sfar::new().file_mode(bad.as_bytes(), 0o644, b"x").0;
+                assert_both_refuse(&blob, &base);
+                let _ = fs::remove_dir_all(base.join("root1"));
+                let _ = fs::remove_dir_all(base.join("root2"));
+            }
+            let _ = fs::remove_dir_all(&base);
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn never_writes_through_symlink() {
+            let base = scratch("symlink");
+            let outside = base.join("outside");
+            fs::create_dir_all(&outside).unwrap();
+            // symlink d -> <absolute outside dir>, then a file under it. Even if the
+            // symlink entry itself were tolerated, the file must not land outside.
+            let blob = Sfar::new()
+                .link("d", outside.to_str().unwrap())
+                .file("d/pwned", b"pwn")
+                .0;
+            assert_both_refuse(&blob, &base);
+            assert!(
+                !outside.join("pwned").exists(),
+                "file written through a symlink"
+            );
+            // A relative in-root-looking link that climbs out.
+            let blob = Sfar::new()
+                .link("d", "../outside")
+                .file("d/pwned", b"pwn")
+                .0;
+            assert_both_refuse(&blob, &base);
+            assert!(
+                !outside.join("pwned").exists(),
+                "file written through ../ link"
+            );
+            let _ = fs::remove_dir_all(&base);
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn never_writes_through_in_root_symlink_to_dir() {
+            // Even a symlink that stays inside the root must not be written through
+            // (the entry after it is refused, nothing is created via the link).
+            let base = scratch("inroot");
+            let blob = Sfar::new()
+                .dir("real")
+                .link("alias", "real")
+                .file("alias/f", b"x")
+                .0;
+            assert_both_refuse(&blob, &base);
+            assert!(!base.join("root1/real/f").exists());
+            assert!(!base.join("root2/real/f").exists());
+            let _ = fs::remove_dir_all(&base);
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn rejects_symlink_chain_escaping_root() {
+            // l1 -> .  (harmless), l2 -> l1/..  (lexically inside, really the root's parent)
+            let base = scratch("chain");
+            let blob = Sfar::new().link("l1", ".").link("l2", "l1/..").0;
+            assert_both_refuse(&blob, &base);
+            let _ = fs::remove_dir_all(&base);
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn existing_symlink_at_destination_is_not_followed() {
+            let base = scratch("preexist");
+            let victim = base.join("victim");
+            fs::write(&victim, b"keep").unwrap();
+            for stream in [false, true] {
+                let root = base.join(format!("root_{stream}"));
+                fs::create_dir_all(&root).unwrap();
+                std::os::unix::fs::symlink(&victim, root.join("f")).unwrap();
+                let blob = Sfar::new().file("f", b"pwn").0;
+                let _ = if stream {
+                    unpack_stream(&mut &blob[..], &root)
+                } else {
+                    unpack(&blob, &root)
+                };
+                assert_eq!(fs::read(&victim).unwrap(), b"keep", "wrote through symlink");
+            }
+            let _ = fs::remove_dir_all(&base);
+        }
+
+        #[test]
+        fn legit_relative_symlinks_still_restore() {
+            let base = scratch("legit");
+            let blob = Sfar::new()
+                .dir("a")
+                .file("a/x", b"hi")
+                .link("a/up", "../a/x")
+                .link("top", "a/x")
+                .0;
+            unpack_stream(&mut &blob[..], &base.join("r")).unwrap();
+            #[cfg(unix)]
+            {
+                assert_eq!(fs::read(base.join("r/top")).unwrap(), b"hi");
+                assert_eq!(fs::read(base.join("r/a/up")).unwrap(), b"hi");
+            }
+            let _ = fs::remove_dir_all(&base);
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn setuid_setgid_sticky_bits_are_masked() {
+            use std::os::unix::fs::PermissionsExt;
+            let base = scratch("mode");
+            let blob = Sfar::new().file_mode(b"suid", 0o7755, b"x").0;
+            unpack(&blob, &base.join("r1")).unwrap();
+            unpack_stream(&mut &blob[..], &base.join("r2")).unwrap();
+            for r in ["r1", "r2"] {
+                let m = fs::metadata(base.join(r).join("suid"))
+                    .unwrap()
+                    .permissions()
+                    .mode();
+                assert_eq!(m & 0o7000, 0, "{r}: special bits survived: {m:o}");
+                assert_eq!(m & 0o777, 0o755, "{r}: permission bits lost: {m:o}");
+            }
+            let _ = fs::remove_dir_all(&base);
+        }
+
+        #[test]
+        fn oversized_symlink_target_length_is_refused_before_allocating() {
+            // A link entry declaring a ~4 GiB target must be rejected as invalid data
+            // up front, not by trying to read (and allocate) the target.
+            let mut blob = Sfar::new().0;
+            blob.push(b'l');
+            blob.extend_from_slice(&1u16.to_be_bytes());
+            blob.push(b'x');
+            blob.extend_from_slice(&u32::MAX.to_be_bytes());
+            let base = scratch("biglink");
+            let e = unpack(&blob, &base.join("r1")).unwrap_err();
+            assert_eq!(e.kind(), ErrorKind::InvalidData, "unpack: {e}");
+            let e = unpack_stream(&mut &blob[..], &base.join("r2")).unwrap_err();
+            assert_eq!(e.kind(), ErrorKind::InvalidData, "unpack_stream: {e}");
+            let _ = fs::remove_dir_all(&base);
+        }
+
+        #[test]
+        fn cur_take_rejects_overflowing_length() {
+            // A file entry declaring len = u64::MAX must be a clean error, not a panic.
+            let mut blob = Sfar::new().file("f", b"x").0;
+            let n = blob.len();
+            blob[n - 1 - 8..n - 1].copy_from_slice(&u64::MAX.to_be_bytes());
+            blob.truncate(n - 1);
+            let base = scratch("take");
+            let e = unpack(&blob, &base.join("r")).unwrap_err();
+            assert_eq!(e.kind(), ErrorKind::UnexpectedEof);
+            let _ = fs::remove_dir_all(&base);
+        }
     }
 }
 pub mod block {
@@ -579,12 +911,13 @@ pub mod block {
     //! `read_at`/`write_at`. Safe `std`, no FFI, no `unsafe`.
 
     use std::fs::File;
-    use std::io::{self, Read, Write};
-    use std::net::{TcpListener, TcpStream};
+    use std::io::{self, Read, Seek, SeekFrom, Write};
+    use std::net::{IpAddr, Ipv4Addr, TcpListener, TcpStream};
     use std::path::Path;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::thread;
 
+    use crate::sync::crypto;
     use crate::sync::image::{Format, Source};
     use crate::sync::sysio;
 
@@ -926,11 +1259,89 @@ pub mod block {
     // crosses the wire at ~20% of its size. block-duplicator streams every byte
     // (zeros included) down one sequential socket; this is that, minus the drag.
     //
-    //   HELLO : "SFDD" ‖ ver(1) ‖ total_size(u64 LE) ‖ chunk_hint(u32 LE)
-    //   DATA  : 0x01 ‖ offset(u64 LE) ‖ len(u32 LE) ‖ <len bytes>
-    //   END   : 0x00
+    //   HELLO : "SFDD" ‖ ver(1) ‖ total_size(u64 LE) ‖ chunk_hint(u32 LE)      (client → server)
+    //   CHAL  : auth(1) ‖ nonce(32)                                            (server → client)
+    //   PROOF : HMAC-SHA256(key, "SFDD-auth-v2" ‖ nonce ‖ size ‖ hint)         (client → server;
+    //           32 zero bytes when CHAL.auth == 0)
+    //   OK    : 0x01 accepted | 0x00 refused (server closes)                    (server → client)
+    //   DATA  : 0x01 ‖ offset(u64 LE) ‖ len(u32 LE) ‖ <len bytes> [‖ tag(32)]
+    //   END   : 0x00 [‖ tag(32)]
+    //
+    // Version 2 (this framing; version 1 had no CHAL/PROOF/OK and is refused). When the
+    // server holds a pre-shared key (`auth` = 1) the client must prove it before the
+    // destination is opened, and every frame — END included — carries a 32-byte tag
+    // binding it to the session nonce and its sequence number, so an on-path peer can
+    // neither start a session nor inject, reorder or replay frames. The data itself is
+    // NOT encrypted; use a tunnel (ssh -L, WireGuard) if it must be confidential. The
+    // server bounds everything the peer declares: size ≤ `max_size` (and ≤ the device
+    // length for a block device), len ≤ WIRE_CHUNK, offset + len ≤ size.
 
     const WIRE_CHUNK: usize = 4 << 20; // 4 MiB read granularity on the sender
+    const WIRE_VERSION: u8 = 2;
+    /// Shortest pre-shared key accepted (bytes). Keys come from a file or the
+    /// environment, never from argv; this only rejects obviously trivial ones.
+    pub const MIN_KEY_LEN: usize = 16;
+    /// Default ceiling on the size a peer may declare (64 TiB).
+    pub const DEFAULT_MAX_SIZE: u64 = 1 << 46;
+    /// How long a peer may stall during the handshake / between data frames.
+    const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+    const FRAME_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+    fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+        a.len() == b.len() && a.iter().zip(b).fold(0u8, |d, (x, y)| d | (x ^ y)) == 0
+    }
+
+    /// A fresh session nonce from the operating system's CSPRNG (portable: `getrandom`/`arc4random`
+    /// on Unix, `BCryptGenRandom` on Windows), not a `/dev/urandom` path that Windows lacks.
+    fn random_nonce() -> io::Result<[u8; 32]> {
+        let mut n = [0u8; 32];
+        aws_lc_rs::rand::fill(&mut n).map_err(|_| io::Error::other("system RNG failure"))?;
+        Ok(n)
+    }
+
+    #[cfg(test)]
+    mod nonce_tests {
+        #[test]
+        fn nonces_are_fresh_and_not_zero() {
+            let (a, b) = (
+                super::random_nonce().unwrap(),
+                super::random_nonce().unwrap(),
+            );
+            assert_ne!(a, b);
+            assert_ne!(a, [0u8; 32]);
+        }
+    }
+
+    fn check_key(key: &[u8]) -> io::Result<()> {
+        if key.len() < MIN_KEY_LEN {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("dd key must be at least {MIN_KEY_LEN} bytes"),
+            ));
+        }
+        Ok(())
+    }
+
+    fn auth_proof(key: &[u8], nonce: &[u8; 32], size: u64, hint: u32) -> [u8; 32] {
+        let mut m = Vec::with_capacity(12 + 32 + 12);
+        m.extend_from_slice(b"SFDD-auth-v2");
+        m.extend_from_slice(nonce);
+        m.extend_from_slice(&size.to_le_bytes());
+        m.extend_from_slice(&hint.to_le_bytes());
+        crypto::hmac_sha256(key, &m)
+    }
+
+    /// Tag for one frame: the HMAC of a SHA-256 over (label ‖ nonce ‖ seq ‖ head ‖ data),
+    /// hashed first so the multi-MiB payload is never copied.
+    fn frame_tag(key: &[u8], nonce: &[u8; 32], seq: u64, head: &[u8], data: &[u8]) -> [u8; 32] {
+        let mut h = crypto::Sha256::new();
+        h.update(b"SFDD-frame-v2");
+        h.update(nonce);
+        h.update(&seq.to_le_bytes());
+        h.update(head);
+        h.update(data);
+        crypto::hmac_sha256(key, &h.finalize())
+    }
 
     /// Rate-limit a progress line to ~10 Hz so it doesn't flood stderr (one carriage
     /// -return refresh, not one per chunk).
@@ -949,13 +1360,36 @@ pub mod block {
         }
     }
 
-    fn send_data_frame(w: &mut impl Write, off: u64, run: &[u8]) -> io::Result<()> {
+    /// Per-session frame authenticator (present only when a pre-shared key is in use).
+    struct Tagger {
+        key: Vec<u8>,
+        nonce: [u8; 32],
+        seq: u64,
+    }
+    impl Tagger {
+        fn next(&mut self, head: &[u8], data: &[u8]) -> [u8; 32] {
+            let t = frame_tag(&self.key, &self.nonce, self.seq, head, data);
+            self.seq += 1;
+            t
+        }
+    }
+
+    fn send_data_frame(
+        w: &mut impl Write,
+        tagger: &mut Option<Tagger>,
+        off: u64,
+        run: &[u8],
+    ) -> io::Result<()> {
         let mut hdr = [0u8; 13];
         hdr[0] = 0x01;
         hdr[1..9].copy_from_slice(&off.to_le_bytes());
         hdr[9..13].copy_from_slice(&(run.len() as u32).to_le_bytes());
         w.write_all(&hdr)?;
-        w.write_all(run)
+        w.write_all(run)?;
+        if let Some(t) = tagger {
+            w.write_all(&t.next(&hdr, run))?;
+        }
+        Ok(())
     }
 
     /// Read-back verification: re-read source and destination through their formats
@@ -1007,6 +1441,8 @@ pub mod block {
 
     /// Push a local source to `host:port`, hole-skipping over the wire (unless the
     /// caller turns sparse off — e.g. a true device clone where zeros are meaningful).
+    /// `key` is the pre-shared key the receiver was started with (required when the
+    /// receiver demands one; ignored otherwise).
     pub fn push(
         src: &Path,
         fmt: Format,
@@ -1014,7 +1450,11 @@ pub mod block {
         port: u16,
         sparse: bool,
         quiet: bool,
+        key: Option<&[u8]>,
     ) -> io::Result<Stats> {
+        if let Some(k) = key {
+            check_key(k)?;
+        }
         let s = Source::open(src, fmt)?;
         let size = s.size()?;
         let mut stream = TcpStream::connect((host, port))?;
@@ -1022,10 +1462,40 @@ pub mod block {
 
         let mut hello = Vec::with_capacity(17);
         hello.extend_from_slice(b"SFDD");
-        hello.push(1u8);
+        hello.push(WIRE_VERSION);
         hello.extend_from_slice(&size.to_le_bytes());
         hello.extend_from_slice(&(WIRE_CHUNK as u32).to_le_bytes());
         stream.write_all(&hello)?;
+
+        // challenge → proof → verdict
+        let mut chal = [0u8; 33];
+        stream.read_exact(&mut chal)?;
+        let nonce: [u8; 32] = chal[1..].try_into().unwrap();
+        let mut proof = [0u8; 32];
+        let mut tagger = None;
+        if chal[0] == 1 {
+            let Some(k) = key else {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "the receiver requires a key (--key-file or SYNCFOLD_DD_KEY)",
+                ));
+            };
+            proof = auth_proof(k, &nonce, size, WIRE_CHUNK as u32);
+            tagger = Some(Tagger {
+                key: k.to_vec(),
+                nonce,
+                seq: 0,
+            });
+        }
+        stream.write_all(&proof)?;
+        let mut verdict = [0u8; 1];
+        stream.read_exact(&mut verdict)?;
+        if verdict[0] != 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "the receiver refused this session (wrong key, or version/size/destination refused)",
+            ));
+        }
 
         let mut buf = vec![0u8; WIRE_CHUNK];
         let mut acc = Stats::ZERO;
@@ -1039,12 +1509,12 @@ pub mod block {
             }
             if sparse {
                 let data = for_each_extent(&buf[..n], off, |o, run| {
-                    send_data_frame(&mut stream, o, run)
+                    send_data_frame(&mut stream, &mut tagger, o, run)
                 })?;
                 acc.bytes_copied += data;
                 acc.bytes_zero += n as u64 - data;
             } else {
-                send_data_frame(&mut stream, off, &buf[..n])?;
+                send_data_frame(&mut stream, &mut tagger, off, &buf[..n])?;
                 acc.bytes_copied += n as u64;
             }
             acc.blocks_copied += 1;
@@ -1062,6 +1532,9 @@ pub mod block {
             }
         }
         stream.write_all(&[0x00])?; // END
+        if let Some(t) = &mut tagger {
+            stream.write_all(&t.next(&[0x00], &[]))?;
+        }
         stream.flush()?;
         if !quiet {
             eprintln!();
@@ -1069,52 +1542,210 @@ pub mod block {
         Ok(acc)
     }
 
-    /// Serve as the receiving sink: accept ONE connection on `port` and write the
-    /// streamed extents into `dst` (file or device). Returns when the peer sends END.
-    pub fn serve(dst: &Path, port: u16, quiet: bool) -> io::Result<Stats> {
-        let listener = TcpListener::bind(("0.0.0.0", port))?;
-        if !quiet {
+    /// Settings for [`serve`].
+    pub struct ServeOpts {
+        /// Address to listen on. Default `127.0.0.1`; anything that is not a loopback
+        /// address (including `0.0.0.0`) requires `key`.
+        pub bind: IpAddr,
+        /// TCP port to listen on.
+        pub port: u16,
+        /// Pre-shared key (at least [`MIN_KEY_LEN`] bytes) the pushing peer must prove.
+        pub key: Option<Vec<u8>>,
+        /// Allow replacing an existing non-empty regular file (it is truncated first).
+        pub force: bool,
+        /// Largest total size a peer may declare.
+        pub max_size: u64,
+        /// Suppress progress and status lines on stderr.
+        pub quiet: bool,
+    }
+
+    impl ServeOpts {
+        /// Loopback-only, no key, no `--force`, default size cap.
+        pub fn new(port: u16) -> Self {
+            ServeOpts {
+                bind: IpAddr::V4(Ipv4Addr::LOCALHOST),
+                port,
+                key: None,
+                force: false,
+                max_size: DEFAULT_MAX_SIZE,
+                quiet: false,
+            }
+        }
+    }
+
+    fn check_serve_policy(ip: IpAddr, key: Option<&[u8]>) -> io::Result<()> {
+        if let Some(k) = key {
+            check_key(k)?;
+        }
+        if !ip.is_loopback() && key.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "refusing to listen on {ip} without authentication: supply a key \
+                     (--key-file, or the SYNCFOLD_DD_KEY environment variable) or bind a loopback address"
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    fn refuse(stream: &mut TcpStream, why: &str) -> io::Error {
+        let _ = stream.write_all(&[0x00]);
+        io::Error::new(io::ErrorKind::PermissionDenied, why.to_string())
+    }
+
+    /// Serve as the receiving sink: accept a connection on `opts.bind:opts.port` and
+    /// write the streamed extents into `dst` (file or device). Returns when a peer
+    /// completes a session (END). A peer that fails the handshake (bad magic or
+    /// version, wrong key) is dropped and the next connection is accepted; `dst` is
+    /// not opened until the handshake — including the key proof — has passed.
+    pub fn serve(dst: &Path, opts: &ServeOpts) -> io::Result<Stats> {
+        check_serve_policy(opts.bind, opts.key.as_deref())?;
+        let listener = TcpListener::bind((opts.bind, opts.port))?;
+        serve_on(&listener, dst, opts)
+    }
+
+    /// [`serve`] on an already-bound listener (`opts.bind`/`opts.port` are ignored; the
+    /// listener's own address is checked against the key policy).
+    pub fn serve_on(listener: &TcpListener, dst: &Path, opts: &ServeOpts) -> io::Result<Stats> {
+        let local = listener.local_addr()?;
+        check_serve_policy(local.ip(), opts.key.as_deref())?;
+        if !opts.quiet {
             eprintln!(
-                "syncfold dd serve: listening on 0.0.0.0:{port} → {}",
+                "syncfold dd serve: listening on {local}{} → {}",
+                if opts.key.is_some() {
+                    " (key required)"
+                } else {
+                    ""
+                },
                 dst.display()
             );
         }
-        let (mut stream, peer) = listener.accept()?;
-        stream.set_nodelay(true)?;
-        if !quiet {
-            eprintln!("syncfold dd serve: connection from {peer}");
+        loop {
+            let (mut stream, peer) = listener.accept()?;
+            stream.set_nodelay(true)?;
+            if !opts.quiet {
+                eprintln!("syncfold dd serve: connection from {peer}");
+            }
+            match serve_session(&mut stream, dst, opts) {
+                Ok(st) => return Ok(st),
+                Err(SessionErr::Handshake(e)) => {
+                    // Not a valid, authorised peer: never touched dst. Keep listening.
+                    if !opts.quiet {
+                        eprintln!("syncfold dd serve: dropped {peer}: {e}");
+                    }
+                }
+                Err(SessionErr::Fatal(e)) => return Err(e),
+            }
+        }
+    }
+
+    enum SessionErr {
+        /// Failed before the peer was authenticated and dst opened.
+        Handshake(io::Error),
+        /// Failed afterwards (protocol violation, I/O error): the session is over.
+        Fatal(io::Error),
+    }
+    impl From<io::Error> for SessionErr {
+        fn from(e: io::Error) -> Self {
+            SessionErr::Fatal(e)
+        }
+    }
+
+    fn serve_session(
+        stream: &mut TcpStream,
+        dst: &Path,
+        opts: &ServeOpts,
+    ) -> Result<Stats, SessionErr> {
+        let hs = |e: io::Error| SessionErr::Handshake(e);
+        let bad = |m: &str| io::Error::new(io::ErrorKind::InvalidData, m.to_string());
+        stream
+            .set_read_timeout(Some(HANDSHAKE_TIMEOUT))
+            .map_err(hs)?;
+        stream
+            .set_write_timeout(Some(HANDSHAKE_TIMEOUT))
+            .map_err(hs)?;
+
+        let mut head = [0u8; 17];
+        stream.read_exact(&mut head).map_err(hs)?;
+        if &head[..4] != b"SFDD" {
+            return Err(hs(bad("bad magic (not a syncfold dd stream)")));
+        }
+        if head[4] != WIRE_VERSION {
+            return Err(hs(bad("unsupported dd protocol version (need 2)")));
+        }
+        let size = u64::from_le_bytes(head[5..13].try_into().unwrap());
+        let hint = u32::from_le_bytes(head[13..17].try_into().unwrap());
+
+        // challenge → proof → verdict
+        let nonce = random_nonce().map_err(hs)?;
+        let mut chal = [0u8; 33];
+        chal[0] = opts.key.is_some() as u8;
+        chal[1..].copy_from_slice(&nonce);
+        stream.write_all(&chal).map_err(hs)?;
+        let mut proof = [0u8; 32];
+        stream.read_exact(&mut proof).map_err(hs)?;
+        let mut tagger = None;
+        if let Some(k) = &opts.key {
+            if !ct_eq(&proof, &auth_proof(k, &nonce, size, hint)) {
+                return Err(hs(refuse(stream, "bad key proof")));
+            }
+            tagger = Some(Tagger {
+                key: k.clone(),
+                nonce,
+                seq: 0,
+            });
         }
 
-        let mut magic = [0u8; 4];
-        stream.read_exact(&mut magic)?;
-        if &magic != b"SFDD" {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "bad magic (not a syncfold dd stream)",
-            ));
+        // Authenticated (or loopback-only unkeyed). Validate what the peer declares
+        // BEFORE touching the destination.
+        if size > opts.max_size {
+            let _ = stream.write_all(&[0x00]);
+            return Err(bad("declared size exceeds the --max-size limit").into());
         }
-        let mut one = [0u8; 1];
-        stream.read_exact(&mut one)?; // version
-        let mut sz = [0u8; 8];
-        stream.read_exact(&mut sz)?;
-        let size = u64::from_le_bytes(sz);
-        let mut ck = [0u8; 4];
-        stream.read_exact(&mut ck)?; // chunk hint — informational
-
         let dst_is_dev = sysio::is_device_path(dst);
         let mut oo = File::options();
-        oo.read(true).write(true).create(true);
-        if !dst_is_dev {
-            oo.truncate(true);
+        oo.read(true).write(true);
+        if dst_is_dev {
+            // never create or truncate a device node
+        } else {
+            oo.create(true);
         }
-        let d = oo.open(dst)?;
-        if !dst_is_dev {
+        let mut d = match oo.open(dst) {
+            Ok(d) => d,
+            Err(e) => {
+                let _ = stream.write_all(&[0x00]);
+                return Err(e.into());
+            }
+        };
+        let meta = d.metadata()?;
+        if dst_is_dev {
+            let dev_len = d.seek(SeekFrom::End(0))?;
+            if size > dev_len {
+                let _ = stream.write_all(&[0x00]);
+                return Err(bad("declared size is larger than the destination device").into());
+            }
+        } else {
+            if meta.is_file() && meta.len() > 0 && !opts.force {
+                let _ = stream.write_all(&[0x00]);
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!(
+                        "{} is a non-empty file; refusing to overwrite it (pass --force)",
+                        dst.display()
+                    ),
+                )
+                .into());
+            }
+            d.set_len(0)?; // start from nothing: stale bytes must not survive in the holes
             d.set_len(size)?; // sparse-zero base; unsent (hole) regions stay zero
         }
+        stream.write_all(&[0x01])?; // OK
+        stream.set_read_timeout(Some(FRAME_TIMEOUT))?;
+        stream.set_write_timeout(Some(FRAME_TIMEOUT))?;
 
-        // A device keeps whatever it held before, so the sender's omitted all-zero extents must be
-        // written as zeros there; a regular file was truncated and sized above and reads zero.
-        recv_extents(&mut stream, &d, size, dst_is_dev, quiet)
+        let acc = recv_extents(stream, &mut tagger, &d, size, dst_is_dev, opts.quiet)?;
+        Ok(acc)
     }
 
     /// Write zeros over `[from, to)` of `d`.
@@ -1129,16 +1760,22 @@ pub mod block {
         Ok(())
     }
 
-    /// Read DATA frames from `r` until END and write each into `d` at its offset. With `zero_gaps`
-    /// the ranges the sender left out (all-zero extents) are written as zeros: between frames, and
-    /// from the last frame to `size`. The sender emits frames in increasing offset order.
+    /// Read DATA frames from `r` until END and write each into `d` at its offset, bounded by
+    /// `size`. When `tagger` is set (a pre-shared key was proved) every frame and END must carry
+    /// a valid tag, checked before the frame is written. With `zero_gaps` the ranges the sender
+    /// left out (all-zero extents) are written as zeros: between frames, and from the last frame
+    /// to `size`. That is needed for a device, which keeps whatever it held before; a regular
+    /// file was truncated and sized by the caller and already reads zero. The sender emits frames
+    /// in increasing offset order.
     fn recv_extents(
         r: &mut dyn Read,
+        tagger: &mut Option<Tagger>,
         d: &File,
         size: u64,
         zero_gaps: bool,
         quiet: bool,
     ) -> io::Result<Stats> {
+        let bad = |m: &str| io::Error::new(io::ErrorKind::InvalidData, m.to_string());
         let mut acc = Stats::ZERO;
         let mut hdr = [0u8; 13];
         let mut data = vec![0u8; WIRE_CHUNK];
@@ -1147,21 +1784,36 @@ pub mod block {
         loop {
             r.read_exact(&mut hdr[..1])?;
             if hdr[0] == 0x00 {
+                if let Some(t) = tagger {
+                    let mut got = [0u8; 32];
+                    r.read_exact(&mut got)?;
+                    if !ct_eq(&got, &t.next(&hdr[..1], &[])) {
+                        return Err(bad("bad END tag"));
+                    }
+                }
                 break; // END
             }
             if hdr[0] != 0x01 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "unknown frame tag",
-                ));
+                return Err(bad("unknown frame tag"));
             }
             r.read_exact(&mut hdr[1..13])?;
             let off = u64::from_le_bytes(hdr[1..9].try_into().unwrap());
             let len = u32::from_le_bytes(hdr[9..13].try_into().unwrap()) as usize;
-            if len > data.len() {
-                data.resize(len, 0);
+            if len > WIRE_CHUNK {
+                return Err(bad("frame length exceeds the wire chunk limit"));
+            }
+            match off.checked_add(len as u64) {
+                Some(end) if end <= size => {}
+                _ => return Err(bad("frame lies outside the declared size")),
             }
             r.read_exact(&mut data[..len])?;
+            if let Some(t) = tagger {
+                let mut got = [0u8; 32];
+                r.read_exact(&mut got)?;
+                if !ct_eq(&got, &t.next(&hdr, &data[..len])) {
+                    return Err(bad("bad frame tag"));
+                }
+            }
             if zero_gaps && off > cursor {
                 zero_fill(d, cursor, off)?;
             }
@@ -1221,6 +1873,389 @@ pub mod block {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use std::net::SocketAddr;
+        use std::path::PathBuf;
+
+        const KEY: &[u8] = b"0123456789abcdef-test-key";
+
+        fn scratch(tag: &str) -> PathBuf {
+            let d = std::env::temp_dir().join(format!("sfdd_{tag}_{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&d);
+            std::fs::create_dir_all(&d).unwrap();
+            d
+        }
+
+        fn quiet(key: Option<&[u8]>) -> ServeOpts {
+            let mut o = ServeOpts::new(0);
+            o.quiet = true;
+            o.key = key.map(<[u8]>::to_vec);
+            o
+        }
+
+        /// Serve `dst` on an ephemeral loopback port in a thread.
+        fn spawn_server(
+            dst: &Path,
+            opts: ServeOpts,
+        ) -> (SocketAddr, thread::JoinHandle<io::Result<Stats>>) {
+            let l = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let addr = l.local_addr().unwrap();
+            let dst = dst.to_path_buf();
+            (addr, thread::spawn(move || serve_on(&l, &dst, &opts)))
+        }
+
+        /// A source image: 3 data bytes, a big hole, 3 more data bytes.
+        fn make_src(dir: &Path) -> (PathBuf, Vec<u8>) {
+            let mut v = vec![0u8; 3 << 20];
+            v[..3].copy_from_slice(b"abc");
+            let n = v.len();
+            v[n - 3..].copy_from_slice(b"xyz");
+            let p = dir.join("src.img");
+            std::fs::write(&p, &v).unwrap();
+            (p, v)
+        }
+
+        fn push_to(addr: SocketAddr, src: &Path, key: Option<&[u8]>) -> io::Result<Stats> {
+            push(src, Format::Raw, "127.0.0.1", addr.port(), true, true, key)
+        }
+
+        /// A raw peer speaking the v2 framing by hand.
+        struct Raw {
+            s: TcpStream,
+            nonce: [u8; 32],
+            auth: bool,
+            seq: u64,
+            key: Option<Vec<u8>>,
+            verdict: u8,
+        }
+        impl Raw {
+            fn open(addr: SocketAddr, size: u64, key: Option<&[u8]>) -> Raw {
+                let mut s = TcpStream::connect(addr).unwrap();
+                s.set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                    .unwrap();
+                let mut h = b"SFDD".to_vec();
+                h.push(WIRE_VERSION);
+                h.extend_from_slice(&size.to_le_bytes());
+                h.extend_from_slice(&(WIRE_CHUNK as u32).to_le_bytes());
+                s.write_all(&h).unwrap();
+                let mut chal = [0u8; 33];
+                s.read_exact(&mut chal).unwrap();
+                let nonce: [u8; 32] = chal[1..].try_into().unwrap();
+                let proof = match (chal[0], key) {
+                    (1, Some(k)) => auth_proof(k, &nonce, size, WIRE_CHUNK as u32),
+                    _ => [0u8; 32],
+                };
+                s.write_all(&proof).unwrap();
+                let mut v = [0u8; 1];
+                let verdict = if s.read_exact(&mut v).is_ok() {
+                    v[0]
+                } else {
+                    0
+                };
+                Raw {
+                    s,
+                    nonce,
+                    auth: chal[0] == 1,
+                    seq: 0,
+                    key: key.map(<[u8]>::to_vec),
+                    verdict,
+                }
+            }
+            fn tag(&mut self, head: &[u8], data: &[u8]) -> Vec<u8> {
+                if !self.auth {
+                    return Vec::new();
+                }
+                let k = self.key.clone().unwrap();
+                let t = frame_tag(&k, &self.nonce, self.seq, head, data).to_vec();
+                self.seq += 1;
+                t
+            }
+            fn frame_raw(&mut self, off: u64, len_field: u32, data: &[u8], tag: Option<Vec<u8>>) {
+                let mut hdr = vec![1u8];
+                hdr.extend_from_slice(&off.to_le_bytes());
+                hdr.extend_from_slice(&len_field.to_le_bytes());
+                let t = tag.unwrap_or_else(|| self.tag(&hdr, data));
+                let mut f = hdr;
+                f.extend_from_slice(data);
+                f.extend_from_slice(&t);
+                let _ = self.s.write_all(&f);
+            }
+            fn frame(&mut self, off: u64, data: &[u8]) {
+                self.frame_raw(off, data.len() as u32, data, None);
+            }
+            fn end(&mut self) {
+                let t = self.tag(&[0], &[]);
+                let mut f = vec![0u8];
+                f.extend_from_slice(&t);
+                let _ = self.s.write_all(&f);
+            }
+        }
+
+        // ---- policy ----
+
+        #[test]
+        fn default_bind_is_loopback() {
+            assert!(ServeOpts::new(9000).bind.is_loopback());
+            assert!(ServeOpts::new(9000).key.is_none());
+            assert!(!ServeOpts::new(9000).force);
+        }
+
+        #[test]
+        fn non_loopback_bind_without_key_is_refused() {
+            let d = scratch("policy");
+            for ip in ["0.0.0.0", "::", "192.0.2.1"] {
+                let mut o = quiet(None);
+                o.bind = ip.parse().unwrap();
+                // run in a thread: a regression would block in accept(), not return
+                let (tx, rx) = std::sync::mpsc::channel();
+                let dst = d.join("dst");
+                thread::spawn(move || {
+                    let _ = tx.send(serve(&dst, &o).err().map(|e| e.kind()));
+                });
+                let got = rx.recv_timeout(std::time::Duration::from_secs(5));
+                assert_eq!(got, Ok(Some(io::ErrorKind::InvalidInput)), "{ip}");
+            }
+            // a key makes a wildcard bind legal (bound on an ephemeral port)
+            let mut o = quiet(Some(KEY));
+            o.bind = "127.0.0.1".parse().unwrap();
+            assert!(check_serve_policy("0.0.0.0".parse().unwrap(), o.key.as_deref()).is_ok());
+            // ... but a trivial key does not
+            assert!(check_serve_policy("127.0.0.1".parse().unwrap(), Some(b"short")).is_err());
+            let _ = std::fs::remove_dir_all(&d);
+        }
+
+        #[test]
+        fn short_key_is_refused_by_push() {
+            let d = scratch("shortkey");
+            let (src, _) = make_src(&d);
+            let e = push(&src, Format::Raw, "127.0.0.1", 1, true, true, Some(b"x"))
+                .err()
+                .expect("expected an error");
+            assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
+            let _ = std::fs::remove_dir_all(&d);
+        }
+
+        // ---- authentication ----
+
+        #[test]
+        fn roundtrip_without_key_on_loopback() {
+            let d = scratch("rt_nokey");
+            let (src, want) = make_src(&d);
+            let dst = d.join("dst.img");
+            let (addr, t) = spawn_server(&dst, quiet(None));
+            let st = push_to(addr, &src, None).unwrap();
+            t.join().unwrap().unwrap();
+            assert_eq!(std::fs::read(&dst).unwrap(), want);
+            assert!(st.bytes_zero > 0, "the hole must not cross the wire");
+            let _ = std::fs::remove_dir_all(&d);
+        }
+
+        #[test]
+        fn roundtrip_with_key() {
+            let d = scratch("rt_key");
+            let (src, want) = make_src(&d);
+            let dst = d.join("dst.img");
+            let (addr, t) = spawn_server(&dst, quiet(Some(KEY)));
+            push_to(addr, &src, Some(KEY)).unwrap();
+            t.join().unwrap().unwrap();
+            assert_eq!(std::fs::read(&dst).unwrap(), want);
+            let _ = std::fs::remove_dir_all(&d);
+        }
+
+        #[test]
+        fn wrong_or_missing_key_is_rejected_and_destination_untouched() {
+            let d = scratch("wrongkey");
+            let (src, want) = make_src(&d);
+            let dst = d.join("dst.img");
+            let (addr, t) = spawn_server(&dst, quiet(Some(KEY)));
+
+            let e = push_to(addr, &src, Some(b"a-different-16+byte-key"))
+                .err()
+                .expect("expected an error");
+            assert_eq!(e.kind(), io::ErrorKind::PermissionDenied, "{e}");
+            let e = push_to(addr, &src, None).err().expect("expected an error");
+            assert_eq!(e.kind(), io::ErrorKind::PermissionDenied, "{e}");
+            let r = Raw::open(addr, 8, Some(b"yet-another-16+byte-key"));
+            assert_eq!(r.verdict, 0);
+            drop(r);
+            assert!(
+                !dst.exists(),
+                "an unauthenticated peer caused the destination to be created"
+            );
+
+            // the server is still listening and the right key still works
+            push_to(addr, &src, Some(KEY)).unwrap();
+            t.join().unwrap().unwrap();
+            assert_eq!(std::fs::read(&dst).unwrap(), want);
+            let _ = std::fs::remove_dir_all(&d);
+        }
+
+        #[test]
+        fn forged_frame_tag_is_rejected_before_writing() {
+            let d = scratch("forge");
+            let dst = d.join("dst.img");
+            let (addr, t) = spawn_server(&dst, quiet(Some(KEY)));
+            let mut r = Raw::open(addr, 16, Some(KEY));
+            assert_eq!(r.verdict, 1);
+            r.frame_raw(0, 4, b"EVIL", Some(vec![0u8; 32]));
+            let e = t.join().unwrap().err().expect("expected an error");
+            assert_eq!(e.kind(), io::ErrorKind::InvalidData, "{e}");
+            assert_eq!(
+                std::fs::read(&dst).unwrap(),
+                vec![0u8; 16],
+                "forged frame was written"
+            );
+            let _ = std::fs::remove_dir_all(&d);
+        }
+
+        #[test]
+        fn replayed_frame_is_rejected() {
+            // Same bytes, same valid tag for seq 0, sent twice: the second must fail.
+            let d = scratch("replay");
+            let dst = d.join("dst.img");
+            let (addr, t) = spawn_server(&dst, quiet(Some(KEY)));
+            let mut r = Raw::open(addr, 16, Some(KEY));
+            let mut hdr = vec![1u8];
+            hdr.extend_from_slice(&0u64.to_le_bytes());
+            hdr.extend_from_slice(&4u32.to_le_bytes());
+            let tag = frame_tag(KEY, &r.nonce, 0, &hdr, b"ABCD").to_vec();
+            r.frame_raw(0, 4, b"ABCD", Some(tag.clone()));
+            r.frame_raw(0, 4, b"ABCD", Some(tag));
+            assert!(t.join().unwrap().is_err());
+            let _ = std::fs::remove_dir_all(&d);
+        }
+
+        #[test]
+        fn old_protocol_version_is_refused_without_touching_destination() {
+            let d = scratch("v1");
+            let dst = d.join("dst.img");
+            let (addr, t) = spawn_server(&dst, quiet(None));
+            let mut s = TcpStream::connect(addr).unwrap();
+            let mut h = b"SFDD".to_vec();
+            h.push(1);
+            h.extend_from_slice(&16u64.to_le_bytes());
+            h.extend_from_slice(&0u32.to_le_bytes());
+            s.write_all(&h).unwrap();
+            drop(s);
+            assert!(!dst.exists());
+            // server survives; finish it with a good session
+            let r = Raw::open(addr, 4, None);
+            assert_eq!(r.verdict, 1);
+            let mut r = r;
+            r.end();
+            t.join().unwrap().unwrap();
+            let _ = std::fs::remove_dir_all(&d);
+        }
+
+        // ---- bounds on what the peer declares ----
+
+        #[test]
+        fn frame_beyond_declared_size_is_refused() {
+            let d = scratch("oob");
+            let dst = d.join("dst.img");
+            let (addr, t) = spawn_server(&dst, quiet(None));
+            let mut r = Raw::open(addr, 16, None);
+            r.frame(1 << 30, b"EVIL");
+            let e = t.join().unwrap().err().expect("expected an error");
+            assert_eq!(e.kind(), io::ErrorKind::InvalidData, "{e}");
+            assert_eq!(
+                std::fs::metadata(&dst).unwrap().len(),
+                16,
+                "file grew past the declared size"
+            );
+            let _ = std::fs::remove_dir_all(&d);
+        }
+
+        #[test]
+        fn frame_straddling_declared_size_or_overflowing_is_refused() {
+            for (off, len) in [(14u64, 4usize), (u64::MAX - 1, 4)] {
+                let d = scratch("straddle");
+                let dst = d.join("dst.img");
+                let (addr, t) = spawn_server(&dst, quiet(None));
+                let mut r = Raw::open(addr, 16, None);
+                r.frame(off, &vec![7u8; len]);
+                assert!(t.join().unwrap().is_err(), "off={off} len={len}");
+                assert_eq!(std::fs::read(&dst).unwrap(), vec![0u8; 16]);
+                let _ = std::fs::remove_dir_all(&d);
+            }
+        }
+
+        #[test]
+        fn oversized_frame_length_is_refused_without_reading_the_payload() {
+            let d = scratch("biglen");
+            let dst = d.join("dst.img");
+            let (addr, t) = spawn_server(&dst, quiet(None));
+            // size is large enough that the bound-vs-size check alone would not stop it
+            let mut r = Raw::open(addr, 1 << 40, None);
+            r.frame_raw(0, u32::MAX, &[], None); // header only; the socket stays open
+            let e = t.join().unwrap().err().expect("expected an error");
+            assert_eq!(e.kind(), io::ErrorKind::InvalidData, "{e}");
+            drop(r);
+            let _ = std::fs::remove_dir_all(&d);
+        }
+
+        #[test]
+        fn absurd_declared_size_is_refused_before_set_len() {
+            let d = scratch("hugesize");
+            let dst = d.join("dst.img");
+            let mut o = quiet(None);
+            o.max_size = 1 << 20;
+            let (addr, t) = spawn_server(&dst, o);
+            let r = Raw::open(addr, (1 << 20) + 1, None);
+            assert_eq!(r.verdict, 0);
+            assert!(t.join().unwrap().is_err());
+            assert!(!dst.exists() || std::fs::metadata(&dst).unwrap().len() == 0);
+            let _ = std::fs::remove_dir_all(&d);
+
+            // and the default cap rejects a u64::MAX declaration
+            let d = scratch("hugesize2");
+            let dst = d.join("dst.img");
+            let (addr, t) = spawn_server(&dst, quiet(None));
+            let r = Raw::open(addr, u64::MAX, None);
+            assert_eq!(r.verdict, 0);
+            assert!(t.join().unwrap().is_err());
+            assert!(!dst.exists() || std::fs::metadata(&dst).unwrap().len() == 0);
+            let _ = std::fs::remove_dir_all(&d);
+        }
+
+        #[test]
+        fn existing_nonempty_file_is_not_truncated_without_force() {
+            let d = scratch("force");
+            let (src, want) = make_src(&d);
+            let dst = d.join("dst.img");
+            std::fs::write(&dst, b"precious data").unwrap();
+            let (addr, t) = spawn_server(&dst, quiet(None));
+            let e = push_to(addr, &src, None).err().expect("expected an error");
+            assert_eq!(e.kind(), io::ErrorKind::PermissionDenied, "{e}");
+            let e = t.join().unwrap().err().expect("expected an error");
+            assert_eq!(e.kind(), io::ErrorKind::AlreadyExists, "{e}");
+            assert_eq!(std::fs::read(&dst).unwrap(), b"precious data");
+
+            // with force the file is replaced, and stale bytes do not survive in the holes
+            std::fs::write(&dst, vec![0xEEu8; 4 << 20]).unwrap();
+            let mut o = quiet(None);
+            o.force = true;
+            let (addr, t) = spawn_server(&dst, o);
+            push_to(addr, &src, None).unwrap();
+            t.join().unwrap().unwrap();
+            assert_eq!(std::fs::read(&dst).unwrap(), want);
+            let _ = std::fs::remove_dir_all(&d);
+        }
+
+        #[test]
+        fn empty_existing_file_needs_no_force() {
+            let d = scratch("emptyok");
+            let (src, want) = make_src(&d);
+            let dst = d.join("dst.img");
+            std::fs::write(&dst, b"").unwrap();
+            let (addr, t) = spawn_server(&dst, quiet(None));
+            push_to(addr, &src, None).unwrap();
+            t.join().unwrap().unwrap();
+            assert_eq!(std::fs::read(&dst).unwrap(), want);
+            let _ = std::fs::remove_dir_all(&d);
+        }
+
+        // ---- sparse device targets (zero_gaps) and same-file refusal ----
+
         use std::fs;
 
         fn frame(off: u64, data: &[u8]) -> Vec<u8> {
@@ -1249,7 +2284,7 @@ pub mod block {
             wire.extend(frame(16384, &[2u8; 4096]));
             wire.push(0x00); // END
             let mut r = &wire[..];
-            let st = recv_extents(&mut r, &d, size, zero_gaps, true).unwrap();
+            let st = recv_extents(&mut r, &mut None, &d, size, zero_gaps, true).unwrap();
             assert_eq!(st.bytes_copied, 8192);
             let got = fs::read(&path).unwrap();
             let _ = fs::remove_file(&path);
@@ -3051,9 +4086,40 @@ pub mod http {
 
     #![allow(dead_code)]
 
-    use std::io::{self, Error, ErrorKind, Write};
+    use std::io::{self, Error, ErrorKind, Read, Write};
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     use crate::sync::tls::client::TlsClient;
+
+    /// Default ceiling on a response body (1 GiB); see [`set_max_response_bytes`].
+    pub const DEFAULT_MAX_RESPONSE_BYTES: u64 = 1 << 30;
+    static MAX_RESPONSE_BYTES: AtomicU64 = AtomicU64::new(DEFAULT_MAX_RESPONSE_BYTES);
+    /// Longest response head (status line + headers) the plain client will buffer.
+    const MAX_HEAD_BYTES: usize = 64 * 1024;
+    /// Longest chunk-size line the plain client will buffer.
+    const MAX_CHUNK_LINE: usize = 1024;
+    /// Idle limit on plain-HTTP sockets (connect-to-close reads/writes).
+    const PLAIN_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+    /// Cap the response body this client will accept from a peer (default
+    /// [`DEFAULT_MAX_RESPONSE_BYTES`]). A response that declares or delivers more is
+    /// refused with `InvalidData`; buffers grow as data arrives, never from a declared
+    /// length. Raise it for objects larger than 1 GiB. Process-wide.
+    pub fn set_max_response_bytes(n: u64) {
+        MAX_RESPONSE_BYTES.store(n, Ordering::Relaxed);
+    }
+
+    /// The current response-body cap (see [`set_max_response_bytes`]).
+    pub fn max_response_bytes() -> u64 {
+        MAX_RESPONSE_BYTES.load(Ordering::Relaxed)
+    }
+
+    fn too_large() -> Error {
+        Error::new(
+            ErrorKind::InvalidData,
+            "HTTP response larger than the configured maximum (see http::set_max_response_bytes)",
+        )
+    }
 
     pub struct Response {
         pub status: u16,
@@ -3084,7 +4150,11 @@ pub mod http {
         let mut c = TlsClient::connect(host, port, verify)?;
         write_request(&mut c, host, port, method, path, extra_headers, body)?;
         let raw = c.recv_all()?; // the Web sweep: decrypt records across all cores
-        parse_response(&raw)
+        parse_response(
+            &raw,
+            method.eq_ignore_ascii_case("HEAD"),
+            max_response_bytes(),
+        )
     }
 
     /// One plain HTTP/1.1 request over TCP (no TLS) — for loopback S3 reads where the data and
@@ -3098,13 +4168,19 @@ pub mod http {
         extra_headers: &[(String, String)],
         body: &[u8],
     ) -> io::Result<Response> {
-        use std::io::Read;
         use std::net::TcpStream;
         let mut c = TcpStream::connect((host, port))?;
+        c.set_read_timeout(Some(PLAIN_IO_TIMEOUT))?;
+        c.set_write_timeout(Some(PLAIN_IO_TIMEOUT))?;
         write_request(&mut c, host, port, method, path, extra_headers, body)?;
-        let mut raw = Vec::new();
-        c.read_to_end(&mut raw)?;
-        parse_response(&raw)
+        // Stream-decode with the cap on the decoded body: a valid chunked answer is not rejected for
+        // its framing overhead, and an oversized one is refused as soon as it crosses the cap.
+        read_response_ext(
+            &mut c,
+            method.eq_ignore_ascii_case("HEAD"),
+            max_response_bytes(),
+            true,
+        )
     }
 
     /// One plain HTTP request on an EXISTING connection, keep-alive: writes the request, reads
@@ -3120,7 +4196,204 @@ pub mod http {
         extra_headers: &[(String, String)],
         body: &[u8],
     ) -> io::Result<Response> {
-        use std::io::Write;
+        request_plain_on_max(
+            conn,
+            host,
+            port,
+            method,
+            path,
+            extra_headers,
+            body,
+            max_response_bytes(),
+        )
+    }
+
+    /// One CRLF-terminated line, including the CRLF, read a byte at a time so nothing past it is
+    /// consumed from a keep-alive connection. At most `max` bytes are buffered for it.
+    fn read_crlf_line<R: Read>(conn: &mut R, what: &str, max: usize) -> io::Result<Vec<u8>> {
+        let mut line = Vec::new();
+        let mut b = [0u8; 1];
+        loop {
+            match conn.read(&mut b) {
+                Ok(0) => {
+                    return Err(Error::new(
+                        ErrorKind::UnexpectedEof,
+                        format!("eof in {what}"),
+                    ))
+                }
+                Ok(_) => {
+                    line.push(b[0]);
+                    if line.ends_with(b"\r\n") {
+                        return Ok(line);
+                    }
+                    if line.len() > max {
+                        return Err(Error::new(
+                            ErrorKind::InvalidData,
+                            format!("{what} too long"),
+                        ));
+                    }
+                }
+                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// Read exactly one HTTP/1.1 response from `conn`: the head, then the body by chunked framing
+    /// or Content-Length, leaving the connection positioned at the next response. `head_only` is
+    /// set for a HEAD request. Every length the peer declares is checked against `max` before
+    /// anything is buffered for it.
+    fn read_response<R: Read>(conn: &mut R, head_only: bool, max: u64) -> io::Result<Response> {
+        read_response_ext(conn, head_only, max, false)
+    }
+
+    /// Read one response: head, then the body per its framing, enforcing `max` on the DECODED body
+    /// as the bytes arrive (a chunked body costs more on the wire than it holds; that framing
+    /// overhead is bounded per line, never by a share of the body cap). `until_close` is for a
+    /// `Connection: close` request: a response with neither Content-Length nor chunking then
+    /// runs to end of stream, still capped at `max`.
+    fn read_response_ext<R: Read>(
+        conn: &mut R,
+        head_only: bool,
+        max: u64,
+        until_close: bool,
+    ) -> io::Result<Response> {
+        let mut buf = Vec::with_capacity(8192);
+        let head_end = loop {
+            let mut b = [0u8; 1];
+            match conn.read(&mut b) {
+                Ok(0) => return Err(Error::new(ErrorKind::UnexpectedEof, "eof in response head")),
+                Ok(_) => {
+                    buf.push(b[0]);
+                    if buf.len() >= 4 && &buf[buf.len() - 4..] == b"\r\n\r\n" {
+                        break buf.len();
+                    }
+                    if buf.len() > MAX_HEAD_BYTES {
+                        return Err(Error::new(
+                            ErrorKind::InvalidData,
+                            "response head too large",
+                        ));
+                    }
+                }
+                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            }
+        };
+        let head =
+            std::str::from_utf8(&buf[..head_end]).map_err(|_| io::Error::other("non-utf8 head"))?;
+        let mut lines = head.split("\r\n");
+        let status = lines
+            .next()
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|s| s.parse::<u16>().ok())
+            .ok_or_else(|| io::Error::other("bad status line"))?;
+        let mut content_length = 0u64;
+        let mut has_length = false;
+        let mut chunked = false;
+        let mut headers: Vec<(String, String)> = Vec::new();
+        for l in lines {
+            if let Some((k, v)) = l.split_once(':') {
+                headers.push((k.trim().to_string(), v.trim().to_string()));
+                let (k, v) = (k.trim().to_ascii_lowercase(), v.trim());
+                if k == "content-length" {
+                    has_length = true;
+                    content_length = v
+                        .parse()
+                        .map_err(|_| Error::new(ErrorKind::InvalidData, "bad Content-Length"))?;
+                }
+                if k == "transfer-encoding" && v.to_ascii_lowercase().contains("chunked") {
+                    chunked = true;
+                }
+            }
+        }
+        let body = if head_only || status == 204 || status == 304 {
+            Vec::new() // no body follows, whatever the headers declare
+        } else if chunked {
+            let mut out: Vec<u8> = Vec::new();
+            loop {
+                let size_line = read_crlf_line(conn, "chunk size", MAX_CHUNK_LINE)?;
+                let size = u64::from_str_radix(
+                    std::str::from_utf8(&size_line[..size_line.len() - 2])
+                        .unwrap_or("")
+                        .split(';')
+                        .next()
+                        .unwrap_or("0")
+                        .trim(),
+                    16,
+                )
+                .map_err(|_| Error::new(ErrorKind::InvalidData, "bad chunk size"))?;
+                if size == 0 {
+                    // Consume the trailer section, up to and including its blank line, so the
+                    // next response on this connection starts at its own status line.
+                    loop {
+                        if read_crlf_line(conn, "chunk trailer", MAX_HEAD_BYTES)?.len() == 2 {
+                            break;
+                        }
+                    }
+                    break;
+                }
+                if size > max.saturating_sub(out.len() as u64) {
+                    return Err(too_large());
+                }
+                let got = (&mut *conn).take(size).read_to_end(&mut out)? as u64;
+                if got != size {
+                    return Err(Error::new(ErrorKind::UnexpectedEof, "truncated chunk"));
+                }
+                let mut crlf = [0u8; 2];
+                conn.read_exact(&mut crlf)?;
+                if &crlf != b"\r\n" {
+                    return Err(Error::new(
+                        ErrorKind::InvalidData,
+                        "missing chunk terminator",
+                    ));
+                }
+            }
+            out
+        } else if content_length > 0 {
+            if content_length > max {
+                return Err(too_large());
+            }
+            // grow as bytes arrive: never allocate from the declared length
+            let mut out = Vec::new();
+            let got = (&mut *conn).take(content_length).read_to_end(&mut out)? as u64;
+            if got != content_length {
+                return Err(Error::new(
+                    ErrorKind::UnexpectedEof,
+                    "truncated response body",
+                ));
+            }
+            out
+        } else if until_close && !has_length {
+            // close-delimited body: read to end of stream, one byte past the cap so overflow is seen
+            let mut out = Vec::new();
+            (&mut *conn)
+                .take(max.saturating_add(1))
+                .read_to_end(&mut out)?;
+            if out.len() as u64 > max {
+                return Err(too_large());
+            }
+            out
+        } else {
+            Vec::new()
+        };
+        Ok(Response {
+            status,
+            headers,
+            body,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn request_plain_on_max(
+        conn: &mut std::net::TcpStream,
+        host: &str,
+        port: u16,
+        method: &str,
+        path: &str,
+        extra_headers: &[(String, String)],
+        body: &[u8],
+        max: u64,
+    ) -> io::Result<Response> {
         let host_hdr = if port == 443 {
             host.to_string()
         } else {
@@ -3138,124 +4411,7 @@ pub mod http {
         }
         conn.flush()?;
 
-        read_response(conn)
-    }
-
-    /// One CRLF-terminated line, including the CRLF, read a byte at a time so nothing past it is
-    /// consumed from a keep-alive connection.
-    fn read_crlf_line<R: std::io::Read>(conn: &mut R, what: &str) -> io::Result<Vec<u8>> {
-        const MAX: usize = 64 * 1024;
-        let mut line = Vec::new();
-        let mut b = [0u8; 1];
-        loop {
-            match conn.read(&mut b) {
-                Ok(0) => {
-                    return Err(io::Error::new(
-                        ErrorKind::UnexpectedEof,
-                        format!("eof in {what}"),
-                    ))
-                }
-                Ok(_) => {
-                    line.push(b[0]);
-                    if line.ends_with(b"\r\n") {
-                        return Ok(line);
-                    }
-                    if line.len() > MAX {
-                        return Err(io::Error::other(format!("{what} line too long")));
-                    }
-                }
-                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
-                Err(e) => return Err(e),
-            }
-        }
-    }
-
-    /// Read exactly one HTTP/1.1 response from `conn`: the head, then the body by chunked framing
-    /// or Content-Length, leaving the connection positioned at the next response.
-    fn read_response<R: std::io::Read>(conn: &mut R) -> io::Result<Response> {
-        // Read one response head, then the body per Content-Length.
-        let mut buf = Vec::with_capacity(8192);
-        let head_end = loop {
-            let mut b = [0u8; 1];
-            match conn.read(&mut b) {
-                Ok(0) => {
-                    return Err(io::Error::new(
-                        ErrorKind::UnexpectedEof,
-                        "eof in response head",
-                    ))
-                }
-                Ok(_) => {
-                    buf.push(b[0]);
-                    if buf.len() >= 4 && &buf[buf.len() - 4..] == b"\r\n\r\n" {
-                        break buf.len();
-                    }
-                }
-                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
-                Err(e) => return Err(e),
-            }
-        };
-        let head =
-            std::str::from_utf8(&buf[..head_end]).map_err(|_| io::Error::other("non-utf8 head"))?;
-        let mut lines = head.split("\r\n");
-        let status = lines
-            .next()
-            .and_then(|l| l.split_whitespace().nth(1))
-            .and_then(|s| s.parse::<u16>().ok())
-            .ok_or_else(|| io::Error::other("bad status line"))?;
-        let mut content_length = 0usize;
-        let mut chunked = false;
-        for l in lines {
-            if let Some((k, v)) = l.split_once(':') {
-                let (k, v) = (k.trim().to_ascii_lowercase(), v.trim());
-                if k == "content-length" {
-                    content_length = v.parse().unwrap_or(0);
-                }
-                if k == "transfer-encoding" && v.to_ascii_lowercase().contains("chunked") {
-                    chunked = true;
-                }
-            }
-        }
-        let body = if chunked {
-            let mut out = Vec::new();
-            loop {
-                let size_line = read_crlf_line(conn, "chunk size")?;
-                let size = usize::from_str_radix(
-                    std::str::from_utf8(&size_line[..size_line.len() - 2])
-                        .unwrap_or("")
-                        .split(';')
-                        .next()
-                        .unwrap_or("0")
-                        .trim(),
-                    16,
-                )
-                .map_err(|_| io::Error::other("bad chunk size"))?;
-                if size == 0 {
-                    // Consume the trailer section, up to and including its blank line, so the
-                    // next response on this connection starts at its own status line.
-                    loop {
-                        if read_crlf_line(conn, "chunk trailer")?.len() == 2 {
-                            break;
-                        }
-                    }
-                    break;
-                }
-                let mut chunk = vec![0u8; size + 2];
-                conn.read_exact(&mut chunk)?;
-                out.extend_from_slice(&chunk[..size]);
-            }
-            out
-        } else if content_length > 0 {
-            let mut out = vec![0u8; content_length];
-            conn.read_exact(&mut out)?;
-            out
-        } else {
-            Vec::new()
-        };
-        Ok(Response {
-            status,
-            headers: vec![],
-            body,
-        })
+        read_response(conn, method.eq_ignore_ascii_case("HEAD"), max)
     }
 
     fn write_request<W: Write>(
@@ -3286,7 +4442,7 @@ pub mod http {
         Ok(())
     }
 
-    fn parse_response(raw: &[u8]) -> io::Result<Response> {
+    fn parse_response(raw: &[u8], head_only: bool, max: u64) -> io::Result<Response> {
         let sep = find(raw, b"\r\n\r\n")
             .ok_or_else(|| Error::new(ErrorKind::InvalidData, "no header terminator"))?;
         let head = std::str::from_utf8(&raw[..sep])
@@ -3305,6 +4461,7 @@ pub mod http {
             })?;
         let mut headers = Vec::new();
         let mut chunked = false;
+        let mut content_length: Option<u64> = None;
         for l in lines {
             if let Some((k, v)) = l.split_once(':') {
                 let k = k.trim().to_string();
@@ -3313,13 +4470,36 @@ pub mod http {
                 {
                     chunked = true;
                 }
+                if k.eq_ignore_ascii_case("content-length") {
+                    content_length =
+                        Some(v.parse().map_err(|_| {
+                            Error::new(ErrorKind::InvalidData, "bad Content-Length")
+                        })?);
+                }
                 headers.push((k, v));
             }
         }
         let body_raw = &raw[sep + 4..];
-        let body = if chunked {
-            dechunk(body_raw)?
+        let body = if head_only || status == 204 || status == 304 {
+            Vec::new() // no body follows, whatever the headers declare
+        } else if chunked {
+            dechunk(body_raw, max)?
+        } else if let Some(cl) = content_length {
+            // a body shorter than declared is a truncated transfer, not a complete answer
+            if cl > max {
+                return Err(too_large());
+            }
+            if (body_raw.len() as u64) < cl {
+                return Err(Error::new(
+                    ErrorKind::UnexpectedEof,
+                    "truncated response body (shorter than Content-Length)",
+                ));
+            }
+            body_raw[..cl as usize].to_vec()
         } else {
+            if body_raw.len() as u64 > max {
+                return Err(too_large());
+            }
             body_raw.to_vec()
         };
         Ok(Response {
@@ -3329,7 +4509,7 @@ pub mod http {
         })
     }
 
-    fn dechunk(mut b: &[u8]) -> io::Result<Vec<u8>> {
+    fn dechunk(mut b: &[u8], max: u64) -> io::Result<Vec<u8>> {
         let mut out = Vec::new();
         loop {
             let nl = find(b, b"\r\n")
@@ -3341,11 +4521,23 @@ pub mod http {
             if size == 0 {
                 break;
             }
-            if b.len() < size {
-                return Err(Error::new(ErrorKind::InvalidData, "truncated chunk"));
+            if (size as u64) > max.saturating_sub(out.len() as u64) {
+                return Err(too_large());
+            }
+            // data + its CRLF must both be present (a response cut right after the data
+            // has no terminator); checked_add so a huge declared size cannot wrap
+            let end = size
+                .checked_add(2)
+                .filter(|&e| e <= b.len())
+                .ok_or_else(|| Error::new(ErrorKind::InvalidData, "truncated chunk"))?;
+            if &b[size..end] != b"\r\n" {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    "missing chunk terminator",
+                ));
             }
             out.extend_from_slice(&b[..size]);
-            b = &b[size + 2..]; // skip data + CRLF
+            b = &b[end..];
         }
         Ok(out)
     }
@@ -3357,6 +4549,194 @@ pub mod http {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use std::io::Read;
+        use std::net::{TcpListener, TcpStream};
+
+        fn parse(raw: &[u8]) -> io::Result<Response> {
+            parse_response(raw, false, max_response_bytes())
+        }
+
+        const CHUNKED: &str = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+
+        fn chunked(body: &str) -> Vec<u8> {
+            format!("{CHUNKED}{body}").into_bytes()
+        }
+
+        #[test]
+        fn chunked_response_without_its_final_crlf_is_an_error_not_a_panic() {
+            for body in [
+                "5\r\nabcde",
+                "5\r\nabcdeX",
+                "5\r\nabcde\r",
+                "5\r\nabcdeXY0\r\n\r\n",
+            ] {
+                let e = parse(&chunked(body))
+                    .err()
+                    .unwrap_or_else(|| panic!("{body:?} accepted"));
+                assert_eq!(e.kind(), ErrorKind::InvalidData, "{body:?}");
+            }
+        }
+
+        #[test]
+        fn well_formed_chunked_responses_still_parse() {
+            let r = parse(&chunked("5\r\nabcde\r\n0\r\n\r\n")).unwrap();
+            assert_eq!(r.body, b"abcde");
+            let r = parse(&chunked("3;ext=1\r\nabc\r\n2\r\nde\r\n0\r\n\r\n")).unwrap();
+            assert_eq!(r.body, b"abcde");
+            let r = parse(&chunked("0\r\n\r\n")).unwrap();
+            assert!(r.body.is_empty());
+        }
+
+        #[test]
+        fn huge_declared_chunk_size_is_an_error() {
+            for sz in ["ffffffffffffffff", "fffffffffffffffe", "7fffffffffffffff"] {
+                let e = parse(&chunked(&format!("{sz}\r\nab\r\n")))
+                    .err()
+                    .expect("accepted");
+                assert_eq!(e.kind(), ErrorKind::InvalidData, "{sz}");
+            }
+        }
+
+        #[test]
+        fn body_shorter_than_content_length_is_rejected() {
+            let e = parse(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nabc")
+                .err()
+                .expect("truncated body accepted");
+            assert_eq!(e.kind(), ErrorKind::UnexpectedEof);
+            let r = parse(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabc").unwrap();
+            assert_eq!(r.body, b"abc");
+            // surplus bytes beyond the declared length are not part of the body
+            let r = parse(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabcdef").unwrap();
+            assert_eq!(r.body, b"abc");
+            // no Content-Length: read-to-close framing, unchanged
+            let r = parse(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nabcdef").unwrap();
+            assert_eq!(r.body, b"abcdef");
+        }
+
+        #[test]
+        fn head_and_bodiless_statuses_ignore_content_length() {
+            let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 1234\r\n\r\n";
+            let r = parse_response(raw, true, max_response_bytes()).unwrap();
+            assert!(r.body.is_empty());
+            let r = parse(b"HTTP/1.1 304 Not Modified\r\nContent-Length: 1234\r\n\r\n").unwrap();
+            assert_eq!(r.status, 304);
+        }
+
+        #[test]
+        fn default_response_cap_is_one_gib() {
+            assert_eq!(DEFAULT_MAX_RESPONSE_BYTES, 1 << 30);
+            assert_eq!(max_response_bytes(), 1 << 30);
+        }
+
+        /// A one-shot server: read the request head, send `reply`, then close.
+        fn serve_once(reply: Vec<u8>) -> (TcpStream, std::thread::JoinHandle<()>) {
+            let l = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let addr = l.local_addr().unwrap();
+            let t = std::thread::spawn(move || {
+                let (mut s, _) = l.accept().unwrap();
+                let mut seen = Vec::new();
+                let mut b = [0u8; 1];
+                while !seen.ends_with(b"\r\n\r\n") {
+                    if s.read(&mut b).unwrap_or(0) == 0 {
+                        break;
+                    }
+                    seen.push(b[0]);
+                }
+                let _ = s.write_all(&reply);
+            });
+            let c = TcpStream::connect(addr).unwrap();
+            c.set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                .unwrap();
+            (c, t)
+        }
+
+        fn get_plain(reply: &[u8], method: &str) -> io::Result<Response> {
+            let (mut c, t) = serve_once(reply.to_vec());
+            let r = request_plain_on(&mut c, "h", 80, method, "/", &[], &[]);
+            let _ = t.join();
+            r
+        }
+
+        #[test]
+        fn plain_on_refuses_a_huge_declared_content_length_without_allocating() {
+            let e = get_plain(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 99999999999\r\n\r\nabc",
+                "GET",
+            )
+            .err()
+            .expect("accepted");
+            assert_eq!(e.kind(), ErrorKind::InvalidData, "{e}");
+        }
+
+        #[test]
+        fn plain_on_chunk_size_that_wraps_is_an_error_not_a_panic() {
+            let e = get_plain(&chunked("ffffffffffffffff\r\nabc"), "GET")
+                .err()
+                .expect("accepted");
+            assert_eq!(e.kind(), ErrorKind::InvalidData, "{e}");
+        }
+
+        #[test]
+        fn plain_on_refuses_a_chunk_larger_than_the_cap() {
+            let e = get_plain(&chunked("100000000\r\nabc"), "GET")
+                .err()
+                .expect("accepted");
+            assert_eq!(e.kind(), ErrorKind::InvalidData, "{e}");
+        }
+
+        #[test]
+        fn plain_on_truncated_body_is_an_error() {
+            let e = get_plain(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n0123456789",
+                "GET",
+            )
+            .err()
+            .expect("accepted");
+            assert_eq!(e.kind(), ErrorKind::UnexpectedEof, "{e}");
+        }
+
+        #[test]
+        fn plain_on_chunk_without_terminator_is_an_error() {
+            let e = get_plain(&chunked("5\r\nabcdeXY"), "GET")
+                .err()
+                .expect("accepted");
+            assert_eq!(e.kind(), ErrorKind::InvalidData, "{e}");
+        }
+
+        #[test]
+        fn plain_on_good_responses_still_work() {
+            let r = get_plain(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello", "GET").unwrap();
+            assert_eq!((r.status, r.body.as_slice()), (200, &b"hello"[..]));
+            let r = get_plain(&chunked("5\r\nhello\r\n0\r\n\r\n"), "GET").unwrap();
+            assert_eq!(r.body, b"hello");
+            let r = get_plain(b"HTTP/1.1 200 OK\r\nContent-Length: 77\r\n\r\n", "HEAD").unwrap();
+            assert!(r.body.is_empty());
+        }
+
+        #[test]
+        fn plain_on_oversized_response_head_is_refused() {
+            let mut reply = b"HTTP/1.1 200 OK\r\nX: ".to_vec();
+            reply.extend(std::iter::repeat_n(b'a', 200 * 1024));
+            let e = get_plain(&reply, "GET").err().expect("accepted");
+            assert_eq!(e.kind(), ErrorKind::InvalidData, "{e}");
+        }
+
+        #[test]
+        fn configurable_cap_applies_to_declared_and_chunked_bodies() {
+            let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\n01234567890";
+            assert!(parse_response(raw, false, 10).is_err());
+            assert_eq!(parse_response(raw, false, 11).unwrap().body.len(), 11);
+            let raw = chunked("6\r\n012345\r\n6\r\n012345\r\n0\r\n\r\n");
+            assert!(parse_response(&raw, false, 11).is_err());
+            assert_eq!(parse_response(&raw, false, 12).unwrap().body.len(), 12);
+            let (mut c, t) =
+                serve_once(b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\n01234567890".to_vec());
+            let e = request_plain_on_max(&mut c, "h", 80, "GET", "/", &[], &[], 10)
+                .err()
+                .expect("accepted");
+            assert_eq!(e.kind(), ErrorKind::InvalidData);
+            let _ = t.join();
+        }
 
         /// Two keep-alive responses back to back on one stream: the second must start at its own
         /// status line, so the first has to consume its trailer section and final blank line.
@@ -3365,9 +4745,9 @@ pub mod http {
             let wire = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nx\r\n0\r\n\r\n\
                          HTTP/1.1 201 Created\r\nTransfer-Encoding: chunked\r\n\r\n1\r\ny\r\n0\r\n\r\n";
             let mut r = &wire[..];
-            let a = read_response(&mut r).unwrap();
+            let a = read_response(&mut r, false, max_response_bytes()).unwrap();
             assert_eq!((a.status, a.body.as_slice()), (200, &b"x"[..]));
-            let b = read_response(&mut r).unwrap();
+            let b = read_response(&mut r, false, max_response_bytes()).unwrap();
             assert_eq!((b.status, b.body.as_slice()), (201, &b"y"[..]));
             assert!(r.is_empty());
         }
@@ -3377,8 +4757,18 @@ pub mod http {
             let wire = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nhi\r\n0\r\nX-Sum: 1\r\nX-More: 2\r\n\r\n\
                          HTTP/1.1 204 No Content\r\n\r\n";
             let mut r = &wire[..];
-            assert_eq!(read_response(&mut r).unwrap().body, b"hi");
-            assert_eq!(read_response(&mut r).unwrap().status, 204);
+            assert_eq!(
+                read_response(&mut r, false, max_response_bytes())
+                    .unwrap()
+                    .body,
+                b"hi"
+            );
+            assert_eq!(
+                read_response(&mut r, false, max_response_bytes())
+                    .unwrap()
+                    .status,
+                204
+            );
         }
 
         #[test]
@@ -3386,7 +4776,64 @@ pub mod http {
             let wire =
                 b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nx\r\n0\r\nX-Sum: 1\r\n";
             let mut r = &wire[..];
-            assert!(read_response(&mut r).is_err());
+            assert!(read_response(&mut r, false, max_response_bytes()).is_err());
+        }
+
+        /// `n` one-byte chunks: the worst framing ratio (6 wire bytes per body byte).
+        fn one_byte_chunks(n: usize, head: &str) -> Vec<u8> {
+            let mut w =
+                format!("HTTP/1.1 200 OK\r\n{head}Transfer-Encoding: chunked\r\n\r\n").into_bytes();
+            for _ in 0..n {
+                w.extend_from_slice(b"1\r\nx\r\n");
+            }
+            w.extend_from_slice(b"0\r\n\r\n");
+            w
+        }
+
+        #[test]
+        fn the_body_cap_counts_decoded_bytes_not_framing() {
+            // 4096 body bytes sent as 4096 one-byte chunks is ~24 KiB on the wire; with a cap of
+            // exactly 4096 it must be accepted (framing overhead is not body).
+            let wire = one_byte_chunks(4096, "");
+            let mut r = &wire[..];
+            let resp = read_response_ext(&mut r, false, 4096, true).unwrap();
+            assert_eq!(resp.body.len(), 4096);
+            // one byte over the decoded cap is refused
+            let wire = one_byte_chunks(4097, "");
+            let mut r = &wire[..];
+            assert!(read_response_ext(&mut r, false, 4096, true).is_err());
+        }
+
+        #[test]
+        fn request_plain_accepts_a_valid_response_in_tiny_chunks() {
+            let l = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let port = l.local_addr().unwrap().port();
+            let wire = one_byte_chunks(20_000, "ETag: \"abc\"\r\n");
+            let t = std::thread::spawn(move || {
+                let (mut c, _) = l.accept().unwrap();
+                let mut head = [0u8; 1024];
+                let _ = c.read(&mut head);
+                c.write_all(&wire).unwrap();
+            });
+            let resp = request_plain("127.0.0.1", port, "GET", "/", &[], &[]).unwrap();
+            t.join().unwrap();
+            assert_eq!(resp.status, 200);
+            assert_eq!(resp.body.len(), 20_000);
+            assert_eq!(resp.header("etag"), Some("\"abc\""));
+        }
+
+        #[test]
+        fn a_close_delimited_body_is_read_to_the_end_and_capped() {
+            let wire = b"HTTP/1.1 200 OK\r\nX-Id: 7\r\n\r\nhello".to_vec();
+            let mut r = &wire[..];
+            let resp = read_response_ext(&mut r, false, 1024, true).unwrap();
+            assert_eq!(resp.body, b"hello");
+            assert_eq!(resp.header("x-id"), Some("7"));
+            let mut r = &wire[..];
+            assert!(read_response_ext(&mut r, false, 4, true).is_err());
+            // the keep-alive reader still treats a frameless body as empty
+            let mut r = &wire[..];
+            assert!(read_response(&mut r, false, 1024).unwrap().body.is_empty());
         }
     }
 }
@@ -3860,7 +5307,7 @@ pub mod image {
 
     // ───────────────────────── qcow2 (READ) ─────────────────────────
     //
-    // Spec: QEMU `docs/interop/qcow2.txt`. All multi-byte fields big-endian. We read   CITATION-EXEMPT: the QEMU qcow2 spec, a tree outside `fold`
+    // Spec: QEMU `docs/interop/qcow2.txt`. All multi-byte fields big-endian. We read
     // the header, then flatten the two-level L1/L2 table into one guest-cluster →
     // host-offset map (0 = unallocated → zeros). Uncompressed, no backing file, no
     // encryption — the common `qemu-img convert -O qcow2` output.
@@ -3868,6 +5315,8 @@ pub mod image {
     const QCOW_MAGIC: u32 = 0x5146_49fb; // "QFI\xfb"
     const OFFSET_MASK: u64 = 0x00ff_ffff_ffff_ffff & !0x1ff; // bits 9..55 = offset
     const L2E_COMPRESSED: u64 = 1 << 62;
+    /// Largest guest-cluster map `Qcow2::open` will build (4 GiB = 512M clusters).
+    const MAX_QCOW2_MAP_BYTES: u64 = 4 << 30;
 
     pub struct Qcow2 {
         file: File,
@@ -3908,10 +5357,35 @@ pub mod image {
 
             let l2_entries = cluster / 8;
             let nclusters = size.div_ceil(cluster);
-            let mut map = vec![0u64; nclusters as usize];
+            // Every size below is declared by the (untrusted) header, so check it against
+            // what the file can actually hold before allocating from it.
+            let file_len = file.metadata()?.len();
+            if nclusters > l1_size * l2_entries {
+                return Err(bad(
+                    "qcow2 L1 table is too small for the declared virtual size",
+                ));
+            }
+            let l1_bytes = l1_size * 8; // l1_size is a u32: no overflow
+            if l1_size > 0
+                && l1_off
+                    .checked_add(l1_bytes)
+                    .is_none_or(|end| end > file_len)
+            {
+                return Err(bad("qcow2 L1 table lies beyond the end of the file"));
+            }
+            if nclusters > MAX_QCOW2_MAP_BYTES / 8 {
+                return Err(bad("qcow2 virtual size too large"));
+            }
+            let mut map: Vec<u64> = Vec::new();
+            map.try_reserve_exact(nclusters as usize)
+                .map_err(|_| bad("cannot allocate the qcow2 cluster map"))?;
+            map.resize(nclusters as usize, 0);
 
             // Read each referenced L2 table once, fill the slice of `map` it covers.
-            let mut l1 = vec![0u8; (l1_size * 8) as usize];
+            let mut l1: Vec<u8> = Vec::new();
+            l1.try_reserve_exact(l1_bytes as usize)
+                .map_err(|_| bad("cannot allocate the qcow2 L1 table"))?;
+            l1.resize(l1_bytes as usize, 0);
             if l1_size > 0 {
                 read_full_at(&file, &mut l1, l1_off)?;
             }
@@ -4262,9 +5736,13 @@ pub mod image {
             if &rt[0..4] != b"regi" {
                 return Err(bad("bad VHDX region table signature"));
             }
-            let entry_count = le32(&rt, 8);
+            let file_len = file.metadata()?.len();
+            let entry_count = le32(&rt, 8) as usize;
+            if entry_count > (rt.len() - 16) / 32 {
+                return Err(bad("VHDX region table entry count exceeds the table"));
+            }
             let (mut bat_off, mut bat_len, mut meta_off) = (0u64, 0u64, 0u64);
-            for i in 0..entry_count as usize {
+            for i in 0..entry_count {
                 let e = 16 + i * 32;
                 let guid = &rt[e..e + 16];
                 let off = le64(&rt, e + 16);
@@ -4279,6 +5757,12 @@ pub mod image {
             if bat_off == 0 || meta_off == 0 {
                 return Err(bad("VHDX region table missing BAT or metadata"));
             }
+            if bat_off
+                .checked_add(bat_len)
+                .is_none_or(|end| end > file_len)
+            {
+                return Err(bad("VHDX BAT region lies beyond the end of the file"));
+            }
 
             // Metadata: virtual size, block size, logical sector size.
             let mut md = vec![0u8; 65536];
@@ -4289,8 +5773,16 @@ pub mod image {
             let mcount = u16::from_le_bytes(md[10..12].try_into().unwrap());
             let (mut size, mut block, mut lss) = (0u64, 0u64, 512u64);
             // metadata items may sit beyond 64 KB — read more if needed via a helper.
-            let read_item = |rel: u32, len: u32| -> io::Result<Vec<u8>> {
-                let mut v = vec![0u8; len as usize];
+            // Only the first `need` bytes of an item are used, so read just those, and
+            // only if the item (as declared) lies inside the file.
+            let read_item = |rel: u32, len: u32, need: usize| -> io::Result<Vec<u8>> {
+                let end = meta_off
+                    .checked_add(rel as u64 + len as u64)
+                    .filter(|&e| e <= file_len);
+                if (len as usize) < need || end.is_none() {
+                    return Err(bad("VHDX metadata item lies beyond the end of the file"));
+                }
+                let mut v = vec![0u8; need];
                 read_full_at(&file, &mut v, meta_off + rel as u64)?;
                 Ok(v)
             };
@@ -4303,11 +5795,11 @@ pub mod image {
                 let off = le32(&md, e + 16);
                 let len = le32(&md, e + 20);
                 if guid == GUID_VDISK_SIZE {
-                    size = le64(&read_item(off, len)?, 0);
+                    size = le64(&read_item(off, len, 8)?, 0);
                 } else if guid == GUID_FILE_PARAMS {
-                    block = le32(&read_item(off, len)?, 0) as u64;
+                    block = le32(&read_item(off, len, 4)?, 0) as u64;
                 } else if guid == GUID_LOGICAL_SS {
-                    lss = le32(&read_item(off, len)?, 0) as u64;
+                    lss = le32(&read_item(off, len, 4)?, 0) as u64;
                 }
             }
             if block == 0 || size == 0 {
@@ -4316,9 +5808,23 @@ pub mod image {
                     return Err(bad("VHDX metadata missing block size"));
                 }
             }
+            // The spec's ranges: block 1 MiB..=256 MiB (power of two), sector 512 or 4096,
+            // virtual size at most 64 TiB. This also keeps `chunk_ratio` non-zero.
+            if !block.is_power_of_two() || !(MB..=256 * MB).contains(&block) {
+                return Err(bad("implausible VHDX block size"));
+            }
+            if lss != 512 && lss != 4096 {
+                return Err(bad("implausible VHDX logical sector size"));
+            }
+            if size > 64 << 40 {
+                return Err(bad("VHDX virtual size exceeds the format limit"));
+            }
             let chunk_ratio = (8_388_608u64 * lss) / block;
 
-            let mut batb = vec![0u8; bat_len as usize];
+            let mut batb: Vec<u8> = Vec::new();
+            batb.try_reserve_exact(bat_len as usize)
+                .map_err(|_| bad("cannot allocate the VHDX BAT"))?;
+            batb.resize(bat_len as usize, 0);
             read_full_at(&file, &mut batb, bat_off)?;
             let bat: Vec<u64> = batb
                 .chunks_exact(8)
@@ -4496,9 +6002,241 @@ pub mod image {
 
     #[cfg(test)]
     mod tests {
+        use super::*;
+        use std::path::PathBuf;
+
         #[test]
         fn crc32c_vector() {
             assert_eq!(super::crc32c(b"123456789"), 0xE306_9283);
+        }
+
+        // ---- hostile-image tests (NET-08) ----
+
+        fn scratch(tag: &str) -> PathBuf {
+            let d = std::env::temp_dir().join(format!("img_{tag}_{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&d);
+            std::fs::create_dir_all(&d).unwrap();
+            d
+        }
+
+        /// A raw image with data at both ends and a hole between.
+        fn raw_image(dir: &Path, len: usize) -> (PathBuf, Vec<u8>) {
+            let mut v = vec![0u8; len];
+            v[..4].copy_from_slice(b"HEAD");
+            v[len - 4..].copy_from_slice(b"TAIL");
+            let p = dir.join("in.raw");
+            std::fs::write(&p, &v).unwrap();
+            (p, v)
+        }
+
+        fn read_all(s: &Source) -> Vec<u8> {
+            let mut out = vec![0u8; s.size().unwrap() as usize];
+            let n = s.read_at(0, &mut out).unwrap();
+            assert_eq!(n, out.len());
+            out
+        }
+
+        fn valid_qcow2(dir: &Path) -> PathBuf {
+            let (raw, _) = raw_image(dir, 3 << 20);
+            let dst = dir.join("v.qcow2");
+            write_qcow2(&Source::open(&raw, Format::Raw).unwrap(), &dst, 16).unwrap();
+            dst
+        }
+
+        fn valid_vhdx(dir: &Path) -> PathBuf {
+            let (raw, _) = raw_image(dir, 5 << 20);
+            let dst = dir.join("v.vhdx");
+            write_vhdx(&Source::open(&raw, Format::Raw).unwrap(), &dst, 512).unwrap();
+            dst
+        }
+
+        fn patch(path: &Path, at: u64, bytes: &[u8]) {
+            use std::io::{Seek, SeekFrom, Write};
+            let mut f = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+            f.seek(SeekFrom::Start(at)).unwrap();
+            f.write_all(bytes).unwrap();
+        }
+
+        fn open_err(path: &Path, fmt: Format) -> io::Error {
+            match Source::open(path, fmt) {
+                Ok(_) => panic!("hostile image was accepted"),
+                Err(e) => e,
+            }
+        }
+
+        #[test]
+        fn valid_images_still_round_trip() {
+            let d = scratch("rt");
+            let (raw, want) = raw_image(&d, 3 << 20);
+            let q = d.join("a.qcow2");
+            write_qcow2(&Source::open(&raw, Format::Raw).unwrap(), &q, 16).unwrap();
+            assert_eq!(read_all(&Source::open(&q, Format::Qcow2).unwrap()), want);
+            let (raw, want) = raw_image(&d, 5 << 20);
+            let v = d.join("a.vhdx");
+            write_vhdx(&Source::open(&raw, Format::Raw).unwrap(), &v, 512).unwrap();
+            assert_eq!(read_all(&Source::open(&v, Format::Vhdx).unwrap()), want);
+            let _ = std::fs::remove_dir_all(&d);
+        }
+
+        #[test]
+        fn qcow2_header_declaring_an_absurd_virtual_size_is_rejected() {
+            let d = scratch("q_huge");
+            let p = d.join("evil.qcow2");
+            let mut h = vec![0u8; 4096];
+            h[0..4].copy_from_slice(&QCOW_MAGIC.to_be_bytes());
+            h[4..8].copy_from_slice(&3u32.to_be_bytes());
+            h[20..24].copy_from_slice(&9u32.to_be_bytes()); // 512-byte clusters
+            h[24..32].copy_from_slice(&(1u64 << 62).to_be_bytes());
+            h[36..40].copy_from_slice(&1u32.to_be_bytes());
+            h[40..48].copy_from_slice(&512u64.to_be_bytes());
+            std::fs::write(&p, &h).unwrap();
+            assert_eq!(
+                open_err(&p, Format::Qcow2).kind(),
+                io::ErrorKind::InvalidData
+            );
+            let _ = std::fs::remove_dir_all(&d);
+        }
+
+        #[test]
+        fn qcow2_l1_size_beyond_the_file_is_rejected() {
+            let d = scratch("q_l1");
+            let p = valid_qcow2(&d);
+            patch(&p, 36, &u32::MAX.to_be_bytes());
+            assert_eq!(
+                open_err(&p, Format::Qcow2).kind(),
+                io::ErrorKind::InvalidData
+            );
+            let _ = std::fs::remove_dir_all(&d);
+        }
+
+        #[test]
+        fn qcow2_l1_table_offset_beyond_the_file_is_rejected() {
+            let d = scratch("q_l1off");
+            let p = valid_qcow2(&d);
+            patch(&p, 40, &(1u64 << 40).to_be_bytes());
+            assert_eq!(
+                open_err(&p, Format::Qcow2).kind(),
+                io::ErrorKind::InvalidData
+            );
+            let _ = std::fs::remove_dir_all(&d);
+        }
+
+        #[test]
+        fn qcow2_l1_too_small_for_the_declared_size_is_rejected() {
+            let d = scratch("q_small");
+            let p = valid_qcow2(&d);
+            patch(&p, 24, &(100u64 << 30).to_be_bytes()); // claims 100 GiB, L1 covers 3 MiB
+            assert_eq!(
+                open_err(&p, Format::Qcow2).kind(),
+                io::ErrorKind::InvalidData
+            );
+            let _ = std::fs::remove_dir_all(&d);
+        }
+
+        /// (offset of the region-table entry for `guid`, its file offset field, its length field)
+        fn region_entry(path: &Path, guid: &[u8; 16]) -> (u64, u64) {
+            let f = File::open(path).unwrap();
+            let mut rt = vec![0u8; 65536];
+            read_full_at(&f, &mut rt, 0x30000).unwrap();
+            let n = le32(&rt, 8) as usize;
+            for i in 0..n {
+                let e = 16 + i * 32;
+                if &rt[e..e + 16] == guid {
+                    return (0x30000 + e as u64, le64(&rt, e + 16));
+                }
+            }
+            panic!("region not found");
+        }
+
+        /// Absolute file offset of the 32-byte metadata table entry for `guid`.
+        fn meta_entry(path: &Path, guid: &[u8; 16]) -> u64 {
+            let (_, meta_off) = region_entry(path, &GUID_METADATA);
+            let f = File::open(path).unwrap();
+            let mut md = vec![0u8; 65536];
+            read_full_at(&f, &mut md, meta_off).unwrap();
+            let n = u16::from_le_bytes(md[10..12].try_into().unwrap()) as usize;
+            for i in 0..n {
+                let e = 32 + i * 32;
+                if &md[e..e + 16] == guid {
+                    return meta_off + e as u64;
+                }
+            }
+            panic!("metadata item not found");
+        }
+
+        #[test]
+        fn vhdx_region_table_entry_count_beyond_the_table_is_rejected() {
+            let d = scratch("v_rt");
+            let p = valid_vhdx(&d);
+            patch(&p, 0x30000 + 8, &u32::MAX.to_le_bytes());
+            assert_eq!(
+                open_err(&p, Format::Vhdx).kind(),
+                io::ErrorKind::InvalidData
+            );
+            let _ = std::fs::remove_dir_all(&d);
+        }
+
+        #[test]
+        fn vhdx_bat_region_longer_than_the_file_is_rejected() {
+            let d = scratch("v_bat");
+            let p = valid_vhdx(&d);
+            let (e, _) = region_entry(&p, &GUID_BAT);
+            patch(&p, e + 24, &(256u32 << 20).to_le_bytes());
+            assert_eq!(
+                open_err(&p, Format::Vhdx).kind(),
+                io::ErrorKind::InvalidData
+            );
+            let _ = std::fs::remove_dir_all(&d);
+        }
+
+        #[test]
+        fn vhdx_metadata_item_length_beyond_the_file_is_rejected() {
+            let d = scratch("v_item");
+            let p = valid_vhdx(&d);
+            let e = meta_entry(&p, &GUID_VDISK_SIZE);
+            patch(&p, e + 20, &u32::MAX.to_le_bytes());
+            assert_eq!(
+                open_err(&p, Format::Vhdx).kind(),
+                io::ErrorKind::InvalidData
+            );
+            let _ = std::fs::remove_dir_all(&d);
+        }
+
+        #[test]
+        fn vhdx_zero_logical_sector_size_is_rejected_not_a_division_by_zero() {
+            let d = scratch("v_lss");
+            let p = valid_vhdx(&d);
+            let (_, meta_off) = region_entry(&p, &GUID_METADATA);
+            let e = meta_entry(&p, &GUID_LOGICAL_SS);
+            let f = File::open(&p).unwrap();
+            let mut ent = [0u8; 32];
+            read_full_at(&f, &mut ent, e).unwrap();
+            let item = meta_off + le32(&ent, 16) as u64;
+            patch(&p, item, &0u32.to_le_bytes());
+            // either open refuses, or reading must not panic
+            match Source::open(&p, Format::Vhdx) {
+                Err(e) => assert_eq!(e.kind(), io::ErrorKind::InvalidData),
+                Ok(s) => panic!("accepted a zero logical sector size ({})", s.describe()),
+            }
+            let _ = std::fs::remove_dir_all(&d);
+        }
+
+        #[test]
+        fn vhdx_implausible_block_size_is_rejected() {
+            let d = scratch("v_block");
+            let p = valid_vhdx(&d);
+            let (_, meta_off) = region_entry(&p, &GUID_METADATA);
+            let e = meta_entry(&p, &GUID_FILE_PARAMS);
+            let f = File::open(&p).unwrap();
+            let mut ent = [0u8; 32];
+            read_full_at(&f, &mut ent, e).unwrap();
+            let item = meta_off + le32(&ent, 16) as u64;
+            patch(&p, item, &3u32.to_le_bytes()); // not a power of two, far below 1 MiB
+            assert_eq!(
+                open_err(&p, Format::Vhdx).kind(),
+                io::ErrorKind::InvalidData
+            );
+            let _ = std::fs::remove_dir_all(&d);
         }
     }
 }
@@ -6134,11 +7872,12 @@ pub mod sysio {
     #[cfg(windows)]
     pub fn open_options_mode(_: &mut OpenOptions, _: u32) {}
 
-    /// Set a unix mode on a path / handle (no-op on Windows).
+    /// Set a unix mode on a path / handle (no-op on Windows). Only the permission bits
+    /// (`0o777`) are applied: setuid/setgid/sticky never come from untrusted archive data.
     #[cfg(unix)]
     pub fn set_mode_path(path: &Path, mode: u32) -> io::Result<()> {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode & 0o777))
     }
     #[cfg(windows)]
     pub fn set_mode_path(_: &Path, _: u32) -> io::Result<()> {
@@ -6148,7 +7887,7 @@ pub mod sysio {
     #[cfg(unix)]
     pub fn set_mode_file(f: &File, mode: u32) -> io::Result<()> {
         use std::os::unix::fs::PermissionsExt;
-        f.set_permissions(std::fs::Permissions::from_mode(mode))
+        f.set_permissions(std::fs::Permissions::from_mode(mode & 0o777))
     }
     #[cfg(windows)]
     pub fn set_mode_file(_: &File, _: u32) -> io::Result<()> {
