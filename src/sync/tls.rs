@@ -802,8 +802,17 @@ pub mod client {
             let mut cert_msg: Vec<u8> = Vec::new();
             let mut cv_msg: Vec<u8> = Vec::new();
             let mut cert_request_context: Option<Vec<u8>> = None;
+            let mut flight_bytes = 0usize;
             'flight: loop {
                 while !has_full_msg(&hs_buf) {
+                    // Refuse an oversized message as soon as its header is in, before
+                    // buffering its body (NET-10).
+                    if hs_buf.len() >= 4 && u24(&hs_buf[1..]) > MAX_HANDSHAKE_MSG {
+                        return Err(Error::new(
+                            ErrorKind::InvalidData,
+                            "handshake message too large",
+                        ));
+                    }
                     let (inner_ct, data) =
                         Self::recv_decrypted(&mut sock, &s_hs_gcm, &s_hs_iv, s_seq)?;
                     s_seq += 1;
@@ -811,6 +820,13 @@ pub mod client {
                         return Err(Error::new(
                             ErrorKind::InvalidData,
                             format!("non-handshake in flight: {inner_ct}"),
+                        ));
+                    }
+                    flight_bytes += data.len();
+                    if flight_bytes > MAX_HANDSHAKE_FLIGHT {
+                        return Err(Error::new(
+                            ErrorKind::InvalidData,
+                            "handshake flight too large",
                         ));
                     }
                     hs_buf.extend_from_slice(&data);
@@ -1228,6 +1244,14 @@ pub mod client {
         Ok((pt[end - 1], pt[..end - 1].to_vec()))
     }
 
+    /// Largest single handshake message accepted in the server's encrypted flight.
+    /// 256 KiB is the bound Go's crypto/tls uses for Certificate messages; real
+    /// chains are a few KiB.
+    const MAX_HANDSHAKE_MSG: usize = 256 * 1024;
+    /// Total plaintext accepted for the whole encrypted flight (EncryptedExtensions
+    /// through Finished), checked before certificate validation runs (NET-10).
+    const MAX_HANDSHAKE_FLIGHT: usize = 512 * 1024;
+
     fn u24(b: &[u8]) -> usize {
         ((b[0] as usize) << 16) | ((b[1] as usize) << 8) | b[2] as usize
     }
@@ -1314,12 +1338,17 @@ pub mod client {
         let ext_len =
             ((*b.get(p).ok_or_else(err)? as usize) << 8) | *b.get(p + 1).ok_or_else(err)? as usize;
         p += 2;
-        let end = p + ext_len;
+        // The declared extensions length must fit in the message actually received.
+        let end = p
+            .checked_add(ext_len)
+            .filter(|&e| e <= b.len())
+            .ok_or_else(err)?;
         while p + 4 <= end {
-            let et = ((b[p] as u16) << 8) | b[p + 1] as u16;
-            let el = ((b[p + 2] as usize) << 8) | b[p + 3] as usize;
+            let hdr = b.get(p..p + 4).ok_or_else(err)?;
+            let et = ((hdr[0] as u16) << 8) | hdr[1] as u16;
+            let el = ((hdr[2] as usize) << 8) | hdr[3] as usize;
             p += 4;
-            let data = b.get(p..p + el).ok_or_else(err)?;
+            let data = b.get(p..p + el).filter(|_| p + el <= end).ok_or_else(err)?;
             if et == 0x0033 {
                 if data.len() < 4 {
                     return Err(err());
@@ -1340,6 +1369,198 @@ pub mod client {
             ErrorKind::InvalidData,
             "no key_share in ServerHello",
         ))
+    }
+
+    #[cfg(all(test, unix))]
+    mod handshake_hardening {
+        use super::*;
+
+        fn server_hello_with_ext_block(ext_len: u16, ext_bytes: &[u8]) -> Vec<u8> {
+            let mut body = vec![0x03, 0x03];
+            body.extend_from_slice(&[0u8; 32]); // random
+            body.push(0); // empty legacy_session_id
+            body.extend_from_slice(&[0x13, 0x01]); // TLS_AES_128_GCM_SHA256
+            body.push(0); // compression
+            body.extend_from_slice(&ext_len.to_be_bytes());
+            body.extend_from_slice(ext_bytes);
+            let mut msg = vec![0x02u8];
+            msg.extend_from_slice(&u24len(&body));
+            msg
+        }
+
+        /// NET-05: the declared extensions length (here 0xffff) is larger than the
+        /// bytes actually present. The parser must return an error, not index past
+        /// the end of the message.
+        #[test]
+        fn server_hello_with_overlong_extensions_length_is_an_error_not_a_panic() {
+            // One complete extension header + a truncated second one (two bytes).
+            let msg = server_hello_with_ext_block(0xffff, &[0x00, 0x2b, 0x00, 0x00, 0x00]);
+            let r = std::panic::catch_unwind(|| parse_server_hello(&msg).map(|_| ()));
+            match r {
+                Ok(Err(e)) => assert_eq!(e.kind(), ErrorKind::InvalidData),
+                Ok(Ok(())) => unreachable!("a ServerHello without a key_share must not parse"),
+                Err(_) => unreachable!("parse_server_hello panicked on a truncated extension"),
+            }
+            // Same with every truncation point of a valid extension block.
+            let mut good_ext = ext(0x002b, &[0x03, 0x04]);
+            let mut share = vec![0x00, 0x1d];
+            share.extend_from_slice(&u16len(&[7u8; 32]));
+            good_ext.extend_from_slice(&ext(0x0033, &share));
+            for cut in 0..good_ext.len() {
+                let msg = server_hello_with_ext_block(good_ext.len() as u16, &good_ext[..cut]);
+                let r = std::panic::catch_unwind(|| parse_server_hello(&msg).map(|_| ()));
+                assert!(
+                    matches!(r, Ok(Err(_))),
+                    "cut at {cut}: expected an error, got a panic or success"
+                );
+            }
+            let full = server_hello_with_ext_block(good_ext.len() as u16, &good_ext);
+            assert_eq!(parse_server_hello(&full).ok(), Some([7u8; 32]));
+        }
+
+        /// A TLS 1.3 server just good enough to get the client into its encrypted
+        /// handshake flight: it answers the ClientHello with a ServerHello, derives
+        /// the server handshake traffic key exactly as RFC 8446 section 7.1 says,
+        /// then streams the encrypted records `flight` yields until the client hangs
+        /// up or `limit` bytes of plaintext have been sent. Returns the plaintext
+        /// byte count it managed to send.
+        fn fake_server(
+            mut sock: UnixStream,
+            mut flight: impl FnMut(usize) -> Vec<u8>,
+            limit: usize,
+        ) -> usize {
+            let Ok((_, ch_msg)) = TlsClient::read_record(&mut sock) else {
+                return 0;
+            };
+            // ClientHello: type(1) len(3) version(2) random(32) sid cipher_suites compression exts
+            let b = &ch_msg[4..];
+            let mut p = 34;
+            p += 1 + b[p] as usize;
+            p += 2 + (((b[p] as usize) << 8) | b[p + 1] as usize);
+            p += 1 + b[p] as usize;
+            let ext_end = p + 2 + (((b[p] as usize) << 8) | b[p + 1] as usize);
+            p += 2;
+            let mut client_pub = [0u8; 32];
+            while p + 4 <= ext_end {
+                let et = ((b[p] as u16) << 8) | b[p + 1] as u16;
+                let el = ((b[p + 2] as usize) << 8) | b[p + 3] as usize;
+                if et == 0x0033 {
+                    // client_shares len(2) group(2) key_len(2) key
+                    client_pub = a32(&b[p + 4 + 6..p + 4 + 6 + 32]);
+                }
+                p += 4 + el;
+            }
+            let sk = a32(&rand_bytes(32).unwrap_or_else(|e| unreachable!("rng: {e}")));
+            let spub = x25519::base_mul(&sk);
+            let shared = x25519::x25519(&sk, &client_pub);
+
+            let mut exts = ext(0x002b, &[0x03, 0x04]);
+            let mut share = vec![0x00, 0x1d];
+            share.extend_from_slice(&u16len(&spub));
+            exts.extend_from_slice(&ext(0x0033, &share));
+            let mut body = vec![0x03, 0x03];
+            body.extend_from_slice(&[0x5a; 32]);
+            body.push(0);
+            body.extend_from_slice(&[0x13, 0x01, 0x00]);
+            body.extend_from_slice(&u16len(&exts));
+            let mut sh = vec![0x02u8];
+            sh.extend_from_slice(&u24len(&body));
+            if TlsClient::send_record(&mut sock, 0x16, &sh).is_err() {
+                return 0;
+            }
+
+            let mut transcript = Sha256::new();
+            transcript.update(&ch_msg);
+            transcript.update(&sh);
+            let th = transcript.finalize();
+            let empty_hash = sha256(b"");
+            let zero = [0u8; 32];
+            let early = hkdf_extract(&zero, &zero);
+            let derived = hkdf_expand_label(&early, "derived", &empty_hash, 32);
+            let hs_secret = hkdf_extract(&derived, &shared);
+            let s_hs = hkdf_expand_label(&hs_secret, "s hs traffic", &th, 32);
+            let gcm = GcmKey::new(&a16(&hkdf_expand_label(&s_hs, "key", b"", 16)));
+            let iv = a12(&hkdf_expand_label(&s_hs, "iv", b"", 12));
+
+            let mut sent = 0usize;
+            let mut seq = 0u64;
+            while sent < limit {
+                let chunk = flight(sent);
+                let n = chunk.len();
+                let rec = seal_record(&gcm, &iv, seq, &with_type(&chunk, 0x16));
+                if sock.write_all(&rec).is_err() {
+                    break;
+                }
+                seq += 1;
+                sent += n;
+            }
+            sent
+        }
+
+        fn run_flight(
+            flight: impl FnMut(usize) -> Vec<u8> + Send + 'static,
+            limit: usize,
+        ) -> (String, usize) {
+            let (client_sock, server_sock) =
+                UnixStream::pair().unwrap_or_else(|e| unreachable!("socketpair: {e}"));
+            let server = thread::spawn(move || fake_server(server_sock, flight, limit));
+            let err = match TlsClient::handshake(client_sock, "victim.example", 443, true, None) {
+                Ok(_) => unreachable!("the fake server never sends Finished"),
+                Err(e) => e.to_string(),
+            };
+            let sent = server
+                .join()
+                .unwrap_or_else(|_| unreachable!("server thread panicked"));
+            (err, sent)
+        }
+
+        /// NET-10: a Certificate message whose declared u24 length is 16 MiB must be
+        /// refused as soon as its header arrives, not buffered until it completes.
+        #[test]
+        fn oversized_handshake_message_is_refused_before_buffering() {
+            const LIMIT: usize = 1 << 20;
+            let (err, sent) = run_flight(
+                |sent| {
+                    if sent == 0 {
+                        let mut first = vec![0x0b, 0xff, 0xff, 0xff]; // Certificate, 16 MiB - 1
+                        first.extend_from_slice(&[0u8; 16_000]);
+                        first
+                    } else {
+                        vec![0u8; 16_000]
+                    }
+                },
+                LIMIT,
+            );
+            assert!(err.contains("handshake message too large"), "got: {err}");
+            assert!(
+                sent < LIMIT,
+                "the client kept reading the whole {sent}-byte flight"
+            );
+        }
+
+        /// NET-10: many small messages that are each fine but add up to more than the
+        /// flight cap must be refused too.
+        #[test]
+        fn handshake_flight_larger_than_the_cap_is_refused() {
+            const LIMIT: usize = 2 << 20;
+            let (err, sent) = run_flight(
+                |_| {
+                    // NewSessionTicket-typed (ignored) 1000-byte messages, 16 per record
+                    let mut rec = Vec::new();
+                    for _ in 0..16 {
+                        rec.push(0x04);
+                        rec.extend_from_slice(&u24len(&[0u8; 996]));
+                    }
+                    rec
+                },
+                LIMIT,
+            );
+            assert!(err.contains("handshake flight too large"), "got: {err}");
+            assert!(
+                sent < LIMIT,
+                "the client kept reading the whole {sent}-byte flight"
+            );
+        }
     }
 
     #[cfg(test)]
