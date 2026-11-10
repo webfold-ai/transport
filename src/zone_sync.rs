@@ -56,7 +56,7 @@
 use crate::native::NativeEndpoint;
 use crate::signed_dns::{Keypair, PublicKey};
 use crate::{BiStream, Connection, PeerAddr, PeerId, Transport};
-use hashtrinity::crypto::blake3;
+use apeiron::map::hashtrinity::crypto::blake3;
 use std::collections::HashSet;
 use std::fmt;
 use std::sync::Arc;

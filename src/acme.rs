@@ -16,7 +16,7 @@
 //! limit. P-256 is also exactly the intersection with what the edge can serve: the serving
 //! provider (`hashtrinity::rustls`) loads Ed25519 and ECDSA-P256 PKCS#8 keys only.
 //!
-//! **The crypto is not reinvented here.** `hashtrinity::crypto::{jwt,acme,certgen}` already
+//! **The crypto is not reinvented here.** `apeiron::map::hashtrinity::crypto::{jwt,acme,certgen}` already
 //! carries the non-secret primitives ACME needs — (the JWS signing and key generation are
 //! `aws-lc-rs`, see [`AccountKey`]),
 //! `b64url`/`jwk_thumbprint_ec_p256` (RFC 7638), `acme_key_authorization` (RFC 8555 §8.1), and
@@ -59,7 +59,7 @@
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
-use hashtrinity::crypto::acme::{acme_key_authorization, b64url, jwk_thumbprint_ec_p256};
+use apeiron::map::hashtrinity::crypto::acme::{acme_key_authorization, b64url, jwk_thumbprint_ec_p256};
 use aws_lc_rs::hmac;
 use aws_lc_rs::rand::SystemRandom;
 use aws_lc_rs::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_FIXED_SIGNING};
@@ -1546,7 +1546,7 @@ mod tests {
     }
 
     use super::*;
-    use hashtrinity::crypto::sha256;
+    use apeiron::map::hashtrinity::crypto::sha256;
 
     fn test_account() -> AccountKey {
         // A fixed, arbitrary 32-byte scalar — deterministic tests, not a real account.
@@ -1706,7 +1706,7 @@ mod tests {
         let csr = csr_p256(&key, &["*.tascloud.app", "tascloud.app"]);
         let (cri, pk, sig) = split_csr(&csr);
         assert_eq!(pk.as_slice(), &key.public_key().as_ref()[1..], "CSR carries the key's public point");
-        assert!(hashtrinity::crypto::ecdsa_p256_verify(&pk, &sha256(&cri), &sig), "CSR proves possession of the key");
+        assert!(apeiron::map::hashtrinity::crypto::ecdsa_p256_verify(&pk, &sha256(&cri), &sig), "CSR proves possession of the key");
         for d in ["*.tascloud.app", "tascloud.app"] {
             assert!(cri.windows(d.len()).any(|w| w == d.as_bytes()), "{d} must be a SAN");
         }
@@ -1714,7 +1714,7 @@ mod tests {
         let mut bad = cri.clone();
         let last = bad.len() - 1;
         bad[last] ^= 1;
-        assert!(!hashtrinity::crypto::ecdsa_p256_verify(&pk, &sha256(&bad), &sig));
+        assert!(!apeiron::map::hashtrinity::crypto::ecdsa_p256_verify(&pk, &sha256(&bad), &sig));
     }
 
     #[test]
@@ -1741,8 +1741,8 @@ mod tests {
         // What aws-lc signs, the (independent) verifier in hashtrinity accepts: r||s over SHA-256.
         let msg = b"protected.payload";
         let sig: [u8; 64] = generated.sign(msg).unwrap().try_into().unwrap();
-        assert!(hashtrinity::crypto::ecdsa_p256_verify(&generated.xy(), &sha256(msg), &sig));
-        assert!(!hashtrinity::crypto::ecdsa_p256_verify(&fixed.xy(), &sha256(msg), &sig));
+        assert!(apeiron::map::hashtrinity::crypto::ecdsa_p256_verify(&generated.xy(), &sha256(msg), &sig));
+        assert!(!apeiron::map::hashtrinity::crypto::ecdsa_p256_verify(&fixed.xy(), &sha256(msg), &sig));
     }
 
     /// The key we hand back must load in the provider the edge actually serves with.
@@ -1755,9 +1755,8 @@ mod tests {
         assert!(pem.starts_with("-----BEGIN PRIVATE KEY-----\n"));
         let body: String = pem.lines().filter(|l| !l.starts_with("-----")).collect();
         let der_bytes = base64_decode_for_test(&body);
-        // Both providers: aws-lc-rs (what the edge serves with now) and the legacy hashtrinity one
-        // (what servelet_tls::tls_server_config still uses until edge-lb switches over).
-        for provider in [crate::edge_proxy::sni::provider(), hashtrinity::rustls::provider()] {
+        // The aws-lc-rs provider the edge serves with.
+        for provider in [crate::edge_proxy::sni::provider()] {
             let key = provider
                 .key_provider
                 .load_private_key(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(der_bytes.clone())))
@@ -1914,7 +1913,7 @@ mod tests {
             let mut sig = [0u8; 64];
             sig.copy_from_slice(&b64url_decode_for_test(sg));
             assert!(
-                hashtrinity::crypto::ecdsa_p256_verify(&pk, &sha256(format!("{p}.{pl}").as_bytes()), &sig),
+                apeiron::map::hashtrinity::crypto::ecdsa_p256_verify(&pk, &sha256(format!("{p}.{pl}").as_bytes()), &sig),
                 "bad JWS signature on {url}"
             );
             Ok(String::from_utf8(b64url_decode_for_test(pl)).unwrap())
@@ -1947,7 +1946,7 @@ mod tests {
             let jwk: Value = serde_json::from_slice(&b64url_decode_for_test(pl)).unwrap();
             assert_eq!(jwk_point(&jwk), st.acct_pk.unwrap(), "the binding's payload is the key signing newAccount");
             // Judge the MAC with a HMAC that is not the one the client used (aws-lc).
-            let expect = hashtrinity::crypto::hmac_sha256(&key, format!("{p}.{pl}").as_bytes());
+            let expect = apeiron::map::hashtrinity::crypto::hmac_sha256(&key, format!("{p}.{pl}").as_bytes());
             if protected["kid"] != kid {
                 return Err(problem(401, "unauthorized", st));
             }
@@ -1974,7 +1973,7 @@ mod tests {
             let mut sig = [0u8; 64];
             sig.copy_from_slice(&b64url_decode_for_test(sg));
             assert!(
-                hashtrinity::crypto::ecdsa_p256_verify(&new_pk, &sha256(format!("{p}.{pl}").as_bytes()), &sig),
+                apeiron::map::hashtrinity::crypto::ecdsa_p256_verify(&new_pk, &sha256(format!("{p}.{pl}").as_bytes()), &sig),
                 "the inner JWS must be signed by the new key"
             );
             let payload: Value = serde_json::from_slice(&b64url_decode_for_test(pl)).unwrap();
@@ -2062,7 +2061,7 @@ mod tests {
                             }
                             let (x, y): ([u8; 32], [u8; 32]) = (new_pk[..32].try_into().unwrap(), new_pk[32..].try_into().unwrap());
                             st.acct_pk = Some(new_pk);
-                            st.thumbprint = hashtrinity::crypto::acme::jwk_thumbprint_ec_p256(&x, &y);
+                            st.thumbprint = apeiron::map::hashtrinity::crypto::acme::jwk_thumbprint_ec_p256(&x, &y);
                             st.key_changes += 1;
                             ok(st, 200, vec![], "{}".into())
                         }
@@ -2108,7 +2107,7 @@ mod tests {
                             let csr = b64url_decode_for_test(v["csr"].as_str().unwrap());
                             let (cri, pk, sig) = split_csr(&csr);
                             st.csr_point = Some(pk);
-                            st.finalized_csr_ok = hashtrinity::crypto::ecdsa_p256_verify(&pk, &sha256(&cri), &sig)
+                            st.finalized_csr_ok = apeiron::map::hashtrinity::crypto::ecdsa_p256_verify(&pk, &sha256(&cri), &sig)
                                 && cri.windows(14).any(|w| w == b"*.tascloud.app");
                             let b = st.base.clone();
                             ok(st, 200, vec![], format!(r#"{{"status":"valid","authorizations":[],"finalize":"{b}/finalize/1","certificate":"{b}/cert/1"}}"#))
@@ -2322,7 +2321,7 @@ mod tests {
         let payload: Value = serde_json::from_slice(&b64url_decode_for_test(pl)).unwrap();
         assert_eq!(payload, account.jwk(), "the payload is the same JWK the outer newAccount JWS carries");
         // Checked with a HMAC implementation other than the aws-lc one the client uses.
-        assert_eq!(b64url_decode_for_test(sg), hashtrinity::crypto::hmac_sha256(&EAB_KEY, format!("{p}.{pl}").as_bytes()));
+        assert_eq!(b64url_decode_for_test(sg), apeiron::map::hashtrinity::crypto::hmac_sha256(&EAB_KEY, format!("{p}.{pl}").as_bytes()));
         assert_eq!(b64url_decode_for_test(sg).len(), 32);
     }
 
@@ -2770,7 +2769,7 @@ mod tests {
         let signer = AccountKey::from_pkcs8_pem(&pem).expect("the PEM this module writes loads");
         assert_eq!(signer.xy().as_slice(), &key.public_key().as_ref()[1..], "same key");
         let sig: [u8; 64] = signer.sign(b"m").unwrap().try_into().unwrap();
-        assert!(hashtrinity::crypto::ecdsa_p256_verify(&signer.xy(), &sha256(b"m"), &sig));
+        assert!(apeiron::map::hashtrinity::crypto::ecdsa_p256_verify(&signer.xy(), &sha256(b"m"), &sig));
 
         let ed25519 = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap().serialize_pem();
         assert!(AccountKey::from_pkcs8_pem(&ed25519).is_err(), "an Ed25519 key cannot sign ES256");

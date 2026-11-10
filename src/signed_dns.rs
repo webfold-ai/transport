@@ -37,7 +37,7 @@
 //! a separate piece of work, and pretending otherwise would hide a real gap.
 
 use super::dns::{DnsError, Message, Record};
-use hashtrinity::base32::ZBASE32;
+use crate::base32::ZBASE32;
 use crate::prim::{ed25519_pubkey, ed25519_sign, ed25519_verify};
 
 /// Length of the value a relay will accept, per BEP44. A DNS message over this cannot be

@@ -44,7 +44,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::prim::sha256;
-use hashtrinity::Table;
+use apeiron::map::hashtrinity::Table;
 
 use crate::acme::{days_from_civil, der, AcmeClient, AcmeError, Dns01Responder, Http01Responder, RenewalWindow, RevocationReason};
 use crate::certkey::{KeyAlg, KeyPolicy};

@@ -39,7 +39,7 @@
 //! `seal_frame`/`open_frame`).
 
 use super::{BiStream, BoxFuture, Connection, PeerId, Transport};
-use hashtrinity::crypto::blake3;
+use apeiron::map::hashtrinity::crypto::blake3;
 use crate::prim::{chacha20poly1305_decrypt, chacha20poly1305_encrypt, ed25519_pubkey, ed25519_sign, ed25519_verify, x25519_pubkey, x25519_shared};
 use std::collections::HashMap;
 use std::io;

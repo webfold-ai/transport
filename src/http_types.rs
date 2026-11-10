@@ -8,11 +8,11 @@
 use std::io;
 use std::str::FromStr;
 use std::sync::Arc;
-use hashtrinity::{CoordMap, PHI};
+use apeiron::map::hashtrinity::{CoordMap, PHI};
 
 // -- Error ---------------------------------------------------------------
 
-// `hashtrinity::Error`'s derive (the thiserror-compatible `#[error("...")]`/`#[from]` subset)
+// `apeiron::map::hashtrinity::Error`'s derive (the thiserror-compatible `#[error("...")]`/`#[from]` subset)
 // needs hashtrinity's `derive` feature, which transitively pulls in `codec` -> `apeiron`, and
 // the pinned `apeiron` revision doesn't build (`apeiron::Words` missing) — a pre-existing,
 // separate breakage out of scope here. Hand-written instead; it's the same boilerplate the
@@ -732,7 +732,7 @@ fn type_id_coord(id: std::any::TypeId) -> u64 {
 /// `Table` has no `get_mut` to build it on; every other operation (`get`/`insert`/`remove`, the
 /// shapes `FromRequestParts`-style extractors and middleware actually use) is exact.
 ///
-/// Uses `hashtrinity::Table` (the exact-key-storing variant), NOT `CoordMap` — `CoordMap`
+/// Uses `apeiron::map::hashtrinity::Table` (the exact-key-storing variant), NOT `CoordMap` — `CoordMap`
 /// ("the address regenerates the key... stores nothing") is for keys that ARE their own
 /// collision-free coordinate (small dense integers, direct addressing); a `TypeId` hashed
 /// through `DefaultHasher` is an OPAQUE 64-bit value with no such guarantee, so two unrelated
@@ -742,7 +742,7 @@ fn type_id_coord(id: std::any::TypeId) -> u64 {
 /// by real comparison, which is what a type-map's correctness actually depends on.
 #[derive(Clone)]
 pub struct Extensions {
-    map: hashtrinity::Table<u64, Box<dyn CloneAny>>,
+    map: apeiron::map::hashtrinity::Table<u64, Box<dyn CloneAny>>,
 }
 
 impl Default for Extensions {
@@ -759,7 +759,7 @@ impl std::fmt::Debug for Extensions {
 
 impl Extensions {
     pub fn new() -> Self {
-        Extensions { map: hashtrinity::Table::new() }
+        Extensions { map: apeiron::map::hashtrinity::Table::new() }
     }
 
     /// Insert a value, returning whatever was previously stored for this exact type `T`.

@@ -290,7 +290,7 @@ fn cmd_s3(args: &[String]) -> ExitCode {
                     for name in &r.unreadable {
                         eprintln!("  ? {name} — could not be read, so it was not scanned");
                     }
-                    let mut bad = hashtrinity::Table::new();
+                    let mut bad = apeiron::map::hashtrinity::Table::new();
                     for (n, _) in &r.threats {
                         bad.mark(n.clone());
                     }

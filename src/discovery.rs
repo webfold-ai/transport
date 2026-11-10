@@ -14,8 +14,8 @@
 //! - **self** = the directory itself (the merged view — the medium turned on itself)
 
 use super::{PeerAddr, PeerId};
-use hashtrinity::Table;
-use hashtrinity::crypto::to_hex;
+use apeiron::map::hashtrinity::Table;
+use apeiron::map::hashtrinity::crypto::to_hex;
 use std::time::Duration;
 
 #[cfg(feature = "bind-overlay")]
@@ -23,9 +23,9 @@ use iroh::{EndpointAddr, EndpointId, address_lookup::memory::MemoryLookup};
 #[cfg(feature = "bind-overlay")]
 use std::sync::{Arc, RwLock};
 
-/// Re-export `hashtrinity::crypto::to_hex` so provision.rs and other callers can format
+/// Re-export `apeiron::map::hashtrinity::crypto::to_hex` so provision.rs and other callers can format
 /// PeerId keys without importing hashtrinity-crypto themselves.
-pub use hashtrinity::crypto::to_hex as peer_key_hex;
+pub use apeiron::map::hashtrinity::crypto::to_hex as peer_key_hex;
 
 /// What kind of compute substrate a peer runs on — used for mixed-cluster placement
 /// (CPU-only LXCs alongside GPU VMs, ARM edge nodes alongside x86 servers).

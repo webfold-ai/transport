@@ -31,8 +31,8 @@
 use super::edge::{normalize, EdgeRegistry, HostnameRecord, HostnameState, Route, TlsMode};
 use super::load_balance::HealthEstimator;
 use super::{Connection, PeerId};
-use hashtrinity::Table;
-use hashtrinity::crypto::to_hex;
+use apeiron::map::hashtrinity::Table;
+use apeiron::map::hashtrinity::crypto::to_hex;
 
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::Arc;
@@ -687,7 +687,7 @@ pub mod flow_count {
 #[cfg(feature = "native")]
 pub mod sni {
     use crate::edge::{cert_name_for, CertMaterial, CertSource};
-    use hashtrinity::Table;
+    use apeiron::map::hashtrinity::Table;
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
     use rustls::server::{ClientHello, ResolvesServerCert};
     use rustls::sign::CertifiedKey;

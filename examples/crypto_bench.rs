@@ -13,7 +13,7 @@ use aws_lc_rs::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM, CHACHA20
 use aws_lc_rs::digest;
 use aws_lc_rs::rand::SystemRandom;
 use aws_lc_rs::signature::{EcdsaKeyPair, Ed25519KeyPair, KeyPair, UnparsedPublicKey, ECDSA_P256_SHA256_FIXED, ECDSA_P256_SHA256_FIXED_SIGNING, ED25519};
-use hashtrinity::crypto as ht;
+use apeiron::map::hashtrinity::crypto as ht;
 
 /// Run `f` repeatedly for ~`budget`, in 5 rounds; return the best ns/op.
 fn bench(budget: Duration, mut f: impl FnMut()) -> f64 {

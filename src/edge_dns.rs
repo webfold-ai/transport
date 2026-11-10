@@ -42,7 +42,7 @@
 //! - **self** = the SOA (the zone's statement about itself)
 
 use super::edge::{normalize, EdgeRegistry, HostnameKind, HostnameState};
-use hashtrinity::Table;
+use apeiron::map::hashtrinity::Table;
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 

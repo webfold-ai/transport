@@ -566,7 +566,7 @@ mod tests {
     /// and the seed is the published name. A divergence here renames every live endpoint.
     #[test]
     fn the_native_keypair_matches_the_documented_derivation() {
-        let expect = hashtrinity::crypto::sha256(b"meteroid:pkarr");
+        let expect = apeiron::map::hashtrinity::crypto::sha256(b"meteroid:pkarr");
         assert_eq!(secret_seed_do_not_expose("meteroid"), expect);
         assert_eq!(
             native_keypair("meteroid").to_z32(),
@@ -606,7 +606,7 @@ mod tests {
 
     /// Every violated property, by name. `Ok` only if none is.
     fn check_peer_id_contract(d: &Derivation<'_>) -> Result<(), Vec<&'static str>> {
-        use hashtrinity::crypto::ed25519_pubkey;
+        use apeiron::map::hashtrinity::crypto::ed25519_pubkey;
         let mut bad = Vec::new();
         let keys = [GOLDEN_DIALKEY, "meteroid", "flexprice", "tas-edge", "k"];
 
@@ -665,7 +665,7 @@ mod tests {
     /// Each mutant wraps or alters the real functions and goes through the SAME checker.
     #[test]
     fn the_checker_rejects_mutants_of_the_real_module() {
-        use hashtrinity::crypto::{ed25519_pubkey, sha256};
+        use apeiron::map::hashtrinity::crypto::{ed25519_pubkey, sha256};
         let z32 = |id: PeerId| super::super::signed_dns::PublicKey::from_bytes(&id).unwrap().to_z32();
         // Run one mutant: replace some of the real functions, keep the rest real.
         let run = |peer: &dyn Fn(&str) -> PeerId,
@@ -728,7 +728,7 @@ mod tests {
     /// `SHA-256(dialkey ++ ":pkarr")` and its public key is `peer_id`.
     #[test]
     fn peer_id_is_the_public_key_not_the_secret_for_the_golden_dialkey() {
-        let seed = hashtrinity::crypto::sha256(format!("{GOLDEN_DIALKEY}:pkarr").as_bytes());
+        let seed = apeiron::map::hashtrinity::crypto::sha256(format!("{GOLDEN_DIALKEY}:pkarr").as_bytes());
         assert_eq!(hex(&seed), GOLDEN_SEED_HEX);
         let id = peer_id(GOLDEN_DIALKEY);
         assert_eq!(hex(&id), GOLDEN_PUBLIC_HEX);

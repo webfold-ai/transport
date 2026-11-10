@@ -19,8 +19,8 @@
 //! - **self** = the affinity check (the map turned on itself — "is this peer healthy right now?")
 
 use super::PeerId;
-use hashtrinity::Table;
-use hashtrinity::crypto::to_hex;
+use apeiron::map::hashtrinity::Table;
+use apeiron::map::hashtrinity::crypto::to_hex;
 use std::time::Duration;
 
 fn peer_key(peer: PeerId) -> String {

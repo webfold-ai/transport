@@ -534,7 +534,7 @@ pub use native_probe::{DnsClient, NativeProbe, QueryOptions};
 mod tests {
     use super::*;
     use crate::edge::{HostnameState, Route};
-    use hashtrinity::Table;
+    use apeiron::map::hashtrinity::Table;
 
     /// A probe answering from a fixed table — the customer's DNS as we would find it.
     struct StaticProbe {

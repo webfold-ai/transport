@@ -11,8 +11,8 @@
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
-use hashtrinity::Table;
-use hashtrinity::crypto::to_hex;
+use apeiron::map::hashtrinity::Table;
+use apeiron::map::hashtrinity::crypto::to_hex;
 use iroh::{EndpointAddr, EndpointId};
 
 use super::discovery::{BootstrapDirectory, DiscoverySource, PeerCapability, PeerDirectory};

@@ -55,11 +55,9 @@ tokio-rustls = { version = "0.26", optional = true }
 tracing = { version = "0.1", default-features = false, features = ["std", "attributes"], optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
-# One hashtrinity for every Ptyktos crate: this GitHub URL at this revision. Cargo treats
-# different references to the same repo (rev vs branch vs none) as distinct SourceIds, and two
-# copies make `hashtrinity::Table<K, V>` two incompatible types (E0308 "multiple different
-# versions of crate `hashtrinity`"), so every consumer pins exactly this form.
-hashtrinity = { git = "https://github.com/Ptyktos/hashtrinity", rev = "92a88636ab0e59ffe366ace07c019cd1f35a0bfa", features = ["base32"] }
+# One apeiron for every crate in the graph: `apeiron::map::hashtrinity::Table<K, V>` crosses crate boundaries,
+# so two apeiron SourceIds would be two incompatible types (E0308). This URL at this rev, no branch, no `.git`.
+apeiron = { version = "0.1.0", git = "https://github.com/webfold-ai/apeiron", rev = "d0eda3226193542949306f767d7280404921546f" }
 rustls-pki-types = "1"
 rustls-native-certs = "0.8"
 bytes = "1"
@@ -74,10 +72,9 @@ flate2 = { version = "1", optional = true }
 # carries `Tuple`/`Relationships`/`Upstream`/`Backends`, which this crate's version didn't) and is
 # already what `bedrock` itself re-exports on both remotes, so it's canonical; `load_balance.rs`
 # is now a thin re-export.
-# Pinned by rev (like hashtrinity): relayfold carries its own hashtrinity pin, so an unpinned entry
-# would resolve to relayfold's default branch, whatever hashtrinity that names, and a consumer that
-# also names relayfold must use this exact rev or the graph holds two relayfolds and two hashtrinitys.
-relayfold = { git = "https://github.com/Ptyktos/relayfold", rev = "84169b1a5720828eb0d4925fb840c1afd88f9df8" }
+# Pinned by rev: an unpinned entry would resolve to relayfold's default branch, and a consumer that also names
+# relayfold must use this exact rev or the graph holds two relayfolds. b50b9e1 is relayfold on wirefold/apeiron.
+relayfold = { git = "https://github.com/Ptyktos/relayfold", rev = "b50b9e198f41fa9f2c2a7c86cc5dc14ad97e41e4" }
 pkarr = { version = "8.0.1", optional = true }
 
 # The unit tests of modules that are always compiled (`edge_verify`, `edge_proxy`) drive async code with

@@ -7,7 +7,7 @@
 
 use std::borrow::Cow;
 use std::io;
-use hashtrinity::{Coord, CoordMap};
+use apeiron::map::hashtrinity::{Coord, CoordMap};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use crate::http_types::*;

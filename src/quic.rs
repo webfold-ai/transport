@@ -475,8 +475,8 @@ impl CongestionState {
 /// seals, exactly as real QUIC's confidentiality comes from the 1-RTT keys negotiated inside
 /// Initial packets, not from the Initial protection itself.
 fn initial_key_and_iv() -> ([u8; 32], [u8; 12]) {
-    let key = hashtrinity::crypto::blake3(b"bedrock-quic-initial-key-v1 (public, not secret)");
-    let iv_src = hashtrinity::crypto::blake3(b"bedrock-quic-initial-iv-v1 (public, not secret)");
+    let key = apeiron::map::hashtrinity::crypto::blake3(b"bedrock-quic-initial-key-v1 (public, not secret)");
+    let iv_src = apeiron::map::hashtrinity::crypto::blake3(b"bedrock-quic-initial-iv-v1 (public, not secret)");
     let mut iv = [0u8; 12];
     iv.copy_from_slice(&iv_src[..12]);
     (key, iv)
@@ -489,7 +489,7 @@ fn initial_key_and_iv() -> ([u8; 32], [u8; 12]) {
 fn iv_from_key(key: &[u8; 32]) -> [u8; 12] {
     let mut input = key.to_vec();
     input.extend_from_slice(b"iv");
-    let h = hashtrinity::crypto::blake3(&input);
+    let h = apeiron::map::hashtrinity::crypto::blake3(&input);
     let mut iv = [0u8; 12];
     iv.copy_from_slice(&h[..12]);
     iv

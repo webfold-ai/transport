@@ -52,9 +52,9 @@
 //! - **self** = the challenge (the name used to prove control of the name)
 
 use super::PeerId;
-use hashtrinity::Table;
+use apeiron::map::hashtrinity::Table;
 use crate::prim::sha256;
-use hashtrinity::crypto::to_hex;
+use apeiron::map::hashtrinity::crypto::to_hex;
 
 /// An apex zone this platform is authoritative for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

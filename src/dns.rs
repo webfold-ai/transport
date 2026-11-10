@@ -1,7 +1,7 @@
 //! The DNS wire format — RFC 1035 messages, encoded and decoded natively.
 //!
 //! This is the naming twin of [`super::native`]: that module replaced `iroh::Endpoint` with a
-//! handshake built on `hashtrinity::crypto`, and this one replaces the external DNS stacks with
+//! handshake built on `apeiron::map::hashtrinity::crypto`, and this one replaces the external DNS stacks with
 //! the wire format itself. Two of them had accumulated — `hickory_proto` under
 //! [`super::edge_dns`], and `simple-dns` arriving transitively through the `pkarr` crate under
 //! [`super::pkarr`] — for the same job, in the same crate.
@@ -9,7 +9,7 @@
 //! The format is small and fixed: a 12-byte header, then four sections of records, each record a
 //! name, a 16-bit type, a 16-bit class, a 32-bit TTL and a length-prefixed payload. Depending on
 //! a crate for it is the multiple-independent-reimplementation pattern a masquerade closes —
-//! the same argument `hashtrinity::base64`'s own header makes.
+//! the same argument `apeiron::map::hashtrinity::base64`'s own header makes.
 //!
 //! ## What is here, and what is deliberately not
 //!

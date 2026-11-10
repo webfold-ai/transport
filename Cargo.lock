@@ -20,7 +20,10 @@ dependencies = [
 [[package]]
 name = "apeiron"
 version = "0.1.0"
-source = "git+https://github.com/Ptyktos/apeiron.git?rev=255ca3018a0f06300153d905cb19b37ea548bb56#255ca3018a0f06300153d905cb19b37ea548bb56"
+source = "git+https://github.com/webfold-ai/apeiron?rev=d0eda3226193542949306f767d7280404921546f#d0eda3226193542949306f767d7280404921546f"
+dependencies = [
+ "libc",
+]
 
 [[package]]
 name = "async-compat"
@@ -561,17 +564,6 @@ name = "glob"
 version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e4eba85ea1d0a966a983acd07deee566e67395d2d96b6fb39e62b5a833f1eb0b"
-
-[[package]]
-name = "hashtrinity"
-version = "0.1.0"
-source = "git+https://github.com/Ptyktos/hashtrinity?rev=92a88636ab0e59ffe366ace07c019cd1f35a0bfa#92a88636ab0e59ffe366ace07c019cd1f35a0bfa"
-dependencies = [
- "apeiron",
- "rustls",
- "serde",
- "serde_json",
-]
 
 [[package]]
 name = "http"
@@ -1309,9 +1301,9 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 [[package]]
 name = "relayfold"
 version = "0.1.0"
-source = "git+https://github.com/Ptyktos/relayfold?rev=84169b1a5720828eb0d4925fb840c1afd88f9df8#84169b1a5720828eb0d4925fb840c1afd88f9df8"
+source = "git+https://github.com/Ptyktos/relayfold?rev=b50b9e198f41fa9f2c2a7c86cc5dc14ad97e41e4#b50b9e198f41fa9f2c2a7c86cc5dc14ad97e41e4"
 dependencies = [
- "hashtrinity",
+ "wirefold",
 ]
 
 [[package]]
@@ -1958,10 +1950,10 @@ dependencies = [
 name = "transport"
 version = "0.4.0"
 dependencies = [
+ "apeiron",
  "aws-lc-rs",
  "bytes",
  "flate2",
- "hashtrinity",
  "pkarr",
  "rcgen",
  "relayfold",
@@ -2243,6 +2235,14 @@ name = "windows_x86_64_msvc"
 version = "0.52.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "589f6da84c646204747d1270a2a5661ea66ed1cced2631d546fdfb155959f9ec"
+
+[[package]]
+name = "wirefold"
+version = "0.1.0"
+source = "git+https://github.com/webfold-ai/wirefold?rev=ba9a71284844cd1a7f14ae3b7105ad972aaa9e07#ba9a71284844cd1a7f14ae3b7105ad972aaa9e07"
+dependencies = [
+ "apeiron",
+]
 
 [[package]]
 name = "writeable"
