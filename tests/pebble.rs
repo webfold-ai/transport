@@ -421,7 +421,7 @@ fn unix_now() -> i64 {
 async fn external_account_binding_is_required_and_verified_by_pebble() {
     let _serial = SERIAL.lock().await;
     let mac_key = AccountKey::generate().unwrap().to_bytes().unwrap(); // 32 random bytes
-    let mac_key_b64 = hashtrinity::crypto::acme::b64url(&mac_key);
+    let mac_key_b64 = apeiron::map::hashtrinity::crypto::acme::b64url(&mac_key);
     let Some(fx) = Fixture::start("eab", EAB_PORTS, Some(("eab-kid-1", &mac_key_b64))).await else { return };
     let account = AccountKey::generate().unwrap();
     let register = |eab: Option<ExternalAccountBinding>| {
@@ -433,7 +433,7 @@ async fn external_account_binding_is_required_and_verified_by_pebble() {
     let err = register(None).await.expect_err("Pebble requires a binding");
     assert!(matches!(&err, AcmeError::Rejected { detail, .. } if detail.contains("externalAccountRequired")), "{err}");
     // A binding made with the wrong MAC key, and one naming a kid Pebble does not know.
-    let wrong_key = ExternalAccountBinding::from_base64url("eab-kid-1", &hashtrinity::crypto::acme::b64url(&[7u8; 32])).unwrap();
+    let wrong_key = ExternalAccountBinding::from_base64url("eab-kid-1", &apeiron::map::hashtrinity::crypto::acme::b64url(&[7u8; 32])).unwrap();
     let err = register(Some(wrong_key)).await.expect_err("wrong MAC key");
     assert!(matches!(&err, AcmeError::Rejected { detail, .. } if detail.contains("unauthorized")), "{err}");
     let unknown_kid = ExternalAccountBinding::from_base64url("nobody", &mac_key_b64).unwrap();

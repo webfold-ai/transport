@@ -40,6 +40,8 @@ pub mod load_balance;
 /// tas-edge — the SaaS hostname layer (managed subdomains, BYO custom hostnames). Pure
 /// registry logic over hashtrinity, so it is always compiled; only the DNS halves need a dep.
 pub mod edge;
+/// RFC 4648 and z-base32 text encoding (an Ed25519 public key as a DNS label).
+pub mod base32;
 /// PEM / base64 plumbing for the certificate paths.
 pub mod pem;
 /// The primitives the secure channel and signed records use: aws-lc-rs (FIPS-capable), with a
@@ -112,7 +114,7 @@ pub mod dns_health;
 /// Owner-signed object replication over the native transport (zone snapshots, ACME challenge state).
 pub mod zone_sync;
 /// The set-difference file sync and the protocol pieces under it: S3 and SigV4, HTTP/1.1 and HTTP/2,
-/// gRPC and HPACK, TLS 1.3, bundles and block images. Moved here from `hashtrinity::sync`.
+/// gRPC and HPACK, TLS 1.3, bundles and block images. Moved here from `apeiron::map::hashtrinity::sync`.
 #[cfg(feature = "syncfold")]
 pub mod sync;
 

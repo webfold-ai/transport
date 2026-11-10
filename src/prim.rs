@@ -6,7 +6,7 @@
 //!   with the `fips` feature, assembly-optimised, constant-time scalar arithmetic, and
 //!   continuously fuzzed/verified upstream.
 //! - Without it (the wire-format-only `--no-default-features` core) the same functions fall back
-//!   to `hashtrinity::crypto`, so the zero-dependency core still builds.
+//!   to `apeiron::map::hashtrinity::crypto`, so the zero-dependency core still builds.
 //!
 //! The same facade also carries SHA-256, HMAC-SHA-256, ECDSA P-256 verification and the QUIC packet
 //! protection (ChaCha20-Poly1305 with the RFC 9001 nonce, and the ChaCha20 header-protection mask),
@@ -25,7 +25,7 @@
 //!
 //! X25519 has one deliberate difference: [`x25519_shared`] returns `None` for a low-order peer
 //! point (an all-zero shared secret), which a handshake must treat as failure. The legacy
-//! `hashtrinity::crypto::x25519` silently returned zeros.
+//! `apeiron::map::hashtrinity::crypto::x25519` silently returned zeros.
 
 #[cfg(feature = "native")]
 mod imp {
@@ -189,7 +189,7 @@ mod imp {
 
 #[cfg(not(feature = "native"))]
 mod imp {
-    use hashtrinity::crypto as ht;
+    use apeiron::map::hashtrinity::crypto as ht;
 
     /// `n` bytes from the kernel CSPRNG (the zero-dependency core has no aws-lc-rs); panics on
     /// failure, never returning predictable bytes.
@@ -260,7 +260,7 @@ pub use imp::*;
 #[cfg(all(test, feature = "native"))]
 mod tests {
     use super::*;
-    use hashtrinity::crypto as ht;
+    use apeiron::map::hashtrinity::crypto as ht;
 
     #[test]
     fn random_bytes_come_from_the_system_rng_and_differ() {

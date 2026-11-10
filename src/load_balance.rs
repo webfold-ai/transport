@@ -2,7 +2,7 @@
 //! implements over HTTP `Upstream`s, and this crate's own [`crate::edge_proxy::ConnectorPool`]
 //! needs over tunnelled `PeerId` connections. Neither type knows about the other, so the shared
 //! part is exactly the pure selection logic: given N candidates (identified only by a
-//! `hashtrinity::Coord` and a weight) plus per-candidate health state, pick one index.
+//! `apeiron::map::hashtrinity::Coord` and a weight) plus per-candidate health state, pick one index.
 //!
 //! This module used to define `LoadBalance`/`HealthEstimator`/`splitmix64`/`consistent_ring_index`
 //! /`pick_index`/`coord_of` directly — its own independent extraction out of `kernel::Backends`,

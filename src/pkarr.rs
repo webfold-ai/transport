@@ -7,7 +7,7 @@
 //! ## This no longer wraps the `pkarr` crate
 //!
 //! It is built from [`super::dns`] (the RFC 1035 wire format) and [`super::signed_dns`] (the
-//! Ed25519-signed BEP44 record), on `hashtrinity::crypto` and this crate's own HTTP client —
+//! Ed25519-signed BEP44 record), on `apeiron::map::hashtrinity::crypto` and this crate's own HTTP client —
 //! the third module in the line [`super::native`] started when it replaced `iroh::Endpoint`.
 //!
 //! The measurement that motivated it: `pkarr` was one direct dependency reaching **82 of

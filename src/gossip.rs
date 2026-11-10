@@ -19,7 +19,7 @@
 //! - **self** = the gossip itself (the medium turned on itself — broadcast)
 
 use super::{Transport, PeerId};
-use hashtrinity::crypto::blake3;
+use apeiron::map::hashtrinity::crypto::blake3;
 use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::Mutex;

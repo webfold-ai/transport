@@ -1,7 +1,7 @@
 //! Golden cross-checks for the primitives behind the transport's wire format and identities.
 //!
 //! Every expected value here is either (a) an RFC / FIPS published test vector, or (b) a value
-//! produced by the previous in-house implementation (`hashtrinity::crypto`) on fixed inputs and
+//! produced by the previous in-house implementation (`apeiron::map::hashtrinity::crypto`) on fixed inputs and
 //! independently re-derived with Python 3 `cryptography` (`python3 -I`). The migration to
 //! aws-lc-rs must reproduce every byte: existing peers interoperate only if the wire bytes do not
 //! change.
@@ -17,7 +17,7 @@
 
 use transport::prim as p;
 // The previous in-house implementation: used only as the reference in the timing bench below.
-use hashtrinity::crypto as ht;
+use apeiron::map::hashtrinity::crypto as ht;
 
 fn hex(s: &str) -> Vec<u8> {
     assert!(s.len() % 2 == 0, "odd hex length");
