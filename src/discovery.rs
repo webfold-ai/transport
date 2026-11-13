@@ -59,6 +59,8 @@ impl std::fmt::Display for ComputeKind {
 }
 
 impl ComputeKind {
+    // Infallible (unknown strings map to a variant), so it is not a `FromStr` impl.
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Self {
         match s {
             "cpu" => ComputeKind::Cpu,

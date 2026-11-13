@@ -29,8 +29,7 @@ use std::time::Duration;
 
 use transport::acme::{AcmeError, ClientOptions, Http01Responder};
 use transport::acme_renew::{
-    cert_validity, CertIssuer, CertStore, FileCertStore, RenewalEngine, RenewalPolicy,
-    RevocationQueue,
+    cert_validity, CertIssuer, FileCertStore, RenewalEngine, RenewalPolicy, RevocationQueue,
 };
 use transport::ca_policy::{CaPolicy, CaStatus};
 use transport::ca_resilience::{AcmeCaConnector, AlertKind, MultiCaIssuer, StatePaths};

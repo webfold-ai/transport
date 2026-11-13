@@ -116,8 +116,10 @@ async fn publish_resolve_dns_stop_restart() {
     // The same record, as DNS.
     let key = native_keypair("plane-a").public_key().to_z32();
     let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let mut q = Message::default();
-    q.id = 9;
+    let mut q = Message {
+        id: 9,
+        ..Message::default()
+    };
     q.flags = Flags {
         recursion_desired: true,
         ..Flags::default()

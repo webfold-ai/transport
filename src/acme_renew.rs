@@ -2193,7 +2193,7 @@ PfFwXFUdKr72euUqW9E4wdcMVA==\n\
         while seen < total {
             let n = eng.run_once(T0 + 60 * seen as i64, &reg).await.issued.len();
             assert!(
-                n >= 1 && n <= 2,
+                (1..=2).contains(&n),
                 "never more than max_per_run per pass: {n}"
             );
             seen += n;

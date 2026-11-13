@@ -528,7 +528,7 @@ async fn the_engine_obtains_wildcard_and_custom_certificates_from_pebble() {
     // ── a second pass is quiet; a "restart" (fresh store from disk) does not reorder
     assert!(engine.run_once(now + 60, &registry).await.issued.is_empty());
     let reopened = FileCertStore::open(&store_dir).unwrap();
-    assert_eq!(reopened.cert_for("*.tascloud.app").is_some(), true);
+    assert!(reopened.cert_for("*.tascloud.app").is_some());
 
     // ── the issued chain + key serve a REAL handshake that verifies against Pebble's root
     let root = fetch_root(&work, fx.ports.mgmt).await;

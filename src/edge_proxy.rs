@@ -220,6 +220,7 @@ pub struct ConnectorPool {
     /// hex(PeerId) → its live connections, each paired with its own passive latency estimator.
     /// Hex rather than `[u8; 32]` because `Table`'s key needs `Coord`, and the hostname registry
     /// already speaks in strings.
+    #[allow(clippy::type_complexity)]
     conns: Table<String, Vec<(Arc<dyn Connection>, Arc<HealthEstimator>)>>,
     cursor: AtomicUsize,
 }
@@ -299,7 +300,9 @@ impl ConnectorPool {
         let node_coords: Vec<u64> = (0..list.len() as u64).collect();
         let weights = vec![1u32; list.len()];
         let health: Vec<Arc<HealthEstimator>> = list.iter().map(|(_, h)| h.clone()).collect();
-        let active = vec![Arc::new(AtomicBool::new(true)); list.len()];
+        let active: Vec<_> = (0..list.len())
+            .map(|_| Arc::new(AtomicBool::new(true)))
+            .collect();
         let idx = crate::load_balance::pick_index(
             algo,
             &node_coords,
@@ -838,6 +841,7 @@ pub mod sni {
     /// "no certificate" for that name rather than evicting a good one elsewhere.
     pub struct EdgeCertResolver {
         source: Arc<dyn CertSource>,
+        #[allow(clippy::type_complexity)]
         cache: Mutex<Table<String, ([u8; 32], Arc<CertifiedKey>)>>,
     }
 
@@ -969,6 +973,8 @@ mod tests {
     /// drives them, so a stub is the honest test double here.
     struct StubConnection {
         peer: PeerId,
+        // Set by the tests to tell stubs apart in failures; never read.
+        #[allow(dead_code)]
         label: &'static str,
     }
 

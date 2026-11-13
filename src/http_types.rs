@@ -621,7 +621,7 @@ pub fn parse_uri(s: &str) -> Result<Uri> {
     };
 
     let (authority, path) = if scheme.is_some() {
-        match rest.find(|c| c == '/' || c == '?') {
+        match rest.find(['/', '?']) {
             Some(i) => {
                 let path = if rest[i..].starts_with('?') {
                     format!("/{}", &rest[i..])

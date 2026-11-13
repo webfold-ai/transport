@@ -146,7 +146,7 @@ fn main() {
             &aws_lc_rs::agreement::X25519,
             lc_peer.as_ref(),
         );
-        black_box(aws_lc_rs::agreement::agree(&lc_priv, &peer, (), |k| Ok(k.len())).unwrap());
+        black_box(aws_lc_rs::agreement::agree(&lc_priv, peer, (), |k| Ok(k.len())).unwrap());
     });
     row("x25519 agree", a, b, None);
 

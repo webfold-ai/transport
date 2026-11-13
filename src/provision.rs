@@ -113,7 +113,7 @@ impl WorkloadPlanner {
             .filter(|c| affinity.is_healthy(c.peer_id))
             .filter(|c| {
                 if let Some(max_rtt) = constraints.max_rtt {
-                    latency.rtt(c.peer_id).map_or(true, |rtt| rtt <= max_rtt)
+                    latency.rtt(c.peer_id).is_none_or(|rtt| rtt <= max_rtt)
                 } else {
                     true
                 }
@@ -251,8 +251,7 @@ impl WorkloadPlanner {
         // Downstream (replica) stages run first — they load the model, then source becomes routable.
         let stages: Vec<PipelineStage> = assignments
             .iter()
-            .enumerate()
-            .map(|(_i, a)| PipelineStage {
+            .map(|a| PipelineStage {
                 node_ids: vec![to_hex(&a.peer_id)],
             })
             .collect();
@@ -519,7 +518,7 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
-    fn test_cap(peer_id: PeerId, free_vram: u64, rtt: Duration) -> PeerCapability {
+    fn test_cap(peer_id: PeerId, free_vram: u64, _rtt: Duration) -> PeerCapability {
         PeerCapability {
             peer_id,
             addr: None,

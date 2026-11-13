@@ -753,7 +753,7 @@ mod tests {
         let rejected = |r: Result<(), Vec<&'static str>>, must_flag: &str| {
             let flagged = r.expect_err("mutant must be rejected");
             assert!(
-                flagged.iter().any(|f| *f == must_flag),
+                flagged.contains(&must_flag),
                 "flagged {flagged:?}, expected {must_flag}"
             );
         };

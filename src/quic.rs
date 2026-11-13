@@ -574,11 +574,7 @@ impl CongestionState {
                 self.rttvar = sample / 2;
             }
             Some(srtt) => {
-                let diff = if srtt > sample {
-                    srtt - sample
-                } else {
-                    sample - srtt
-                };
+                let diff = srtt.abs_diff(sample);
                 self.rttvar = (self.rttvar * 3 + diff) / 4;
                 self.srtt = Some((srtt * 7 + sample) / 8);
             }
@@ -1347,7 +1343,6 @@ mod tests {
 #[cfg(test)]
 mod connection_tests {
     use super::*;
-    use std::sync::atomic::Ordering;
 
     /// Real two-endpoint handshake over real UDP sockets, then real encrypted data delivery —
     /// the same shape of proof `transport::native`'s `connect_and_send_frame` gives for TCP.
@@ -1681,7 +1676,7 @@ mod connection_tests {
         // Shrink the window to zero so the write below cannot proceed yet.
         conn.shared.congestion.lock().await.cwnd = 0.0;
 
-        let (mut send, _) = ConnTrait::open_bi(&conn).await.unwrap();
+        let (send, _) = ConnTrait::open_bi(&conn).await.unwrap();
         let write_fut = tokio::spawn({
             let mut send = send;
             async move {

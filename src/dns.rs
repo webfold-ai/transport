@@ -731,8 +731,9 @@ impl Question {
 }
 
 /// The 4-bit response code (RFC 1035 §4.1.1).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ResponseCode {
+    #[default]
     NoError,
     FormErr,
     ServFail,
@@ -781,12 +782,6 @@ pub struct Flags {
     pub recursion_desired: bool,
     pub recursion_available: bool,
     pub response_code: ResponseCode,
-}
-
-impl Default for ResponseCode {
-    fn default() -> Self {
-        ResponseCode::NoError
-    }
 }
 
 impl Flags {
@@ -1017,7 +1012,7 @@ mod tests {
             RData::Soa {
                 mname: n("ns1.example.com"),
                 rname: n("hostmaster.example.com"),
-                serial: 2026_08_15,
+                serial: 20_260_815,
                 refresh: 7200,
                 retry: 3600,
                 expire: 1_209_600,

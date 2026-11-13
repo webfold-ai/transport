@@ -123,7 +123,6 @@ pub mod zone_sync;
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
-use std::sync::Arc;
 
 /// A peer's identity — an Ed25519 public key (32 bytes). Same as iroh's `EndpointId`.
 pub type PeerId = [u8; 32];
@@ -174,12 +173,14 @@ pub trait BiStream: Send {
 /// A connection to a peer — can open and accept bi-directional stream pairs.
 ///
 /// A bi-directional stream pair is `(send: Box<dyn BiStream>, recv: Box<dyn BiStream>)`.
+/// The `(send, recv)` pair a bi-directional stream yields.
+pub type BiStreamPair = (Box<dyn BiStream>, Box<dyn BiStream>);
+
 pub trait Connection: Send + Sync {
     /// Open a new bi-directional stream pair. Returns (send, recv).
-    fn open_bi<'a>(&'a self) -> BoxFuture<'a, io::Result<(Box<dyn BiStream>, Box<dyn BiStream>)>>;
+    fn open_bi<'a>(&'a self) -> BoxFuture<'a, io::Result<BiStreamPair>>;
     /// Accept a bi-directional stream pair from the peer.
-    fn accept_bi<'a>(&'a self)
-        -> BoxFuture<'a, io::Result<(Box<dyn BiStream>, Box<dyn BiStream>)>>;
+    fn accept_bi<'a>(&'a self) -> BoxFuture<'a, io::Result<BiStreamPair>>;
     /// The peer's identity (Ed25519 public key).
     fn peer_id(&self) -> PeerId;
     /// Close the connection.
@@ -228,6 +229,8 @@ impl PeerAddr {
         }
     }
 
+    // Kept as an inherent method: callers use it, and it is the wire form, not a `Display` impl.
+    #[allow(clippy::inherent_to_string_shadow_display)]
     pub fn to_string(&self) -> String {
         format!(
             "bedrock-transport://{}@{}:{}",

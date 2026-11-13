@@ -20,7 +20,7 @@ use transport::prim as p;
 use apeiron::map::hashtrinity::crypto as ht;
 
 fn hex(s: &str) -> Vec<u8> {
-    assert!(s.len() % 2 == 0, "odd hex length");
+    assert!(s.len().is_multiple_of(2), "odd hex length");
     (0..s.len() / 2)
         .map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).expect("hex digit"))
         .collect()

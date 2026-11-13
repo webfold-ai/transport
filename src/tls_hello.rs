@@ -263,16 +263,15 @@ mod tests {
             for flip in [0x01u8, 0x80, 0xff] {
                 let mut bad = hello.clone();
                 bad[i] ^= flip;
-                match peek_sni(&bad) {
-                    Hello::Sni(h) => assert!(
+                if let Hello::Sni(h) = peek_sni(&bad) {
+                    assert!(
                         h == "app.acme.com.au"
                             || h.bytes().all(|b| b.is_ascii_lowercase()
                                 || b.is_ascii_digit()
                                 || b == b'-'
                                 || b == b'.'),
                         "a corrupted hello may only yield a syntactically valid name: {h}"
-                    ),
-                    _ => {}
+                    )
                 }
             }
         }

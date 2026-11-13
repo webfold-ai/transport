@@ -2282,7 +2282,8 @@ mod tests {
         let body: String = pem.lines().filter(|l| !l.starts_with("-----")).collect();
         let der_bytes = base64_decode_for_test(&body);
         // The aws-lc-rs provider the edge serves with.
-        for provider in [crate::edge_proxy::sni::provider()] {
+        {
+            let provider = crate::edge_proxy::sni::provider();
             let key = provider
                 .key_provider
                 .load_private_key(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(

@@ -369,6 +369,11 @@ impl GossipTopic {
         }
     }
 
+    /// True when no message is pending.
+    pub async fn is_empty(&self) -> bool {
+        self.len().await == 0
+    }
+
     /// Number of pending messages.
     pub async fn len(&self) -> usize {
         self.delivered.lock().await.len()

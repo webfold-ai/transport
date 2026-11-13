@@ -1331,7 +1331,7 @@ mod tests {
     #[test]
     fn challenge_is_satisfied_by_either_proof() {
         let c = Challenge::derive("app.acme.com.au", "acme", "x.tascloud.app", b"s");
-        assert!(c.satisfied_by_txt(&[c.token.clone()]));
+        assert!(c.satisfied_by_txt(std::slice::from_ref(&c.token)));
         assert!(c.satisfied_by_txt(&["noise".into(), c.token.to_uppercase()]));
         assert!(!c.satisfied_by_txt(&["noise".into()]));
         assert!(
@@ -1464,7 +1464,7 @@ mod tests {
 
     #[test]
     fn a_released_label_is_quarantined_against_other_tenants_but_not_its_owner() {
-        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::atomic::AtomicU64;
         let apex = APEXES.iter().find(|a| a.zone == "tasmanian.cloud").unwrap();
         let now = std::sync::Arc::new(AtomicU64::new(1_000_000));
         let mut reg = registry_at(&now);
@@ -1850,7 +1850,7 @@ mod tests {
             Err(EdgeError::PeerConflict(_))
         ));
         assert!(
-            matches!(reg.bind_peer(&rec.fqdn, UNBOUND_PEER, 1), Err(_)),
+            reg.bind_peer(&rec.fqdn, UNBOUND_PEER, 1).is_err(),
             "zero is not an identity"
         );
         assert!(matches!(
