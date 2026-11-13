@@ -27,6 +27,8 @@ pub mod dns;
 /// into the label it publishes under. The native replacement for the `pkarr` crate's format half.
 pub mod signed_dns;
 pub mod pkarr;
+pub mod pkarr_relay;
+pub mod mesh_dns;
 pub mod dialkey;
 #[cfg(feature = "federation")]
 pub mod federation;

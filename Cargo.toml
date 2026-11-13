@@ -46,7 +46,7 @@ bind-edge-dns = ["native"]
 # bedrock's ops.rs) is what `federation`'s 5 cfg sites in dialkey.rs were waiting on.
 
 [dependencies]
-tokio = { version = "1", features = ["net", "io-util", "time", "rt", "rt-multi-thread", "macros", "sync"], optional = true }
+tokio = { version = "1", features = ["net", "io-util", "time", "rt", "rt-multi-thread", "macros", "sync", "signal"], optional = true }
 # aws-lc-rs is rustls' default provider (and what its `fips` feature builds on). `ring` is no longer
 # enabled: every provider this crate installs or builds is aws-lc-rs.
 rustls = { version = "0.23", optional = true }
@@ -84,6 +84,11 @@ pkarr = { version = "8.0.1", optional = true }
 tokio = { version = "1", features = ["rt", "macros"] }
 # Real certificates for the SNI-resolver and handshake tests (keys_match rejects fabricated pairs).
 rcgen = "0.13"
+
+[[bin]]
+name = "meshd"
+path = "src/bin/meshd.rs"
+required-features = ["native"]
 
 [[bin]]
 name = "syncfold"
