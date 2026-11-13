@@ -19,7 +19,7 @@
 
   inputs = {
     # The build layer, by revision (flake.lock records the narHash too).
-    tas-nix.url = "git+https://github.com/Ptyktos/caretaker?dir=nix&ref=claude/confident-hamilton-u5lcc4-pins-init&rev=247943bcaf1e537885aa4dd9aeb363c670888e10&shallow=1";
+    tas-nix.url = "git+https://github.com/Ptyktos/caretaker?dir=nix&rev=b8cda7e4590c8aa6576d834c6363a6266ae5b9d8&shallow=1";
 
     relayfold = {
       url = "git+https://github.com/Ptyktos/relayfold?rev=c8ffabecd6aed43ac4806bb5da41b195689bcdd9&shallow=1";
@@ -52,23 +52,12 @@
       };
       # The reviewed cargo-deny policy: the shared default plus two recorded exceptions (see deny.toml).
       denyConfig = ./deny.toml;
-      # A gate is switched off only with a reason on record. fmt: this repository is not rustfmt-clean
-      # (1,656 hunks across 45 files that predate this flake); a repository-wide reformat is a
-      # maintainers' decision, since it touches every open change. New files are formatted. Turn this
-      # back on after that pass.
-      #
-      # clippy and doc: `cargo clippy/doc -D warnings` fails on warnings that predate this flake
-      # (`unexpected cfg feature "bind-overlay"` in lib.rs/discovery.rs, which Cargo.toml never
-      # declares, and several unused imports). Declaring the feature and clearing the imports is a
-      # change to the library's own code, not to its packaging, so it is left for its own PR; turn
-      # these back on with it.
-      gates = {
-        fmt = false;
-        clippy = false;
-        doc = false;
-      };
       # include_str!/include_bytes! read tests/fixtures; the default source filter drops them.
       extraSourceFilter = path: _type: builtins.match ".*/tests/fixtures(/.*)?" path != null;
+      # The doc gate is off: `cargo doc --no-deps` reports 109 unresolved intra-doc links across the
+      # crate (links written against module paths that do not resolve), and `-D warnings` rejects them.
+      # Fixing them is a documentation pass, not packaging; turn the gate back on with it.
+      gates.doc = false;
       # aws-lc-sys (the crypto provider under rustls) builds C and wants cmake.
       extraNativeBuildInputs = pkgs: [ pkgs.cmake ];
 
