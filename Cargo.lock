@@ -20,6 +20,14 @@ dependencies = [
 [[package]]
 name = "apeiron"
 version = "0.1.0"
+source = "git+https://github.com/webfold-ai/apeiron?rev=1c3d4a1da565cde409f6f3cb343086aa6853eb9c#1c3d4a1da565cde409f6f3cb343086aa6853eb9c"
+dependencies = [
+ "libc",
+]
+
+[[package]]
+name = "apeiron"
+version = "0.1.0"
 source = "git+https://github.com/webfold-ai/apeiron?rev=d0eda3226193542949306f767d7280404921546f#d0eda3226193542949306f767d7280404921546f"
 dependencies = [
  "libc",
@@ -1311,7 +1319,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 [[package]]
 name = "relayfold"
 version = "0.1.0"
-source = "git+https://github.com/Ptyktos/relayfold?rev=c8ffabecd6aed43ac4806bb5da41b195689bcdd9#c8ffabecd6aed43ac4806bb5da41b195689bcdd9"
+source = "git+https://github.com/Ptyktos/relayfold?rev=69084250929ca64f526ee86007e0a7f3ef402c32#69084250929ca64f526ee86007e0a7f3ef402c32"
 dependencies = [
  "wirefold",
 ]
@@ -1971,7 +1979,7 @@ dependencies = [
 name = "transport"
 version = "0.4.0"
 dependencies = [
- "apeiron",
+ "apeiron 0.1.0 (git+https://github.com/webfold-ai/apeiron?rev=d0eda3226193542949306f767d7280404921546f)",
  "aws-lc-rs",
  "bytes",
  "flate2",
@@ -2260,9 +2268,9 @@ checksum = "589f6da84c646204747d1270a2a5661ea66ed1cced2631d546fdfb155959f9ec"
 [[package]]
 name = "wirefold"
 version = "0.1.0"
-source = "git+https://github.com/webfold-ai/wirefold?rev=ba9a71284844cd1a7f14ae3b7105ad972aaa9e07#ba9a71284844cd1a7f14ae3b7105ad972aaa9e07"
+source = "git+https://github.com/webfold-ai/wirefold?rev=ed1ffdf4d34a86ab60e128ea14d2475e57650946#ed1ffdf4d34a86ab60e128ea14d2475e57650946"
 dependencies = [
- "apeiron",
+ "apeiron 0.1.0 (git+https://github.com/webfold-ai/apeiron?rev=1c3d4a1da565cde409f6f3cb343086aa6853eb9c)",
 ]
 
 [[package]]
