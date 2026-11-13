@@ -41,6 +41,16 @@ const BILLING_SERVICE: &str = "_billing._tcp";
 const BILLING_PATH: &str = "/v1/billing";
 const RECORD_TTL: u32 = 300;
 
+/// The environment variable [`RelayClient::from_env`] reads: comma-separated relay base URLs.
+pub const RELAYS_ENV: &str = "PKARR_RELAYS";
+
+/// `"http://a:6881, http://b:6881,,"` is two relays: split on commas, trim, drop empties, keep
+/// order (the client asks them in order).
+#[must_use]
+pub fn parse_relay_list(list: &str) -> Vec<String> {
+    list.split(',').map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned).collect()
+}
+
 /// The relays a [`RelayClient`] talks to when the caller names none — the same two the `pkarr`
 /// crate defaults to, so an existing deployment resolves unchanged.
 pub const DEFAULT_RELAYS: [&str; 2] = ["https://relay.pkarr.org", "https://pkarr.pubky.app"];
@@ -331,6 +341,20 @@ impl RelayClient {
         RelayClient { http: crate::http_client::Client::new(), relays }
     }
 
+    /// A client against the relays named by [`RELAYS_ENV`] (`PKARR_RELAYS`, comma-separated base
+    /// URLs, e.g. `http://meshd:6881`), or against [`DEFAULT_RELAYS`] when it is unset or names
+    /// none. This is how a deployment points every service at its own `meshd` without each
+    /// service growing its own variable.
+    #[must_use]
+    pub fn from_env() -> Self {
+        let relays = std::env::var(RELAYS_ENV).map(|v| parse_relay_list(&v)).unwrap_or_default();
+        if relays.is_empty() {
+            Self::new()
+        } else {
+            Self::with_relays(relays)
+        }
+    }
+
     fn url(relay: &str, key: &PublicKey) -> String {
         format!("{}/{}", relay.trim_end_matches('/'), key.to_z32())
     }
@@ -468,6 +492,14 @@ pub async fn resolve_mesh_model(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_relay_list_is_trimmed_ordered_and_without_blanks() {
+        assert_eq!(parse_relay_list("http://a:6881, http://b:6881 ,,"), ["http://a:6881", "http://b:6881"]);
+        assert!(parse_relay_list("").is_empty());
+        assert!(parse_relay_list(" , ,").is_empty());
+        assert_eq!(parse_relay_list("https://relay.example"), ["https://relay.example"]);
+    }
+
     use super::*;
 
     /// The seed derivation IS the identity: change it and every published endpoint silently
