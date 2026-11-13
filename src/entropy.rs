@@ -55,7 +55,9 @@ pub struct OsEntropy;
 
 impl EntropySource for OsEntropy {
     fn fill(&self, dest: &mut [u8]) -> Result<(), EntropyError> {
-        aws_lc_rs::rand::SystemRandom::new().fill(dest).map_err(|_| EntropyError("the system RNG failed"))
+        aws_lc_rs::rand::SystemRandom::new()
+            .fill(dest)
+            .map_err(|_| EntropyError("the system RNG failed"))
     }
 }
 
@@ -133,7 +135,9 @@ pub fn self_check_with(src: &dyn EntropySource) -> Result<(), EntropyError> {
         let ones: u32 = d.iter().map(|b| b.count_ones()).sum();
         // Mean 128, sd 8 over 256 bits; 64..=192 is eight standard deviations.
         if !(64..=192).contains(&ones) {
-            return Err(EntropyError("returned a block whose bit balance is implausible"));
+            return Err(EntropyError(
+                "returned a block whose bit balance is implausible",
+            ));
         }
     }
     for i in 0..DRAWS {
@@ -168,7 +172,10 @@ pub fn startup_self_check(timeout: Duration) -> Result<(), EntropyError> {
 ///
 /// # Errors
 /// The check failed, or did not finish in time.
-pub fn startup_self_check_with(src: std::sync::Arc<dyn EntropySource>, timeout: Duration) -> Result<(), EntropyError> {
+pub fn startup_self_check_with(
+    src: std::sync::Arc<dyn EntropySource>,
+    timeout: Duration,
+) -> Result<(), EntropyError> {
     let (tx, rx) = mpsc::channel();
     std::thread::Builder::new()
         .name("rng-self-check".into())
@@ -176,7 +183,8 @@ pub fn startup_self_check_with(src: std::sync::Arc<dyn EntropySource>, timeout: 
             let _ = tx.send(self_check_with(src.as_ref()));
         })
         .map_err(|_| EntropyError("could not start the self-check thread"))?;
-    rx.recv_timeout(timeout).map_err(|_| EntropyError("the self-check did not finish in time"))?
+    rx.recv_timeout(timeout)
+        .map_err(|_| EntropyError("the self-check did not finish in time"))?
 }
 
 /// Whether this build uses the FIPS-validated `aws-lc` module (the `fips` feature).
@@ -218,7 +226,12 @@ pub fn check_secret_strength(label: &str, secret: &[u8], min_len: usize) -> Resu
         return Err(weak("it uses too few distinct characters"));
     }
     for period in 1..=4usize {
-        if secret.len() > period * 2 && secret.chunks(period).skip(1).all(|c| secret.starts_with(&c[..c.len().min(period)])) {
+        if secret.len() > period * 2
+            && secret
+                .chunks(period)
+                .skip(1)
+                .all(|c| secret.starts_with(&c[..c.len().min(period)]))
+        {
             return Err(weak("it is a short repeating pattern"));
         }
     }
@@ -295,9 +308,15 @@ mod tests {
     #[test]
     fn a_source_that_succeeds_with_garbage_is_refused() {
         for fill in [0x00u8, 0xff, 0x55] {
-            assert!(self_check_with(&Constant(fill)).is_err(), "constant {fill:#x}");
+            assert!(
+                self_check_with(&Constant(fill)).is_err(),
+                "constant {fill:#x}"
+            );
         }
-        assert_eq!(self_check_with(&Cloned::default()).unwrap_err().0, "returned the same block twice");
+        assert_eq!(
+            self_check_with(&Cloned::default()).unwrap_err().0,
+            "returned the same block twice"
+        );
     }
 
     #[test]
@@ -318,16 +337,35 @@ mod tests {
 
     #[test]
     fn weak_secrets_are_refused_and_the_error_never_echoes_them() {
-        for weak in ["", "short", "unsetunsetunsetunsetunsetunsetunsetunset", "00000000000000000000000000000000", "abababababababababababababababab", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"] {
-            let err = check_secret_strength("EDGE_LB_REGISTRY_SECRET", weak.as_bytes(), 32).unwrap_err();
-            assert!(!weak.is_empty() && !err.0.contains(weak) || weak.is_empty(), "the error must not echo the secret: {err}");
-            assert!(err.0.starts_with("EDGE_LB_REGISTRY_SECRET is too weak"), "{err}");
+        for weak in [
+            "",
+            "short",
+            "unsetunsetunsetunsetunsetunsetunsetunset",
+            "00000000000000000000000000000000",
+            "abababababababababababababababab",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ] {
+            let err =
+                check_secret_strength("EDGE_LB_REGISTRY_SECRET", weak.as_bytes(), 32).unwrap_err();
+            assert!(
+                !weak.is_empty() && !err.0.contains(weak) || weak.is_empty(),
+                "the error must not echo the secret: {err}"
+            );
+            assert!(
+                err.0.starts_with("EDGE_LB_REGISTRY_SECRET is too weak"),
+                "{err}"
+            );
         }
         // Long enough to look random but under the minimum length: refused on length alone.
         let err = check_secret_strength("S", b"Zq8vK2mXp4Ld9RtYw3Hn", 32).unwrap_err();
         assert!(err.0.contains("at least 32 bytes"), "{err}");
         let good = random_hex(24).unwrap();
         check_secret_strength("x", good.as_bytes(), 32).unwrap();
-        check_secret_strength("x", b"correct horse battery staple, with a salt of 9QJ4", 32).unwrap();
+        check_secret_strength(
+            "x",
+            b"correct horse battery staple, with a salt of 9QJ4",
+            32,
+        )
+        .unwrap();
     }
 }

@@ -115,7 +115,14 @@ pub fn parse(cert_der: &[u8]) -> Option<Cert<'_>> {
             }
         }
     }
-    Some(Cert { der: cert_der, serial, issuer, subject, spki, extensions })
+    Some(Cert {
+        der: cert_der,
+        serial,
+        issuer,
+        subject,
+        spki,
+        extensions,
+    })
 }
 
 /// The next element if it is a SEQUENCE: `(whole TLV, rest)`.
@@ -130,7 +137,10 @@ fn take_seq(buf: &[u8]) -> Option<(&[u8], &[u8])> {
 
 impl Cert<'_> {
     fn extension(&self, oid: &[u8]) -> Option<&[u8]> {
-        self.extensions.iter().find(|(o, _, _)| *o == oid).map(|(_, _, v)| *v)
+        self.extensions
+            .iter()
+            .find(|(o, _, _)| *o == oid)
+            .map(|(_, _, v)| *v)
     }
 
     /// Whether the certificate carries an embedded SCT list (RFC 6962 §3.3).
@@ -148,19 +158,29 @@ impl Cert<'_> {
     /// Whether `basicConstraints` says CA:TRUE.
     #[must_use]
     pub fn is_ca(&self) -> bool {
-        let Some(v) = self.extension(OID_BASIC_CONSTRAINTS) else { return false };
-        let Some((0x30, content, _)) = der::read(v) else { return false };
+        let Some(v) = self.extension(OID_BASIC_CONSTRAINTS) else {
+            return false;
+        };
+        let Some((0x30, content, _)) = der::read(v) else {
+            return false;
+        };
         matches!(der::read(content), Some((0x01, b, _)) if b.first().is_some_and(|x| *x != 0))
     }
 
     /// The `dNSName` entries of the subject alternative name, lower-cased.
     #[must_use]
     pub fn dns_names(&self) -> Vec<String> {
-        let Some(v) = self.extension(OID_SAN) else { return Vec::new() };
-        let Some((0x30, mut names, _)) = der::read(v) else { return Vec::new() };
+        let Some(v) = self.extension(OID_SAN) else {
+            return Vec::new();
+        };
+        let Some((0x30, mut names, _)) = der::read(v) else {
+            return Vec::new();
+        };
         let mut out = Vec::new();
         while !names.is_empty() {
-            let Some((tag, content, next)) = der::read(names) else { break };
+            let Some((tag, content, next)) = der::read(names) else {
+                break;
+            };
             names = next;
             if tag == 0x82 {
                 if let Ok(s) = std::str::from_utf8(content) {
@@ -203,7 +223,9 @@ impl Cert<'_> {
 /// Handles the string types a Name uses; anything else is `None`.
 #[must_use]
 pub fn name_attribute(name_tlv: &[u8], oid: &[u8]) -> Option<String> {
-    let (0x30, mut rdns, _) = der::read(name_tlv)? else { return None };
+    let (0x30, mut rdns, _) = der::read(name_tlv)? else {
+        return None;
+    };
     while !rdns.is_empty() {
         let (tag, rdn, next) = der::read(rdns)?;
         rdns = next;
@@ -235,7 +257,9 @@ pub fn name_attribute(name_tlv: &[u8], oid: &[u8]) -> Option<String> {
 /// DER of the first `CERTIFICATE` block of `chain_pem`.
 #[must_use]
 pub fn leaf_der(chain_pem: &str) -> Option<Vec<u8>> {
-    crate::pem::blocks(chain_pem, "CERTIFICATE").into_iter().next()
+    crate::pem::blocks(chain_pem, "CERTIFICATE")
+        .into_iter()
+        .next()
 }
 
 /// The leaf's complete `SubjectPublicKeyInfo` DER — the identity of the certified key.
@@ -279,7 +303,10 @@ pub fn chain_top(chain_pem: &str) -> Option<ChainTop> {
 /// SHA-256 of `der` as lower-case hex — how CCADB and the Chrome Root Store identify a root.
 #[must_use]
 pub fn fingerprint_hex(der: &[u8]) -> String {
-    crate::prim::sha256(der).iter().map(|b| format!("{b:02x}")).collect()
+    crate::prim::sha256(der)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 #[cfg(test)]
@@ -288,8 +315,13 @@ mod tests {
 
     fn cert(names: &[&str], ca: bool) -> (rcgen::Certificate, rcgen::KeyPair) {
         let key = rcgen::KeyPair::generate().unwrap();
-        let mut params = rcgen::CertificateParams::new(names.iter().map(|s| (*s).to_string()).collect::<Vec<_>>()).unwrap();
-        params.distinguished_name.push(rcgen::DnType::CommonName, "Test Subject");
+        let mut params = rcgen::CertificateParams::new(
+            names.iter().map(|s| (*s).to_string()).collect::<Vec<_>>(),
+        )
+        .unwrap();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "Test Subject");
         if ca {
             params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
         }
@@ -300,7 +332,10 @@ mod tests {
     fn reads_names_san_spki_and_ca_flag() {
         let (c, key) = cert(&["Example.TEST", "*.example.test"], false);
         let parsed = parse(c.der()).unwrap();
-        assert_eq!(parsed.dns_names(), vec!["example.test".to_string(), "*.example.test".to_string()]);
+        assert_eq!(
+            parsed.dns_names(),
+            vec!["example.test".to_string(), "*.example.test".to_string()]
+        );
         assert_eq!(parsed.subject_cn().as_deref(), Some("Test Subject"));
         assert!(parsed.is_self_issued());
         assert!(!parsed.is_ca());
@@ -321,7 +356,10 @@ mod tests {
         assert!(parse(&truncated).is_none());
         let mut trailing = c.der().to_vec();
         trailing.push(0);
-        assert!(parse(&trailing).is_none(), "trailing bytes after the certificate");
+        assert!(
+            parse(&trailing).is_none(),
+            "trailing bytes after the certificate"
+        );
         assert!(parse(&vec![0x30; MAX_CERT_LEN + 1]).is_none());
         // Every prefix and a bit-flipped copy must stay a clean Option.
         for n in 0..c.der().len().min(400) {
@@ -345,7 +383,10 @@ mod tests {
         // A certificate with a (dummy) SCT list extension, as CAs embed them.
         let key = rcgen::KeyPair::generate().unwrap();
         let mut params = rcgen::CertificateParams::new(vec!["sct.test".to_string()]).unwrap();
-        let mut ext = rcgen::CustomExtension::from_oid_content(&[1, 3, 6, 1, 4, 1, 11129, 2, 4, 2], vec![0x04, 0x02, 0x00, 0x00]);
+        let mut ext = rcgen::CustomExtension::from_oid_content(
+            &[1, 3, 6, 1, 4, 1, 11129, 2, 4, 2],
+            vec![0x04, 0x02, 0x00, 0x00],
+        );
         ext.set_criticality(false);
         params.custom_extensions.push(ext);
         let c = params.self_signed(&key).unwrap();

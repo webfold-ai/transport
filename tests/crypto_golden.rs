@@ -62,7 +62,10 @@ fn rfc8439_2_8_2_chacha20poly1305_aead_vector() {
     let (ct, tag) = p::chacha20poly1305_encrypt(&key, &nonce, pt, &aad);
     assert_eq!(to_hex(&ct), "d31a8d34648e60db7b86afbc53ef7ec2a4aded51296e08fea9e2b5a736ee62d63dbea45e8ca9671282fafb69da92728b1a71de0a9e060b2905d6a5b67ecd3b3692ddbd7f2d778b8c9803aee328091b58fab324e4fad675945585808b4831d7bc3ff4def08e4b7a9de576d26586cec64b6116");
     assert_eq!(to_hex(&tag), "1ae10b594f09e26a7e902ecbd0600691");
-    assert_eq!(p::chacha20poly1305_decrypt(&key, &nonce, &ct, &tag, &aad).as_deref(), Some(&pt[..]));
+    assert_eq!(
+        p::chacha20poly1305_decrypt(&key, &nonce, &ct, &tag, &aad).as_deref(),
+        Some(&pt[..])
+    );
 }
 
 #[test]
@@ -70,32 +73,68 @@ fn rfc7748_x25519_function_vector_and_diffie_hellman() {
     // RFC 7748 §5.2 first vector (raw u-coordinate ladder).
     let scalar: [u8; 32] = arr("a546e36bf0527c9d3b16154b82465edd62144c0ac1fc5a18506a2244ba449ac4");
     let u: [u8; 32] = arr("e6db6867583030db3594c1a424b15f7c726624ec26b3353b10a903a6d0ab1c4c");
-    assert_eq!(to_hex(&p::x25519_shared(&scalar, &u).unwrap()), "c3da55379de9c6908e94ea4df28d084f32eccf03491c71f754b4075577a28552");
+    assert_eq!(
+        to_hex(&p::x25519_shared(&scalar, &u).unwrap()),
+        "c3da55379de9c6908e94ea4df28d084f32eccf03491c71f754b4075577a28552"
+    );
     // RFC 7748 §6.1 Alice / Bob.
     let alice: [u8; 32] = arr("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a");
     let bob: [u8; 32] = arr("5dab087e624a8a4b79e17f8b83800ee66f3bb1292618b6fd1c2f8b27ff88e0eb");
-    assert_eq!(to_hex(&p::x25519_pubkey(&alice)), "8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a");
-    assert_eq!(to_hex(&p::x25519_pubkey(&bob)), "de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f");
+    assert_eq!(
+        to_hex(&p::x25519_pubkey(&alice)),
+        "8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a"
+    );
+    assert_eq!(
+        to_hex(&p::x25519_pubkey(&bob)),
+        "de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f"
+    );
     let shared = "4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742";
-    assert_eq!(to_hex(&p::x25519_shared(&alice, &arr("de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f")).unwrap()), shared);
-    assert_eq!(to_hex(&p::x25519_shared(&bob, &arr("8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a")).unwrap()), shared);
+    assert_eq!(
+        to_hex(
+            &p::x25519_shared(
+                &alice,
+                &arr("de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f")
+            )
+            .unwrap()
+        ),
+        shared
+    );
+    assert_eq!(
+        to_hex(
+            &p::x25519_shared(
+                &bob,
+                &arr("8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a")
+            )
+            .unwrap()
+        ),
+        shared
+    );
 }
 
 #[test]
 fn rfc4231_hmac_sha256_test_case_2() {
     let mac = p::hmac_sha256(b"Jefe", b"what do ya want for nothing?");
-    assert_eq!(to_hex(&mac), "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843");
+    assert_eq!(
+        to_hex(&mac),
+        "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+    );
 }
 
 #[test]
 fn fips180_sha256_abc() {
-    assert_eq!(to_hex(&p::sha256(b"abc")), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    assert_eq!(
+        to_hex(&p::sha256(b"abc")),
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+    );
 }
 
 #[test]
 fn rfc8032_ed25519_public_key_test_1() {
     let seed: [u8; 32] = arr("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60");
-    assert_eq!(to_hex(&p::ed25519_pubkey(&seed)), "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a");
+    assert_eq!(
+        to_hex(&p::ed25519_pubkey(&seed)),
+        "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a"
+    );
 }
 
 #[test]
@@ -114,7 +153,10 @@ fn quic_packet_seal_golden_1200_bytes_and_open_round_trip() {
     let sealed = p::quic_seal(&key, &iv, pn, &header, &payload);
     assert_eq!(sealed.len(), 1216);
     assert_eq!(to_hex(&sealed), QUIC_SEALED.trim());
-    assert_eq!(p::quic_open(&key, &iv, pn, &header, &sealed).as_deref(), Some(&payload[..]));
+    assert_eq!(
+        p::quic_open(&key, &iv, pn, &header, &sealed).as_deref(),
+        Some(&payload[..])
+    );
     // Wrong packet number, wrong AAD, flipped tag bit: all rejected.
     assert!(p::quic_open(&key, &iv, pn + 1, &header, &sealed).is_none());
     assert!(p::quic_open(&key, &iv, pn, &header[..19], &sealed).is_none());
@@ -134,16 +176,28 @@ fn quic_header_protection_mask_golden() {
 #[test]
 fn x25519_golden_on_fixed_scalar_and_peer() {
     let (key, _, _, _, _) = quic_inputs();
-    assert_eq!(to_hex(&p::x25519_pubkey(&key)), "bb50ff9e82a574cfbf820e97f60fb9c143ec7415cf514f8cfd98eff59e059614");
+    assert_eq!(
+        to_hex(&p::x25519_pubkey(&key)),
+        "bb50ff9e82a574cfbf820e97f60fb9c143ec7415cf514f8cfd98eff59e059614"
+    );
     let peer: [u8; 32] = arr("e6db6867583030db3594c1a424b15f7c726624ec26b3353b10a903a6d0ab1c4c");
-    assert_eq!(to_hex(&p::x25519_shared(&key, &peer).unwrap()), "264f646c3f7363b622cbe69dec58773217af6e07623a3c92bc6132e5eb36f570");
+    assert_eq!(
+        to_hex(&p::x25519_shared(&key, &peer).unwrap()),
+        "264f646c3f7363b622cbe69dec58773217af6e07623a3c92bc6132e5eb36f570"
+    );
 }
 
 #[test]
 fn sha256_and_hmac_golden_on_1200_byte_payload() {
     let (_, _, _, header, payload) = quic_inputs();
-    assert_eq!(to_hex(&p::sha256(&payload)), "a952ade4894b1a37001ff320a7ddc6c2ad5cf943748e407fb770787f8420a39a");
-    assert_eq!(to_hex(&p::hmac_sha256(&header, &payload)), "ac59b57949eea014851dfc26fc649bf369b7aa9a4c934b3b38da3f66b7157f1d");
+    assert_eq!(
+        to_hex(&p::sha256(&payload)),
+        "a952ade4894b1a37001ff320a7ddc6c2ad5cf943748e407fb770787f8420a39a"
+    );
+    assert_eq!(
+        to_hex(&p::hmac_sha256(&header, &payload)),
+        "ac59b57949eea014851dfc26fc649bf369b7aa9a4c934b3b38da3f66b7157f1d"
+    );
 }
 
 // ── ECDSA P-256 over SHA-256, signed by pyca (independent signer) ─────────────────────────
@@ -176,7 +230,11 @@ fn packet_seal_open_timing() {
     const N: u32 = 20_000;
     let (key, iv, pn, header, payload) = quic_inputs();
     let sealed = p::quic_seal(&key, &iv, pn, &header, &payload);
-    assert_eq!(sealed, ht::quic::quic_seal(&key, &iv, pn, &header, &payload), "same bytes before timing");
+    assert_eq!(
+        sealed,
+        ht::quic::quic_seal(&key, &iv, pn, &header, &payload),
+        "same bytes before timing"
+    );
 
     fn per_op(mut f: impl FnMut()) -> f64 {
         let t = Instant::now();
@@ -185,19 +243,44 @@ fn packet_seal_open_timing() {
         }
         t.elapsed().as_secs_f64() * 1e6 / f64::from(N)
     }
-    let (mut old_seal, mut old_open, mut new_seal, mut new_open) = (f64::MAX, f64::MAX, f64::MAX, f64::MAX);
+    let (mut old_seal, mut old_open, mut new_seal, mut new_open) =
+        (f64::MAX, f64::MAX, f64::MAX, f64::MAX);
     for _ in 0..3 {
         old_seal = old_seal.min(per_op(|| {
-            black_box(ht::quic::quic_seal(&key, &iv, black_box(pn), &header, black_box(&payload)));
+            black_box(ht::quic::quic_seal(
+                &key,
+                &iv,
+                black_box(pn),
+                &header,
+                black_box(&payload),
+            ));
         }));
         old_open = old_open.min(per_op(|| {
-            black_box(ht::quic::quic_open(&key, &iv, black_box(pn), &header, black_box(&sealed)));
+            black_box(ht::quic::quic_open(
+                &key,
+                &iv,
+                black_box(pn),
+                &header,
+                black_box(&sealed),
+            ));
         }));
         new_seal = new_seal.min(per_op(|| {
-            black_box(p::quic_seal(&key, &iv, black_box(pn), &header, black_box(&payload)));
+            black_box(p::quic_seal(
+                &key,
+                &iv,
+                black_box(pn),
+                &header,
+                black_box(&payload),
+            ));
         }));
         new_open = new_open.min(per_op(|| {
-            black_box(p::quic_open(&key, &iv, black_box(pn), &header, black_box(&sealed)));
+            black_box(p::quic_open(
+                &key,
+                &iv,
+                black_box(pn),
+                &header,
+                black_box(&sealed),
+            ));
         }));
     }
     println!("1200 B packet, best of 3 x {N}:");

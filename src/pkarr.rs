@@ -27,9 +27,9 @@
 //! named gap, not an oversight.
 
 use super::dns::{Name, RData, Record};
-use super::signed_dns::{Keypair, SignedDnsError, SignedPacket};
 #[cfg(feature = "native")]
 use super::signed_dns::PublicKey;
+use super::signed_dns::{Keypair, SignedDnsError, SignedPacket};
 use crate::prim::sha256;
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -48,7 +48,11 @@ pub const RELAYS_ENV: &str = "PKARR_RELAYS";
 /// order (the client asks them in order).
 #[must_use]
 pub fn parse_relay_list(list: &str) -> Vec<String> {
-    list.split(',').map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned).collect()
+    list.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .collect()
 }
 
 /// The relays a [`RelayClient`] talks to when the caller names none — the same two the `pkarr`
@@ -87,7 +91,9 @@ impl core::fmt::Display for PublishError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             PublishError::Packet(e) => write!(f, "pkarr: {e}"),
-            PublishError::AllRelaysFailed(m) => write!(f, "pkarr: no relay accepted the record ({m})"),
+            PublishError::AllRelaysFailed(m) => {
+                write!(f, "pkarr: no relay accepted the record ({m})")
+            }
         }
     }
 }
@@ -133,14 +139,19 @@ fn service_records(
 ) -> Vec<Record> {
     let apex_str = keypair.to_z32();
     let apex = Name::from_ascii(&apex_str).expect("a z-base32 key is a valid label");
-    let svc = Name::from_ascii(&service_name(&apex_str, service))
-        .expect("service.key is a valid name");
+    let svc =
+        Name::from_ascii(&service_name(&apex_str, service)).expect("service.key is a valid name");
 
     let mut out = vec![
         Record::new(
             svc.clone(),
             RECORD_TTL,
-            RData::Srv { priority: 0, weight: 0, port, target: apex.clone() },
+            RData::Srv {
+                priority: 0,
+                weight: 0,
+                port,
+                target: apex.clone(),
+            },
         ),
         Record::new(
             svc,
@@ -171,7 +182,10 @@ fn build_packet(
     service: &str,
     metadata: &[(&str, &str)],
 ) -> SignedPacket {
-    sign(keypair, &service_records(keypair, ip, port, service, metadata))
+    sign(
+        keypair,
+        &service_records(keypair, ip, port, service, metadata),
+    )
 }
 
 #[cfg_attr(not(feature = "native"), allow(dead_code))] // read back only by the relay-client resolvers (and tests)
@@ -188,7 +202,9 @@ fn resolve_service_packet(packet: &SignedPacket, service: &str) -> Option<Servic
             continue;
         }
         match &r.data {
-            RData::Srv { port: p, target: t, .. } => {
+            RData::Srv {
+                port: p, target: t, ..
+            } => {
                 port = Some(*p);
                 target = Some(t.clone());
             }
@@ -228,7 +244,12 @@ fn resolve_service_packet(packet: &SignedPacket, service: &str) -> Option<Servic
 
 /// Build a signed packet advertising an opsfold HTTP endpoint.
 #[must_use]
-pub fn build_opsfold_packet(keypair: &Keypair, ip: IpAddr, port: u16, region: &str) -> SignedPacket {
+pub fn build_opsfold_packet(
+    keypair: &Keypair,
+    ip: IpAddr,
+    port: u16,
+    region: &str,
+) -> SignedPacket {
     build_packet(
         keypair,
         ip,
@@ -240,7 +261,12 @@ pub fn build_opsfold_packet(keypair: &Keypair, ip: IpAddr, port: u16, region: &s
 
 /// Build a signed packet advertising a billing HTTP endpoint.
 #[must_use]
-pub fn build_billing_packet(keypair: &Keypair, ip: IpAddr, port: u16, tenant: &str) -> SignedPacket {
+pub fn build_billing_packet(
+    keypair: &Keypair,
+    ip: IpAddr,
+    port: u16,
+    tenant: &str,
+) -> SignedPacket {
     build_packet(
         keypair,
         ip,
@@ -279,9 +305,11 @@ pub fn build_combined_packet(
         BILLING_SERVICE,
         &[("tenant", tenant), ("path", BILLING_PATH)],
     );
-    records.extend(billing.into_iter().filter(|r| {
-        !matches!(r.data, RData::A(_) | RData::Aaaa(_))
-    }));
+    records.extend(
+        billing
+            .into_iter()
+            .filter(|r| !matches!(r.data, RData::A(_) | RData::Aaaa(_))),
+    );
     sign(keypair, &records)
 }
 
@@ -338,7 +366,10 @@ impl RelayClient {
     /// A client against the given relay base URLs.
     #[must_use]
     pub fn with_relays(relays: Vec<String>) -> Self {
-        RelayClient { http: crate::http_client::Client::new(), relays }
+        RelayClient {
+            http: crate::http_client::Client::new(),
+            relays,
+        }
     }
 
     /// A client against the relays named by [`RELAYS_ENV`] (`PKARR_RELAYS`, comma-separated base
@@ -347,7 +378,9 @@ impl RelayClient {
     /// service growing its own variable.
     #[must_use]
     pub fn from_env() -> Self {
-        let relays = std::env::var(RELAYS_ENV).map(|v| parse_relay_list(&v)).unwrap_or_default();
+        let relays = std::env::var(RELAYS_ENV)
+            .map(|v| parse_relay_list(&v))
+            .unwrap_or_default();
         if relays.is_empty() {
             Self::new()
         } else {
@@ -422,7 +455,14 @@ pub async fn publish_combined(
     tenant: &str,
 ) -> Result<(), PublishError> {
     client
-        .publish(&build_combined_packet(keypair, ip, opsfold_port, billing_port, region, tenant))
+        .publish(&build_combined_packet(
+            keypair,
+            ip,
+            opsfold_port,
+            billing_port,
+            region,
+            tenant,
+        ))
         .await
 }
 
@@ -438,7 +478,9 @@ pub async fn publish_opsfold(
     port: u16,
     region: &str,
 ) -> Result<(), PublishError> {
-    client.publish(&build_opsfold_packet(keypair, ip, port, region)).await
+    client
+        .publish(&build_opsfold_packet(keypair, ip, port, region))
+        .await
 }
 
 /// Publish a billing endpoint record.
@@ -453,7 +495,9 @@ pub async fn publish_billing(
     port: u16,
     tenant: &str,
 ) -> Result<(), PublishError> {
-    client.publish(&build_billing_packet(keypair, ip, port, tenant)).await
+    client
+        .publish(&build_billing_packet(keypair, ip, port, tenant))
+        .await
 }
 
 /// Resolve an opsfold endpoint from a published record.
@@ -465,7 +509,11 @@ pub async fn resolve_opsfold(
     let packet = client.resolve_most_recent(public_key).await?;
     let ep = resolve_service_packet(&packet, OPSFOLD_SERVICE)?;
     Some(OpsfoldEndpoint {
-        region: ep.metadata.get("region").cloned().unwrap_or_else(|| "unknown".to_string()),
+        region: ep
+            .metadata
+            .get("region")
+            .cloned()
+            .unwrap_or_else(|| "unknown".to_string()),
         url: ep.url,
     })
 }
@@ -494,10 +542,16 @@ pub async fn resolve_mesh_model(
 mod tests {
     #[test]
     fn a_relay_list_is_trimmed_ordered_and_without_blanks() {
-        assert_eq!(parse_relay_list("http://a:6881, http://b:6881 ,,"), ["http://a:6881", "http://b:6881"]);
+        assert_eq!(
+            parse_relay_list("http://a:6881, http://b:6881 ,,"),
+            ["http://a:6881", "http://b:6881"]
+        );
         assert!(parse_relay_list("").is_empty());
         assert!(parse_relay_list(" , ,").is_empty());
-        assert_eq!(parse_relay_list("https://relay.example"), ["https://relay.example"]);
+        assert_eq!(
+            parse_relay_list("https://relay.example"),
+            ["https://relay.example"]
+        );
     }
 
     use super::*;
@@ -509,7 +563,11 @@ mod tests {
         let a = keypair_from_dialkey("tas-cloud-01");
         assert_eq!(a.to_z32(), keypair_from_dialkey("tas-cloud-01").to_z32());
         assert_ne!(a.to_z32(), keypair_from_dialkey("tas-cloud-02").to_z32());
-        assert_eq!(dialkey_seed("x"), sha256(b"x:pkarr"), "the suffix is part of the identity");
+        assert_eq!(
+            dialkey_seed("x"),
+            sha256(b"x:pkarr"),
+            "the suffix is part of the identity"
+        );
     }
 
     #[test]
@@ -518,8 +576,14 @@ mod tests {
         let p = build_opsfold_packet(&k, "10.7.46.107".parse().unwrap(), 8081, "tas-cloud");
         let ep = resolve_service_packet(&p, OPSFOLD_SERVICE).expect("resolves");
         assert_eq!(ep.url, "http://10.7.46.107:8081");
-        assert_eq!(ep.metadata.get("region").map(String::as_str), Some("tas-cloud"));
-        assert_eq!(ep.metadata.get("path").map(String::as_str), Some(OPSFOLD_PATH));
+        assert_eq!(
+            ep.metadata.get("region").map(String::as_str),
+            Some("tas-cloud")
+        );
+        assert_eq!(
+            ep.metadata.get("path").map(String::as_str),
+            Some(OPSFOLD_PATH)
+        );
     }
 
     #[test]
@@ -547,14 +611,20 @@ mod tests {
         let bill = resolve_service_packet(&p, BILLING_SERVICE).expect("billing resolves");
         assert_eq!(ops.url, "http://192.0.2.9:8081");
         assert_eq!(bill.url, "http://192.0.2.9:9090");
-        assert_eq!(bill.metadata.get("tenant").map(String::as_str), Some("acme"));
+        assert_eq!(
+            bill.metadata.get("tenant").map(String::as_str),
+            Some("acme")
+        );
         // one apex address, not one per service
         let addrs = p
             .records()
             .iter()
             .filter(|r| matches!(r.data, RData::A(_) | RData::Aaaa(_)))
             .count();
-        assert_eq!(addrs, 1, "the apex address must not be duplicated per service");
+        assert_eq!(
+            addrs, 1,
+            "the apex address must not be duplicated per service"
+        );
     }
 
     /// A record survives the exact bytes a relay stores and returns.
@@ -570,7 +640,10 @@ mod tests {
         let back = SignedPacket::from_relay_bytes(k.public_key(), &p.to_relay_bytes()).unwrap();
         let ep = resolve_service_packet(&back, MESH_MODEL_SERVICE).expect("resolves");
         assert_eq!(ep.url, "http://198.51.100.4:7000");
-        assert_eq!(ep.metadata.get("model").map(String::as_str), Some("qwen3-8b"));
+        assert_eq!(
+            ep.metadata.get("model").map(String::as_str),
+            Some("qwen3-8b")
+        );
     }
 
     /// Asking for a service the packet does not advertise is `None`, not another service's

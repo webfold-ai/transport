@@ -52,9 +52,9 @@
 //! - **self** = the challenge (the name used to prove control of the name)
 
 use super::PeerId;
-use apeiron::map::hashtrinity::Table;
 use crate::prim::sha256;
 use apeiron::map::hashtrinity::crypto::to_hex;
+use apeiron::map::hashtrinity::Table;
 
 /// An apex zone this platform is authoritative for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -78,13 +78,34 @@ impl Apex {
 /// Every apex the edge answers for. `tasmanian.cloud` is the platform's own zone (the portal
 /// lives there); the rest are the customer-facing pool.
 pub const APEXES: &[Apex] = &[
-    Apex { zone: "tasmanian.cloud",        hsts_preloaded: false },
-    Apex { zone: "tascloud.app",           hsts_preloaded: true  },
-    Apex { zone: "tascloud.dev",           hsts_preloaded: true  },
-    Apex { zone: "tasmaniancloud.app",      hsts_preloaded: true  },
-    Apex { zone: "tasmaniancloud.dev",      hsts_preloaded: true  },
-    Apex { zone: "tasmaniancloud.com.au",   hsts_preloaded: false },
-    Apex { zone: "tasmaniancloud.au",       hsts_preloaded: false },
+    Apex {
+        zone: "tasmanian.cloud",
+        hsts_preloaded: false,
+    },
+    Apex {
+        zone: "tascloud.app",
+        hsts_preloaded: true,
+    },
+    Apex {
+        zone: "tascloud.dev",
+        hsts_preloaded: true,
+    },
+    Apex {
+        zone: "tasmaniancloud.app",
+        hsts_preloaded: true,
+    },
+    Apex {
+        zone: "tasmaniancloud.dev",
+        hsts_preloaded: true,
+    },
+    Apex {
+        zone: "tasmaniancloud.com.au",
+        hsts_preloaded: false,
+    },
+    Apex {
+        zone: "tasmaniancloud.au",
+        hsts_preloaded: false,
+    },
 ];
 
 /// The apex a fully-qualified name sits directly under, if any.
@@ -118,7 +139,9 @@ pub fn is_valid_label(label: &str) -> bool {
         && !label.starts_with('-')
         && !label.ends_with('-')
         && !label.starts_with("xn--")
-        && label.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        && label
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
 /// Whether `fqdn` is a plausible customer-owned domain we could serve: at least two labels,
@@ -130,7 +153,10 @@ pub fn is_valid_custom_hostname(fqdn: &str) -> bool {
     if fqdn.len() > 253 || fqdn.split('.').count() < 2 {
         return false;
     }
-    if APEXES.iter().any(|a| fqdn == a.zone || fqdn.ends_with(&format!(".{}", a.zone))) {
+    if APEXES
+        .iter()
+        .any(|a| fqdn == a.zone || fqdn.ends_with(&format!(".{}", a.zone)))
+    {
         return false;
     }
     if !fqdn.split('.').all(is_valid_label) {
@@ -146,8 +172,21 @@ pub fn is_valid_custom_hostname(fqdn: &str) -> bool {
 /// TLDs reserved for special / private use (RFC 2606, 6761, 6762, 8375 and the
 /// ICANN-recommended private suffixes). No publicly trusted certificate exists for them.
 const NON_PUBLIC_TLDS: &[&str] = &[
-    "local", "localhost", "localdomain", "internal", "intranet", "lan", "home", "corp", "private",
-    "test", "example", "invalid", "onion", "arpa", "alt",
+    "local",
+    "localhost",
+    "localdomain",
+    "internal",
+    "intranet",
+    "lan",
+    "home",
+    "corp",
+    "private",
+    "test",
+    "example",
+    "invalid",
+    "onion",
+    "arpa",
+    "alt",
 ];
 
 // ── Label generation ──────────────────────────────────────────────────────────────────────
@@ -164,27 +203,108 @@ const ADJECTIVES: &[&str] = &[
 
 const NOUNS: &[&str] = &[
     "banksia", "bellbird", "bramble", "cascade", "cedar", "cove", "current", "delta", "dingo",
-    "ember", "estuary", "fjord", "galah", "granite", "harbour", "heath", "ibis", "inlet",
-    "jarrah", "kelp", "lantern", "ledger", "lyrebird", "meadow", "mesa", "numbat", "orchard",
-    "pelican", "quokka", "quoll", "ridge", "rosella", "sandbar", "summit", "thicket", "tundra",
-    "verdant", "wallaby", "willow", "wombat",
+    "ember", "estuary", "fjord", "galah", "granite", "harbour", "heath", "ibis", "inlet", "jarrah",
+    "kelp", "lantern", "ledger", "lyrebird", "meadow", "mesa", "numbat", "orchard", "pelican",
+    "quokka", "quoll", "ridge", "rosella", "sandbar", "summit", "thicket", "tundra", "verdant",
+    "wallaby", "willow", "wombat",
 ];
 
 /// Reserved labels the generator will never emit and a customer may never claim. These are
 /// names infrastructure and humans assume mean something specific.
 const RESERVED_LABELS: &[&str] = &[
-    "www", "api", "app", "admin", "portal", "mail", "smtp", "imap", "pop", "ns", "ns1", "ns2",
-    "dns", "mx", "edge", "cdn", "status", "docs", "blog", "billing", "auth", "login", "sso",
-    "id", "console", "dashboard", "static", "assets", "cdn1", "test", "staging", "prod",
-    "internal", "vpn", "git", "registry", "acme", "_acme-challenge", "localhost", "root",
+    "www",
+    "api",
+    "app",
+    "admin",
+    "portal",
+    "mail",
+    "smtp",
+    "imap",
+    "pop",
+    "ns",
+    "ns1",
+    "ns2",
+    "dns",
+    "mx",
+    "edge",
+    "cdn",
+    "status",
+    "docs",
+    "blog",
+    "billing",
+    "auth",
+    "login",
+    "sso",
+    "id",
+    "console",
+    "dashboard",
+    "static",
+    "assets",
+    "cdn1",
+    "test",
+    "staging",
+    "prod",
+    "internal",
+    "vpn",
+    "git",
+    "registry",
+    "acme",
+    "_acme-challenge",
+    "localhost",
+    "root",
     // Platform surfaces named in the architecture (public or Netbird-only) that a customer
     // must not be able to squat on a platform apex before the platform claims them.
-    "flexprice", "logto", "zammad", "unkey", "grafana", "netbird", "kanidm", "oidc", "oauth",
-    "support", "help", "pay", "payments", "invoice", "invoices", "checkout", "download",
-    "downloads", "update", "updates", "relay", "relays", "tunnel", "tunnels", "overlay", "ntfy",
-    "notify", "metrics", "monitor", "mta-sts", "autoconfig", "autodiscover", "ns3", "ns4", "mx1",
-    "mx2", "www1", "www2", "sandbox", "demo", "security", "abuse", "postmaster", "hostmaster",
-    "webmaster", "ca", "pki", "crl", "ocsp", "wpad", "_dmarc",
+    "flexprice",
+    "logto",
+    "zammad",
+    "unkey",
+    "grafana",
+    "netbird",
+    "kanidm",
+    "oidc",
+    "oauth",
+    "support",
+    "help",
+    "pay",
+    "payments",
+    "invoice",
+    "invoices",
+    "checkout",
+    "download",
+    "downloads",
+    "update",
+    "updates",
+    "relay",
+    "relays",
+    "tunnel",
+    "tunnels",
+    "overlay",
+    "ntfy",
+    "notify",
+    "metrics",
+    "monitor",
+    "mta-sts",
+    "autoconfig",
+    "autodiscover",
+    "ns3",
+    "ns4",
+    "mx1",
+    "mx2",
+    "www1",
+    "www2",
+    "sandbox",
+    "demo",
+    "security",
+    "abuse",
+    "postmaster",
+    "hostmaster",
+    "webmaster",
+    "ca",
+    "pki",
+    "crl",
+    "ocsp",
+    "wpad",
+    "_dmarc",
 ];
 
 /// Whether a label is reserved (never generated, never claimable by a customer).
@@ -334,7 +454,8 @@ impl Challenge {
     #[must_use]
     pub fn derive(fqdn: &str, tenant_id: &str, cname_target: &str, registry_secret: &[u8]) -> Self {
         let fqdn = normalize(fqdn);
-        let mut input = Vec::with_capacity(registry_secret.len() + fqdn.len() + tenant_id.len() + 16);
+        let mut input =
+            Vec::with_capacity(registry_secret.len() + fqdn.len() + tenant_id.len() + 16);
         input.extend_from_slice(registry_secret);
         input.extend_from_slice(b":tas-edge-challenge:");
         input.extend_from_slice(fqdn.as_bytes());
@@ -351,7 +472,9 @@ impl Challenge {
     /// Whether any of the TXT values published at `txt_name` satisfies this challenge.
     #[must_use]
     pub fn satisfied_by_txt(&self, values: &[String]) -> bool {
-        values.iter().any(|v| v.trim().eq_ignore_ascii_case(&self.token))
+        values
+            .iter()
+            .any(|v| v.trim().eq_ignore_ascii_case(&self.token))
     }
 
     /// Whether the observed CNAME chain lands on the target we handed out.
@@ -397,10 +520,15 @@ impl std::fmt::Display for EdgeError {
             EdgeError::Taken(h) => write!(f, "hostname already taken: {h}"),
             EdgeError::NotFound(h) => write!(f, "no such hostname: {h}"),
             EdgeError::Forbidden(h) => write!(f, "hostname belongs to another tenant: {h}"),
-            EdgeError::PeerConflict(h) => write!(f, "hostname is already bound to a different connector: {h}"),
+            EdgeError::PeerConflict(h) => {
+                write!(f, "hostname is already bound to a different connector: {h}")
+            }
             EdgeError::BadState(h) => write!(f, "operation not valid in the current state of: {h}"),
             EdgeError::InvalidCnameTarget(t) => {
-                write!(f, "CNAME target must be an active managed hostname of this tenant: {t}")
+                write!(
+                    f,
+                    "CNAME target must be an active managed hostname of this tenant: {t}"
+                )
             }
             EdgeError::NoLabelAvailable => write!(f, "could not generate a free label"),
         }
@@ -482,7 +610,11 @@ impl EdgeRegistry {
     #[must_use]
     pub fn quarantine_snapshot(&self) -> Vec<(String, String, u64)> {
         let now = (self.clock)();
-        self.quarantine.iter().filter(|(_, (_, until))| *until > now).map(|(label, (tenant, until))| (label.clone(), tenant.clone(), *until)).collect()
+        self.quarantine
+            .iter()
+            .filter(|(_, (_, until))| *until > now)
+            .map(|(label, (tenant, until))| (label.clone(), tenant.clone(), *until))
+            .collect()
     }
 
     /// Reinstate tombstones saved by [`Self::quarantine_snapshot`]. Entries already expired are
@@ -494,7 +626,11 @@ impl EdgeRegistry {
                 continue;
             }
             let label = normalize(&label);
-            if self.quarantine.get(&label).is_some_and(|(_, existing)| *existing >= until) {
+            if self
+                .quarantine
+                .get(&label)
+                .is_some_and(|(_, existing)| *existing >= until)
+            {
                 continue;
             }
             self.quarantine.put(label, (tenant, until));
@@ -608,7 +744,10 @@ impl EdgeRegistry {
         // The CNAME proof is only as strong as the target being uniquely this tenant's. An
         // unowned or foreign label would let a stale customer record satisfy the challenge.
         let target = normalize(cname_target);
-        let target_ok = self.owner.get(&target).is_some_and(|o| *o == route.tenant_id)
+        let target_ok = self
+            .owner
+            .get(&target)
+            .is_some_and(|o| *o == route.tenant_id)
             && self.hosts.get(&target).is_some_and(|r| {
                 r.kind == HostnameKind::Managed && r.state == HostnameState::Active
             });
@@ -639,7 +778,11 @@ impl EdgeRegistry {
     }
 
     /// The record for `fqdn`, only if `tenant_id` owns it.
-    pub fn get_for_tenant(&self, tenant_id: &str, fqdn: &str) -> Result<&HostnameRecord, EdgeError> {
+    pub fn get_for_tenant(
+        &self,
+        tenant_id: &str,
+        fqdn: &str,
+    ) -> Result<&HostnameRecord, EdgeError> {
         let fqdn = normalize(fqdn);
         match self.owner.get(&fqdn) {
             None => Err(EdgeError::NotFound(fqdn)),
@@ -708,8 +851,14 @@ impl EdgeRegistry {
             if self.probes.count(&fqdn) >= max_probes {
                 record.state = HostnameState::Failed(format!(
                     "no CNAME to {} and no matching TXT at {} after {max_probes} checks",
-                    record.challenge.as_ref().map_or("the edge", |c| c.cname_target.as_str()),
-                    record.challenge.as_ref().map_or("_twn-challenge", |c| c.txt_name.as_str()),
+                    record
+                        .challenge
+                        .as_ref()
+                        .map_or("the edge", |c| c.cname_target.as_str()),
+                    record
+                        .challenge
+                        .as_ref()
+                        .map_or("_twn-challenge", |c| c.txt_name.as_str()),
                 ));
             }
         }
@@ -763,7 +912,8 @@ impl EdgeRegistry {
         for fqdn in &waiting {
             if let Some(record) = self.hosts.get(fqdn) {
                 let mut record = record.clone();
-                record.state = HostnameState::Failed(format!("certificate could not be issued: {reason}"));
+                record.state =
+                    HostnameState::Failed(format!("certificate could not be issued: {reason}"));
                 self.hosts.put(fqdn.clone(), record);
             }
         }
@@ -775,7 +925,12 @@ impl EdgeRegistry {
     /// a portal that already knows the connector's identity should pass it at admission instead).
     /// Re-enrolling the same peer is idempotent; a different peer is refused, so a second agent
     /// holding the shared enrollment secret cannot take over a hostname.
-    pub fn bind_peer(&mut self, fqdn: &str, peer: PeerId, origin_port: u16) -> Result<(), EdgeError> {
+    pub fn bind_peer(
+        &mut self,
+        fqdn: &str,
+        peer: PeerId,
+        origin_port: u16,
+    ) -> Result<(), EdgeError> {
         let fqdn = normalize(fqdn);
         let Some(record) = self.hosts.get(&fqdn) else {
             return Err(EdgeError::NotFound(fqdn));
@@ -798,13 +953,22 @@ impl EdgeRegistry {
     /// Moving a custom hostname to `Terminate` makes it wait for a certificate again
     /// (`Active -> PendingCert`), because on the way in nothing was issued for it; moving a
     /// waiting one to `Passthrough` releases it, since nothing will ever be issued.
-    pub fn set_tls_mode(&mut self, tenant_id: &str, fqdn: &str, mode: TlsMode) -> Result<(), EdgeError> {
+    pub fn set_tls_mode(
+        &mut self,
+        tenant_id: &str,
+        fqdn: &str,
+        mode: TlsMode,
+    ) -> Result<(), EdgeError> {
         let fqdn = normalize(fqdn);
         let mut record = self.get_for_tenant(tenant_id, &fqdn)?.clone();
         record.tls_mode = mode;
         match (mode, record.kind, &record.state) {
-            (TlsMode::Terminate, HostnameKind::Custom, HostnameState::Active) => record.state = HostnameState::PendingCert,
-            (TlsMode::Passthrough, _, HostnameState::PendingCert) => record.state = HostnameState::Active,
+            (TlsMode::Terminate, HostnameKind::Custom, HostnameState::Active) => {
+                record.state = HostnameState::PendingCert
+            }
+            (TlsMode::Passthrough, _, HostnameState::PendingCert) => {
+                record.state = HostnameState::Active
+            }
             _ => {}
         }
         self.hosts.put(fqdn, record);
@@ -838,7 +1002,11 @@ impl EdgeRegistry {
         if record.state != HostnameState::Suspended {
             return Err(EdgeError::BadState(fqdn));
         }
-        record.state = self.held.get(&fqdn).cloned().unwrap_or(HostnameState::PendingDns);
+        record.state = self
+            .held
+            .get(&fqdn)
+            .cloned()
+            .unwrap_or(HostnameState::PendingDns);
         self.held.remove(&fqdn);
         self.hosts.put(fqdn, record);
         Ok(())
@@ -869,8 +1037,10 @@ impl EdgeRegistry {
         let mut seen: Table<String, bool> = Table::new();
         let mut out = Vec::new();
         for (_, record) in self.hosts.iter() {
-            if matches!(record.state, HostnameState::PendingDns | HostnameState::Failed(_))
-                || record.tls_mode == TlsMode::Passthrough
+            if matches!(
+                record.state,
+                HostnameState::PendingDns | HostnameState::Failed(_)
+            ) || record.tls_mode == TlsMode::Passthrough
             {
                 continue;
             }
@@ -919,7 +1089,10 @@ pub struct CertMaterial {
 // be the way it leaves the process.
 impl std::fmt::Debug for CertMaterial {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CertMaterial").field("chain_pem_bytes", &self.chain_pem.len()).field("key_pem", &"<redacted>").finish()
+        f.debug_struct("CertMaterial")
+            .field("chain_pem_bytes", &self.chain_pem.len())
+            .field("key_pem", &"<redacted>")
+            .finish()
     }
 }
 
@@ -958,31 +1131,57 @@ mod tests {
     /// CNAME proof must point at.
     fn claim_target(reg: &mut EdgeRegistry, tenant: &str, label: &str) -> String {
         let apex = APEXES.iter().find(|a| a.zone == "tascloud.app").unwrap();
-        reg.claim_managed_label(apex, label, route(tenant, &format!("tun-{label}"))).unwrap().fqdn
+        reg.claim_managed_label(apex, label, route(tenant, &format!("tun-{label}")))
+            .unwrap()
+            .fqdn
     }
 
     /// A registry on a clock the test controls.
     fn registry_at(now: &std::sync::Arc<std::sync::atomic::AtomicU64>) -> EdgeRegistry {
         let now = now.clone();
-        EdgeRegistry::with_clock(b"s".to_vec(), Box::new(move || now.load(std::sync::atomic::Ordering::SeqCst)))
+        EdgeRegistry::with_clock(
+            b"s".to_vec(),
+            Box::new(move || now.load(std::sync::atomic::Ordering::SeqCst)),
+        )
     }
 
     #[test]
     fn apex_matches_only_direct_children() {
-        assert_eq!(apex_of("amber-wren-1a2b3c.tascloud.app").unwrap().zone, "tascloud.app");
-        assert_eq!(apex_of("AMBER-WREN.TASCLOUD.APP.").unwrap().zone, "tascloud.app");
-        assert!(apex_of("deep.amber-wren.tascloud.app").is_none(), "wildcard covers one label only");
-        assert!(apex_of("tascloud.app").is_none(), "the apex itself is not a child");
+        assert_eq!(
+            apex_of("amber-wren-1a2b3c.tascloud.app").unwrap().zone,
+            "tascloud.app"
+        );
+        assert_eq!(
+            apex_of("AMBER-WREN.TASCLOUD.APP.").unwrap().zone,
+            "tascloud.app"
+        );
+        assert!(
+            apex_of("deep.amber-wren.tascloud.app").is_none(),
+            "wildcard covers one label only"
+        );
+        assert!(
+            apex_of("tascloud.app").is_none(),
+            "the apex itself is not a child"
+        );
         assert!(apex_of("app.acme.com.au").is_none());
     }
 
     #[test]
     fn hsts_preloaded_apexes_are_flagged() {
-        for zone in ["tascloud.app", "tascloud.dev", "tasmaniancloud.app", "tasmaniancloud.dev"] {
+        for zone in [
+            "tascloud.app",
+            "tascloud.dev",
+            "tasmaniancloud.app",
+            "tasmaniancloud.dev",
+        ] {
             let apex = APEXES.iter().find(|a| a.zone == zone).unwrap();
             assert!(apex.hsts_preloaded, "{zone} is under an HSTS-preloaded TLD");
         }
-        for zone in ["tasmanian.cloud", "tasmaniancloud.com.au", "tasmaniancloud.au"] {
+        for zone in [
+            "tasmanian.cloud",
+            "tasmaniancloud.com.au",
+            "tasmaniancloud.au",
+        ] {
             let apex = APEXES.iter().find(|a| a.zone == zone).unwrap();
             assert!(!apex.hsts_preloaded);
         }
@@ -993,8 +1192,15 @@ mod tests {
         let a = label_for_dialkey("tunnel-abc", 0);
         let b = label_for_dialkey("tunnel-abc", 0);
         assert_eq!(a, b, "the same dialkey must always yield the same hostname");
-        assert!(is_valid_label(&a), "generated label must be a legal DNS label: {a}");
-        assert_ne!(a, label_for_dialkey("tunnel-abc", 1), "retry reshuffles the whole label");
+        assert!(
+            is_valid_label(&a),
+            "generated label must be a legal DNS label: {a}"
+        );
+        assert_ne!(
+            a,
+            label_for_dialkey("tunnel-abc", 1),
+            "retry reshuffles the whole label"
+        );
         assert_ne!(a, label_for_dialkey("tunnel-xyz", 0));
     }
 
@@ -1002,7 +1208,10 @@ mod tests {
     fn generated_labels_never_collide_with_reserved_names() {
         for i in 0..2000u32 {
             let label = label_for_dialkey(&format!("dialkey-{i}"), 0);
-            assert!(!is_reserved_label(&label), "generator emitted reserved label {label}");
+            assert!(
+                !is_reserved_label(&label),
+                "generator emitted reserved label {label}"
+            );
             assert!(is_valid_label(&label));
         }
     }
@@ -1011,9 +1220,15 @@ mod tests {
     fn custom_hostname_validation_rejects_our_own_zones() {
         assert!(is_valid_custom_hostname("app.acme.com.au"));
         assert!(is_valid_custom_hostname("acme.com.au"));
-        assert!(!is_valid_custom_hostname("anything.tascloud.app"), "cannot 'bring' a name we own");
+        assert!(
+            !is_valid_custom_hostname("anything.tascloud.app"),
+            "cannot 'bring' a name we own"
+        );
         assert!(!is_valid_custom_hostname("tascloud.dev"));
-        assert!(!is_valid_custom_hostname("localhost"), "single label is not a domain");
+        assert!(
+            !is_valid_custom_hostname("localhost"),
+            "single label is not a domain"
+        );
         assert!(!is_valid_custom_hostname("-bad.example.com"));
     }
 
@@ -1021,29 +1236,46 @@ mod tests {
     fn managed_claim_is_stable_for_a_dialkey() {
         let apex = APEXES.iter().find(|a| a.zone == "tascloud.app").unwrap();
         let mut reg = EdgeRegistry::new(b"test-secret".to_vec());
-        let rec = reg.claim_managed(apex, "dialkey-one", route("acme", "tun-1")).unwrap();
-        assert_eq!(rec.fqdn, format!("{}.tascloud.app", label_for_dialkey("dialkey-one", 0)));
+        let rec = reg
+            .claim_managed(apex, "dialkey-one", route("acme", "tun-1"))
+            .unwrap();
+        assert_eq!(
+            rec.fqdn,
+            format!("{}.tascloud.app", label_for_dialkey("dialkey-one", 0))
+        );
         assert_eq!(rec.cert_name, "*.tascloud.app");
         assert_eq!(rec.state, HostnameState::Active);
-        assert!(rec.challenge.is_none(), "we are authoritative — nothing to prove");
+        assert!(
+            rec.challenge.is_none(),
+            "we are authoritative — nothing to prove"
+        );
     }
 
     #[test]
     fn a_colliding_dialkey_gets_a_different_label_not_an_error() {
         let apex = APEXES.iter().find(|a| a.zone == "tascloud.app").unwrap();
         let mut reg = EdgeRegistry::new(b"s".to_vec());
-        let first = reg.claim_managed(apex, "same-dialkey", route("acme", "tun-1")).unwrap();
+        let first = reg
+            .claim_managed(apex, "same-dialkey", route("acme", "tun-1"))
+            .unwrap();
         // A second tenant deriving the identical label must be given a free one instead.
-        let second = reg.claim_managed(apex, "same-dialkey", route("other", "tun-2")).unwrap();
+        let second = reg
+            .claim_managed(apex, "same-dialkey", route("other", "tun-2"))
+            .unwrap();
         assert_ne!(first.fqdn, second.fqdn);
-        assert_eq!(second.fqdn, format!("{}.tascloud.app", label_for_dialkey("same-dialkey", 1)));
+        assert_eq!(
+            second.fqdn,
+            format!("{}.tascloud.app", label_for_dialkey("same-dialkey", 1))
+        );
     }
 
     #[test]
     fn reserved_labels_cannot_be_claimed() {
         let apex = APEXES.iter().find(|a| a.zone == "tascloud.app").unwrap();
         let mut reg = EdgeRegistry::new(b"s".to_vec());
-        let err = reg.claim_managed_label(apex, "admin", route("acme", "t")).unwrap_err();
+        let err = reg
+            .claim_managed_label(apex, "admin", route("acme", "t"))
+            .unwrap_err();
         assert_eq!(err, EdgeError::ReservedLabel("admin".to_string()));
     }
 
@@ -1052,11 +1284,21 @@ mod tests {
         let mut reg = EdgeRegistry::new(b"s".to_vec());
         claim_target(&mut reg, "acme", "amber-wren-1a2b3c");
         let rec = reg
-            .add_custom("app.acme.com.au", "amber-wren-1a2b3c.tascloud.app", route("acme", "tun-1"))
+            .add_custom(
+                "app.acme.com.au",
+                "amber-wren-1a2b3c.tascloud.app",
+                route("acme", "tun-1"),
+            )
             .unwrap();
         assert_eq!(rec.state, HostnameState::PendingDns);
-        assert_eq!(rec.cert_name, "app.acme.com.au", "custom names need their own certificate");
-        assert!(!rec.is_servable(true), "unproven control must never serve, certificate or not");
+        assert_eq!(
+            rec.cert_name, "app.acme.com.au",
+            "custom names need their own certificate"
+        );
+        assert!(
+            !rec.is_servable(true),
+            "unproven control must never serve, certificate or not"
+        );
         let challenge = rec.challenge.unwrap();
         assert_eq!(challenge.txt_name, "_twn-challenge.app.acme.com.au");
         assert_eq!(challenge.cname_target, "amber-wren-1a2b3c.tascloud.app");
@@ -1066,13 +1308,24 @@ mod tests {
     fn challenge_tokens_are_stable_and_domain_bound() {
         let a = Challenge::derive("app.acme.com.au", "acme", "x.tascloud.app", b"secret");
         let b = Challenge::derive("APP.ACME.COM.AU.", "acme", "x.tascloud.app", b"secret");
-        assert_eq!(a.token, b.token, "the same name must not re-issue a different token");
-        let other_domain = Challenge::derive("app.other.com.au", "acme", "x.tascloud.app", b"secret");
+        assert_eq!(
+            a.token, b.token,
+            "the same name must not re-issue a different token"
+        );
+        let other_domain =
+            Challenge::derive("app.other.com.au", "acme", "x.tascloud.app", b"secret");
         assert_ne!(a.token, other_domain.token);
-        let other_tenant = Challenge::derive("app.acme.com.au", "rival", "x.tascloud.app", b"secret");
-        assert_ne!(a.token, other_tenant.token, "a token must not transfer between tenants");
+        let other_tenant =
+            Challenge::derive("app.acme.com.au", "rival", "x.tascloud.app", b"secret");
+        assert_ne!(
+            a.token, other_tenant.token,
+            "a token must not transfer between tenants"
+        );
         let other_secret = Challenge::derive("app.acme.com.au", "acme", "x.tascloud.app", b"other");
-        assert_ne!(a.token, other_secret.token, "the token must be unguessable without the secret");
+        assert_ne!(
+            a.token, other_secret.token,
+            "the token must be unguessable without the secret"
+        );
     }
 
     #[test]
@@ -1081,7 +1334,10 @@ mod tests {
         assert!(c.satisfied_by_txt(&[c.token.clone()]));
         assert!(c.satisfied_by_txt(&["noise".into(), c.token.to_uppercase()]));
         assert!(!c.satisfied_by_txt(&["noise".into()]));
-        assert!(c.satisfied_by_cname(&["X.TASCLOUD.APP.".into()]), "case and root dot must not matter");
+        assert!(
+            c.satisfied_by_cname(&["X.TASCLOUD.APP.".into()]),
+            "case and root dot must not matter"
+        );
         assert!(!c.satisfied_by_cname(&["someone-else.tascloud.app".into()]));
     }
 
@@ -1089,7 +1345,8 @@ mod tests {
     fn validation_walks_pending_to_active() {
         let mut reg = EdgeRegistry::new(b"s".to_vec());
         claim_target(&mut reg, "acme", "x");
-        reg.add_custom("app.acme.com.au", "x.tascloud.app", route("acme", "tun-1")).unwrap();
+        reg.add_custom("app.acme.com.au", "x.tascloud.app", route("acme", "tun-1"))
+            .unwrap();
         assert_eq!(reg.pending_validation().len(), 1);
 
         let state = reg.record_probe("app.acme.com.au", true, 10).unwrap();
@@ -1100,37 +1357,61 @@ mod tests {
         let rec = reg.lookup("app.acme.com.au").unwrap();
         assert_eq!(rec.state, HostnameState::Active);
         assert!(rec.is_servable(true));
-        assert!(!rec.is_servable(false), "custom hostnames have no plaintext fallback");
+        assert!(
+            !rec.is_servable(false),
+            "custom hostnames have no plaintext fallback"
+        );
     }
 
     #[test]
     fn a_never_configured_hostname_fails_instead_of_polling_forever() {
         let mut reg = EdgeRegistry::new(b"s".to_vec());
         claim_target(&mut reg, "acme", "x");
-        reg.add_custom("app.acme.com.au", "x.tascloud.app", route("acme", "tun-1")).unwrap();
+        reg.add_custom("app.acme.com.au", "x.tascloud.app", route("acme", "tun-1"))
+            .unwrap();
         for _ in 0..2 {
-            assert_eq!(reg.record_probe("app.acme.com.au", false, 3).unwrap(), HostnameState::PendingDns);
+            assert_eq!(
+                reg.record_probe("app.acme.com.au", false, 3).unwrap(),
+                HostnameState::PendingDns
+            );
         }
         let state = reg.record_probe("app.acme.com.au", false, 3).unwrap();
         match state {
             HostnameState::Failed(reason) => {
-                assert!(reason.contains("x.tascloud.app"), "the failure must name what to fix: {reason}");
+                assert!(
+                    reason.contains("x.tascloud.app"),
+                    "the failure must name what to fix: {reason}"
+                );
                 assert!(reason.contains("_twn-challenge.app.acme.com.au"));
             }
             other => panic!("expected Failed, got {other:?}"),
         }
-        assert!(reg.pending_validation().is_empty(), "a failed hostname leaves the work list");
+        assert!(
+            reg.pending_validation().is_empty(),
+            "a failed hostname leaves the work list"
+        );
     }
 
     #[test]
     fn tenancy_is_enforced_on_every_control_path() {
         let apex = APEXES.iter().find(|a| a.zone == "tasmanian.cloud").unwrap();
         let mut reg = EdgeRegistry::new(b"s".to_vec());
-        let rec = reg.claim_managed(apex, "dk", route("acme", "tun-1")).unwrap();
+        let rec = reg
+            .claim_managed(apex, "dk", route("acme", "tun-1"))
+            .unwrap();
 
-        assert!(matches!(reg.get_for_tenant("rival", &rec.fqdn), Err(EdgeError::Forbidden(_))));
-        assert!(matches!(reg.suspend("rival", &rec.fqdn), Err(EdgeError::Forbidden(_))));
-        assert!(matches!(reg.release("rival", &rec.fqdn), Err(EdgeError::Forbidden(_))));
+        assert!(matches!(
+            reg.get_for_tenant("rival", &rec.fqdn),
+            Err(EdgeError::Forbidden(_))
+        ));
+        assert!(matches!(
+            reg.suspend("rival", &rec.fqdn),
+            Err(EdgeError::Forbidden(_))
+        ));
+        assert!(matches!(
+            reg.release("rival", &rec.fqdn),
+            Err(EdgeError::Forbidden(_))
+        ));
         assert!(reg.get_for_tenant("acme", &rec.fqdn).is_ok());
 
         // The data plane still resolves it — it has already authenticated the connection.
@@ -1144,9 +1425,18 @@ mod tests {
         // below tests what it claims to rather than matching the domain by accident.
         claim_target(&mut reg, "tenant-mercury", "x");
         claim_target(&mut reg, "tenant-venus", "y");
-        reg.add_custom("app.example.com.au", "x.tascloud.app", route("tenant-mercury", "t1")).unwrap();
+        reg.add_custom(
+            "app.example.com.au",
+            "x.tascloud.app",
+            route("tenant-mercury", "t1"),
+        )
+        .unwrap();
         let err = reg
-            .add_custom("app.example.com.au", "y.tascloud.app", route("tenant-venus", "t2"))
+            .add_custom(
+                "app.example.com.au",
+                "y.tascloud.app",
+                route("tenant-venus", "t2"),
+            )
             .unwrap_err();
         assert_eq!(err, EdgeError::Taken("app.example.com.au".to_string()));
         assert!(
@@ -1159,10 +1449,15 @@ mod tests {
     fn suspension_stops_serving_without_dropping_the_name() {
         let apex = APEXES.iter().find(|a| a.zone == "tasmanian.cloud").unwrap();
         let mut reg = EdgeRegistry::new(b"s".to_vec());
-        let rec = reg.claim_managed(apex, "dk", route("acme", "tun-1")).unwrap();
+        let rec = reg
+            .claim_managed(apex, "dk", route("acme", "tun-1"))
+            .unwrap();
         reg.suspend("acme", &rec.fqdn).unwrap();
         assert!(!reg.lookup(&rec.fqdn).unwrap().is_servable(true));
-        assert!(reg.lookup(&rec.fqdn).is_some(), "a suspended name still resolves");
+        assert!(
+            reg.lookup(&rec.fqdn).is_some(),
+            "a suspended name still resolves"
+        );
         reg.resume("acme", &rec.fqdn).unwrap();
         assert!(reg.lookup(&rec.fqdn).unwrap().is_servable(true));
     }
@@ -1173,21 +1468,31 @@ mod tests {
         let apex = APEXES.iter().find(|a| a.zone == "tasmanian.cloud").unwrap();
         let now = std::sync::Arc::new(AtomicU64::new(1_000_000));
         let mut reg = registry_at(&now);
-        let first = reg.claim_managed(apex, "dk", route("acme", "tun-1")).unwrap();
+        let first = reg
+            .claim_managed(apex, "dk", route("acme", "tun-1"))
+            .unwrap();
         reg.release("acme", &first.fqdn).unwrap();
 
         // Another tenant cannot take it by vanity label...
         let label = first.fqdn.split('.').next().unwrap();
         assert_eq!(
-            reg.claim_managed_label(apex, label, route("attacker", "tun-x")).unwrap_err(),
+            reg.claim_managed_label(apex, label, route("attacker", "tun-x"))
+                .unwrap_err(),
             EdgeError::Taken(first.fqdn.clone()),
             "quarantine must look exactly like 'taken'"
         );
         // ...nor does the dialkey-derived claim land on it: the generator moves to the next label.
-        let other = reg.claim_managed(apex, "dk", route("rival", "tun-2")).unwrap();
+        let other = reg
+            .claim_managed(apex, "dk", route("rival", "tun-2"))
+            .unwrap();
         assert_ne!(other.fqdn, first.fqdn);
         // The original tenant may take it back at once.
-        assert_eq!(reg.claim_managed(apex, "dk", route("acme", "tun-1b")).unwrap().fqdn, first.fqdn);
+        assert_eq!(
+            reg.claim_managed(apex, "dk", route("acme", "tun-1b"))
+                .unwrap()
+                .fqdn,
+            first.fqdn
+        );
     }
 
     #[test]
@@ -1202,17 +1507,30 @@ mod tests {
     fn quarantine_survives_a_restart_through_snapshot_and_restore() {
         let mut a = EdgeRegistry::new(b"s".to_vec());
         let apex = APEXES.iter().find(|x| x.zone == "tascloud.app").unwrap();
-        a.claim_managed_label(apex, "mine", route("acme", "t")).unwrap();
+        a.claim_managed_label(apex, "mine", route("acme", "t"))
+            .unwrap();
         a.release("acme", "mine.tascloud.app").unwrap();
         let saved = a.quarantine_snapshot();
         assert_eq!(saved.len(), 1);
 
         let mut b = EdgeRegistry::new(b"s".to_vec());
-        assert!(b.claim_managed_label(apex, "mine", route("rival", "t2")).is_ok(), "a fresh registry knows nothing (the failure being fixed)");
+        assert!(
+            b.claim_managed_label(apex, "mine", route("rival", "t2"))
+                .is_ok(),
+            "a fresh registry knows nothing (the failure being fixed)"
+        );
         let mut c = EdgeRegistry::new(b"s".to_vec());
         c.restore_quarantine(saved.clone());
-        assert!(c.claim_managed_label(apex, "mine", route("rival", "t2")).is_err(), "the rival is still refused after the restart");
-        assert!(c.claim_managed_label(apex, "mine", route("acme", "t3")).is_ok(), "the releasing tenant may take it back");
+        assert!(
+            c.claim_managed_label(apex, "mine", route("rival", "t2"))
+                .is_err(),
+            "the rival is still refused after the restart"
+        );
+        assert!(
+            c.claim_managed_label(apex, "mine", route("acme", "t3"))
+                .is_ok(),
+            "the releasing tenant may take it back"
+        );
         // expired entries are ignored, and restore never shortens an existing tombstone
         let mut d = EdgeRegistry::new(b"s".to_vec());
         d.restore_quarantine(vec![("old.tascloud.app".into(), "x".into(), 1)]);
@@ -1225,25 +1543,37 @@ mod tests {
         let apex = APEXES.iter().find(|a| a.zone == "tasmanian.cloud").unwrap();
         let now = std::sync::Arc::new(AtomicU64::new(1_000_000));
         let mut reg = registry_at(&now);
-        let first = reg.claim_managed(apex, "dk", route("acme", "tun-1")).unwrap();
+        let first = reg
+            .claim_managed(apex, "dk", route("acme", "tun-1"))
+            .unwrap();
         reg.release("acme", &first.fqdn).unwrap();
         let label = first.fqdn.split('.').next().unwrap().to_string();
 
         now.store(1_000_000 + RELEASE_QUARANTINE_SECS - 1, Ordering::SeqCst);
-        assert!(reg.claim_managed_label(apex, &label, route("other", "t")).is_err());
+        assert!(reg
+            .claim_managed_label(apex, &label, route("other", "t"))
+            .is_err());
         now.store(1_000_000 + RELEASE_QUARANTINE_SECS + 1, Ordering::SeqCst);
-        assert_eq!(reg.claim_managed_label(apex, &label, route("other", "t")).unwrap().fqdn, first.fqdn);
+        assert_eq!(
+            reg.claim_managed_label(apex, &label, route("other", "t"))
+                .unwrap()
+                .fqdn,
+            first.fqdn
+        );
     }
 
     #[test]
     fn releasing_a_custom_hostname_does_not_quarantine_it() {
         let mut reg = EdgeRegistry::new(b"s".to_vec());
         claim_target(&mut reg, "acme", "x");
-        reg.add_custom("app.acme.com.au", "x.tascloud.app", route("acme", "t")).unwrap();
+        reg.add_custom("app.acme.com.au", "x.tascloud.app", route("acme", "t"))
+            .unwrap();
         reg.release("acme", "app.acme.com.au").unwrap();
         claim_target(&mut reg, "other", "y");
         // Ownership of a custom name is re-proven by DNS every time; there is nothing to protect.
-        assert!(reg.add_custom("app.acme.com.au", "y.tascloud.app", route("other", "t2")).is_ok());
+        assert!(reg
+            .add_custom("app.acme.com.au", "y.tascloud.app", route("other", "t2"))
+            .is_ok());
     }
 
     #[test]
@@ -1253,7 +1583,13 @@ mod tests {
         claim_target(&mut reg, "acme", "mine");
 
         // Another tenant's label: a stale CNAME to it must not prove anything for us.
-        let err = reg.add_custom("app.acme.com.au", "victim-app.tascloud.app", route("acme", "t")).unwrap_err();
+        let err = reg
+            .add_custom(
+                "app.acme.com.au",
+                "victim-app.tascloud.app",
+                route("acme", "t"),
+            )
+            .unwrap_err();
         assert!(matches!(err, EdgeError::InvalidCnameTarget(_)), "{err:?}");
         // An unclaimed label under our apex.
         assert!(matches!(
@@ -1272,61 +1608,109 @@ mod tests {
             Err(EdgeError::InvalidCnameTarget(_))
         ));
         reg.resume("acme", "mine.tascloud.app").unwrap();
-        assert!(reg.add_custom("app.acme.com.au", "MINE.tascloud.app.", route("acme", "t")).is_ok());
+        assert!(reg
+            .add_custom("app.acme.com.au", "MINE.tascloud.app.", route("acme", "t"))
+            .is_ok());
     }
 
     #[test]
     fn resume_restores_the_prior_state_and_cannot_skip_validation() {
         let mut reg = EdgeRegistry::new(b"s".to_vec());
         claim_target(&mut reg, "acme", "x");
-        reg.add_custom("a.acme.com.au", "x.tascloud.app", route("acme", "t1")).unwrap();
-        assert_eq!(reg.lookup("a.acme.com.au").unwrap().state, HostnameState::PendingDns);
+        reg.add_custom("a.acme.com.au", "x.tascloud.app", route("acme", "t1"))
+            .unwrap();
+        assert_eq!(
+            reg.lookup("a.acme.com.au").unwrap().state,
+            HostnameState::PendingDns
+        );
 
         // The bypass: suspend + resume used to turn an UNPROVEN name Active.
         reg.suspend("acme", "a.acme.com.au").unwrap();
         reg.resume("acme", "a.acme.com.au").unwrap();
-        assert_eq!(reg.lookup("a.acme.com.au").unwrap().state, HostnameState::PendingDns, "still has to prove control");
+        assert_eq!(
+            reg.lookup("a.acme.com.au").unwrap().state,
+            HostnameState::PendingDns,
+            "still has to prove control"
+        );
         assert_eq!(reg.pending_validation().len(), 1);
 
         // Resuming something that is not suspended is an error, not a promotion.
-        assert!(matches!(reg.resume("acme", "a.acme.com.au"), Err(EdgeError::BadState(_))));
+        assert!(matches!(
+            reg.resume("acme", "a.acme.com.au"),
+            Err(EdgeError::BadState(_))
+        ));
         reg.record_probe("a.acme.com.au", true, 5).unwrap();
-        assert!(matches!(reg.resume("acme", "a.acme.com.au"), Err(EdgeError::BadState(_))));
-        assert_eq!(reg.lookup("a.acme.com.au").unwrap().state, HostnameState::PendingCert, "no cert yet, so not Active");
+        assert!(matches!(
+            reg.resume("acme", "a.acme.com.au"),
+            Err(EdgeError::BadState(_))
+        ));
+        assert_eq!(
+            reg.lookup("a.acme.com.au").unwrap().state,
+            HostnameState::PendingCert,
+            "no cert yet, so not Active"
+        );
 
         // Suspend is idempotent and does not overwrite the remembered state.
         reg.suspend("acme", "a.acme.com.au").unwrap();
         reg.suspend("acme", "a.acme.com.au").unwrap();
         reg.resume("acme", "a.acme.com.au").unwrap();
-        assert_eq!(reg.lookup("a.acme.com.au").unwrap().state, HostnameState::PendingCert);
+        assert_eq!(
+            reg.lookup("a.acme.com.au").unwrap().state,
+            HostnameState::PendingCert
+        );
 
         // A failed hostname can be neither suspended nor resumed into service.
         reg.cert_failed("a.acme.com.au", "nope");
-        assert!(matches!(reg.suspend("acme", "a.acme.com.au"), Err(EdgeError::BadState(_))));
-        assert!(matches!(reg.resume("acme", "a.acme.com.au"), Err(EdgeError::BadState(_))));
+        assert!(matches!(
+            reg.suspend("acme", "a.acme.com.au"),
+            Err(EdgeError::BadState(_))
+        ));
+        assert!(matches!(
+            reg.resume("acme", "a.acme.com.au"),
+            Err(EdgeError::BadState(_))
+        ));
         // Tenancy still applies.
-        assert!(matches!(reg.resume("rival", "a.acme.com.au"), Err(EdgeError::Forbidden(_))));
+        assert!(matches!(
+            reg.resume("rival", "a.acme.com.au"),
+            Err(EdgeError::Forbidden(_))
+        ));
     }
 
     #[test]
     fn a_certificate_arriving_cannot_lift_a_suspension_or_revive_a_failure() {
         let mut reg = EdgeRegistry::new(b"s".to_vec());
         claim_target(&mut reg, "acme", "x");
-        reg.add_custom("a.acme.com.au", "x.tascloud.app", route("acme", "t1")).unwrap();
-        reg.add_custom("b.acme.com.au", "x.tascloud.app", route("acme", "t2")).unwrap();
-        reg.add_custom("c.acme.com.au", "x.tascloud.app", route("acme", "t3")).unwrap();
+        reg.add_custom("a.acme.com.au", "x.tascloud.app", route("acme", "t1"))
+            .unwrap();
+        reg.add_custom("b.acme.com.au", "x.tascloud.app", route("acme", "t2"))
+            .unwrap();
+        reg.add_custom("c.acme.com.au", "x.tascloud.app", route("acme", "t3"))
+            .unwrap();
         for h in ["a", "b", "c"] {
-            reg.record_probe(&format!("{h}.acme.com.au"), true, 5).unwrap();
+            reg.record_probe(&format!("{h}.acme.com.au"), true, 5)
+                .unwrap();
         }
         reg.suspend("acme", "a.acme.com.au").unwrap(); // billing hold
         reg.cert_failed("b.acme.com.au", "CAA forbids issuance");
 
         reg.cert_ready("a.acme.com.au").unwrap();
         reg.cert_ready("b.acme.com.au").unwrap();
-        assert_eq!(reg.lookup("a.acme.com.au").unwrap().state, HostnameState::Suspended);
-        assert!(matches!(reg.lookup("b.acme.com.au").unwrap().state, HostnameState::Failed(_)));
-        assert_eq!(reg.activate_cert("c.acme.com.au"), vec!["c.acme.com.au".to_string()]);
-        assert_eq!(reg.lookup("c.acme.com.au").unwrap().state, HostnameState::Active);
+        assert_eq!(
+            reg.lookup("a.acme.com.au").unwrap().state,
+            HostnameState::Suspended
+        );
+        assert!(matches!(
+            reg.lookup("b.acme.com.au").unwrap().state,
+            HostnameState::Failed(_)
+        ));
+        assert_eq!(
+            reg.activate_cert("c.acme.com.au"),
+            vec!["c.acme.com.au".to_string()]
+        );
+        assert_eq!(
+            reg.lookup("c.acme.com.au").unwrap().state,
+            HostnameState::Active
+        );
     }
 
     #[test]
@@ -1335,27 +1719,56 @@ mod tests {
         let mut reg = EdgeRegistry::new(b"s".to_vec());
         let live = reg.claim_managed(apex, "dk", route("acme", "t")).unwrap();
         claim_target(&mut reg, "acme", "x");
-        reg.add_custom("a.acme.com.au", "x.tascloud.app", route("acme", "t1")).unwrap();
+        reg.add_custom("a.acme.com.au", "x.tascloud.app", route("acme", "t1"))
+            .unwrap();
         reg.record_probe("a.acme.com.au", true, 5).unwrap();
 
         // A renewal failure of the wildcard must not fail a hostname that is already serving.
-        assert!(reg.cert_failed("*.tasmanian.cloud", "rate limited").is_empty());
+        assert!(reg
+            .cert_failed("*.tasmanian.cloud", "rate limited")
+            .is_empty());
         assert_eq!(reg.lookup(&live.fqdn).unwrap().state, HostnameState::Active);
 
-        assert_eq!(reg.cert_failed("a.acme.com.au", "CAA forbids issuance"), vec!["a.acme.com.au".to_string()]);
+        assert_eq!(
+            reg.cert_failed("a.acme.com.au", "CAA forbids issuance"),
+            vec!["a.acme.com.au".to_string()]
+        );
         match &reg.lookup("a.acme.com.au").unwrap().state {
             HostnameState::Failed(r) => assert!(r.contains("CAA forbids issuance"), "{r}"),
             other => panic!("{other:?}"),
         }
-        assert!(reg.required_cert_names().iter().all(|n| n != "a.acme.com.au"), "a failed name leaves the issuance list");
+        assert!(
+            reg.required_cert_names()
+                .iter()
+                .all(|n| n != "a.acme.com.au"),
+            "a failed name leaves the issuance list"
+        );
     }
 
     #[test]
     fn custom_hostnames_a_public_ca_would_refuse_are_not_admitted() {
-        for bad in ["printer.local", "nas.lan", "svc.internal", "x.test", "a.b.example", "host.onion", "1.2.3.4", "10.0.0.1", "foo.home.arpa"] {
-            assert!(!is_valid_custom_hostname(bad), "{bad} can never get a public certificate");
+        for bad in [
+            "printer.local",
+            "nas.lan",
+            "svc.internal",
+            "x.test",
+            "a.b.example",
+            "host.onion",
+            "1.2.3.4",
+            "10.0.0.1",
+            "foo.home.arpa",
+        ] {
+            assert!(
+                !is_valid_custom_hostname(bad),
+                "{bad} can never get a public certificate"
+            );
         }
-        for ok in ["example.com", "app.example.com.au", "my-1.example.dev", "x.co.uk"] {
+        for ok in [
+            "example.com",
+            "app.example.com.au",
+            "my-1.example.dev",
+            "x.co.uk",
+        ] {
             assert!(is_valid_custom_hostname(ok), "{ok}");
         }
     }
@@ -1364,11 +1777,21 @@ mod tests {
     fn platform_surfaces_cannot_be_squatted_as_labels() {
         let apex = APEXES.iter().find(|a| a.zone == "tasmanian.cloud").unwrap();
         let mut reg = EdgeRegistry::new(b"s".to_vec());
-        for label in ["flexprice", "logto", "support", "mta-sts", "autodiscover", "relay"] {
-            assert!(matches!(
-                reg.claim_managed_label(apex, label, route("acme", "t")),
-                Err(EdgeError::ReservedLabel(_))
-            ), "{label}");
+        for label in [
+            "flexprice",
+            "logto",
+            "support",
+            "mta-sts",
+            "autodiscover",
+            "relay",
+        ] {
+            assert!(
+                matches!(
+                    reg.claim_managed_label(apex, label, route("acme", "t")),
+                    Err(EdgeError::ReservedLabel(_))
+                ),
+                "{label}"
+            );
         }
     }
 
@@ -1376,21 +1799,37 @@ mod tests {
     fn passthrough_names_need_no_certificate_and_are_never_on_the_issuance_list() {
         let mut reg = EdgeRegistry::new(b"s".to_vec());
         claim_target(&mut reg, "acme", "x");
-        reg.add_custom("secure.acme.com.au", "x.tascloud.app", route("acme", "t")).unwrap();
-        reg.set_tls_mode("acme", "secure.acme.com.au", TlsMode::Passthrough).unwrap();
+        reg.add_custom("secure.acme.com.au", "x.tascloud.app", route("acme", "t"))
+            .unwrap();
+        reg.set_tls_mode("acme", "secure.acme.com.au", TlsMode::Passthrough)
+            .unwrap();
         // Proof of control is the last gate: straight to Active, no PendingCert.
-        assert_eq!(reg.record_probe("secure.acme.com.au", true, 5).unwrap(), HostnameState::Active);
+        assert_eq!(
+            reg.record_probe("secure.acme.com.au", true, 5).unwrap(),
+            HostnameState::Active
+        );
         let rec = reg.lookup("secure.acme.com.au").unwrap();
         assert!(rec.is_servable(false), "no certificate of ours is involved");
-        assert!(!reg.required_cert_names().contains(&"secure.acme.com.au".to_string()));
+        assert!(!reg
+            .required_cert_names()
+            .contains(&"secure.acme.com.au".to_string()));
 
         // Back to terminating: it must wait for a certificate again, and be on the work list.
-        reg.set_tls_mode("acme", "secure.acme.com.au", TlsMode::Terminate).unwrap();
-        assert_eq!(reg.lookup("secure.acme.com.au").unwrap().state, HostnameState::PendingCert);
-        assert!(reg.required_cert_names().contains(&"secure.acme.com.au".to_string()));
+        reg.set_tls_mode("acme", "secure.acme.com.au", TlsMode::Terminate)
+            .unwrap();
+        assert_eq!(
+            reg.lookup("secure.acme.com.au").unwrap().state,
+            HostnameState::PendingCert
+        );
+        assert!(reg
+            .required_cert_names()
+            .contains(&"secure.acme.com.au".to_string()));
         assert!(!reg.lookup("secure.acme.com.au").unwrap().is_servable(false));
         // Only the owner may flip it.
-        assert!(matches!(reg.set_tls_mode("rival", "secure.acme.com.au", TlsMode::Passthrough), Err(EdgeError::Forbidden(_))));
+        assert!(matches!(
+            reg.set_tls_mode("rival", "secure.acme.com.au", TlsMode::Passthrough),
+            Err(EdgeError::Forbidden(_))
+        ));
     }
 
     #[test]
@@ -1406,9 +1845,18 @@ mod tests {
         assert_eq!(reg.lookup(&rec.fqdn).unwrap().route.peer, a);
         assert_eq!(reg.lookup(&rec.fqdn).unwrap().route.origin_port, 9000);
         reg.bind_peer(&rec.fqdn, a, 9001).unwrap(); // idempotent re-enrollment (may move the port)
-        assert!(matches!(reg.bind_peer(&rec.fqdn, b, 9000), Err(EdgeError::PeerConflict(_))));
-        assert!(matches!(reg.bind_peer(&rec.fqdn, UNBOUND_PEER, 1), Err(_)), "zero is not an identity");
-        assert!(matches!(reg.bind_peer("nope.tascloud.app", a, 1), Err(EdgeError::NotFound(_))));
+        assert!(matches!(
+            reg.bind_peer(&rec.fqdn, b, 9000),
+            Err(EdgeError::PeerConflict(_))
+        ));
+        assert!(
+            matches!(reg.bind_peer(&rec.fqdn, UNBOUND_PEER, 1), Err(_)),
+            "zero is not an identity"
+        );
+        assert!(matches!(
+            reg.bind_peer("nope.tascloud.app", a, 1),
+            Err(EdgeError::NotFound(_))
+        ));
     }
 
     #[test]
@@ -1416,14 +1864,19 @@ mod tests {
         let apex = APEXES.iter().find(|a| a.zone == "tascloud.app").unwrap();
         let mut reg = EdgeRegistry::new(b"s".to_vec());
         for i in 0..5 {
-            reg.claim_managed(apex, &format!("dk-{i}"), route("acme", &format!("tun-{i}"))).unwrap();
+            reg.claim_managed(apex, &format!("dk-{i}"), route("acme", &format!("tun-{i}")))
+                .unwrap();
         }
         claim_target(&mut reg, "acme", "x");
-        reg.add_custom("app.acme.com.au", "x.tascloud.app", route("acme", "tun-c")).unwrap();
+        reg.add_custom("app.acme.com.au", "x.tascloud.app", route("acme", "tun-c"))
+            .unwrap();
 
         // The pending custom hostname is NOT yet in the issuance list — proving control
         // comes first, or we would be asking a CA for a name we cannot validate.
-        assert_eq!(reg.required_cert_names(), vec!["*.tascloud.app".to_string()]);
+        assert_eq!(
+            reg.required_cert_names(),
+            vec!["*.tascloud.app".to_string()]
+        );
 
         reg.record_probe("app.acme.com.au", true, 5).unwrap();
         assert_eq!(
@@ -1435,16 +1888,24 @@ mod tests {
 
     #[test]
     fn cert_name_resolution_matches_the_record() {
-        assert_eq!(cert_name_for("amber-wren-1a2b3c.tascloud.app"), "*.tascloud.app");
+        assert_eq!(
+            cert_name_for("amber-wren-1a2b3c.tascloud.app"),
+            "*.tascloud.app"
+        );
         assert_eq!(cert_name_for("app.acme.com.au"), "app.acme.com.au");
-        assert_eq!(cert_name_for("deep.nested.tascloud.app"), "deep.nested.tascloud.app");
+        assert_eq!(
+            cert_name_for("deep.nested.tascloud.app"),
+            "deep.nested.tascloud.app"
+        );
     }
 
     #[test]
     fn routes_carry_the_dialkey_derived_peer_identity() {
         let apex = APEXES.iter().find(|a| a.zone == "tasmanian.cloud").unwrap();
         let mut reg = EdgeRegistry::new(b"s".to_vec());
-        let rec = reg.claim_managed(apex, "dk", route("acme", "tun-7")).unwrap();
+        let rec = reg
+            .claim_managed(apex, "dk", route("acme", "tun-7"))
+            .unwrap();
         assert_eq!(
             rec.route.peer,
             super::super::dialkey::peer_id("tun-7"),
@@ -1456,9 +1917,12 @@ mod tests {
     fn listings_are_scoped() {
         let apex = APEXES.iter().find(|a| a.zone == "tasmanian.cloud").unwrap();
         let mut reg = EdgeRegistry::new(b"s".to_vec());
-        reg.claim_managed(apex, "dk-1", route("acme", "tun-1")).unwrap();
-        reg.claim_managed(apex, "dk-2", route("acme", "tun-2")).unwrap();
-        reg.claim_managed(apex, "dk-3", route("rival", "tun-3")).unwrap();
+        reg.claim_managed(apex, "dk-1", route("acme", "tun-1"))
+            .unwrap();
+        reg.claim_managed(apex, "dk-2", route("acme", "tun-2"))
+            .unwrap();
+        reg.claim_managed(apex, "dk-3", route("rival", "tun-3"))
+            .unwrap();
 
         assert_eq!(reg.list_for_tenant("acme").len(), 2);
         assert_eq!(reg.list_for_tenant("rival").len(), 1);

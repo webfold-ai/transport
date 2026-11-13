@@ -73,7 +73,11 @@ pub trait CtSource: Send + Sync {
 fn norm_serial(s: &str) -> String {
     let t = s.trim().trim_start_matches("0x").to_ascii_lowercase();
     let t = t.trim_start_matches('0');
-    if t.is_empty() { "0".to_string() } else { t.to_string() }
+    if t.is_empty() {
+        "0".to_string()
+    } else {
+        t.to_string()
+    }
 }
 
 /// Parse crt.sh's `output=json` array.
@@ -89,23 +93,48 @@ pub fn parse_crtsh(body: &[u8]) -> Result<Vec<CtEntry>, String> {
     if text.trim().is_empty() {
         return Ok(Vec::new()); // crt.sh answers an empty body for no results
     }
-    let v: serde_json::Value = serde_json::from_str(text).map_err(|e| format!("crt.sh response is not JSON: {e}"))?;
+    let v: serde_json::Value =
+        serde_json::from_str(text).map_err(|e| format!("crt.sh response is not JSON: {e}"))?;
     let arr = v.as_array().ok_or("crt.sh response is not an array")?;
     if arr.len() > MAX_ENTRIES_PER_QUERY {
-        return Err(format!("crt.sh returned more than {MAX_ENTRIES_PER_QUERY} entries"));
+        return Err(format!(
+            "crt.sh returned more than {MAX_ENTRIES_PER_QUERY} entries"
+        ));
     }
-    let ts = |s: &str| crate::acme::parse_rfc3339(&if s.contains(['Z', '+']) { s.to_string() } else { format!("{}Z", s.split('.').next().unwrap_or(s)) });
+    let ts = |s: &str| {
+        crate::acme::parse_rfc3339(&if s.contains(['Z', '+']) {
+            s.to_string()
+        } else {
+            format!("{}Z", s.split('.').next().unwrap_or(s))
+        })
+    };
     arr.iter()
         .map(|e| {
-            let field = |k: &str| e.get(k).and_then(|x| x.as_str()).ok_or_else(|| format!("a crt.sh entry has no '{k}'"));
+            let field = |k: &str| {
+                e.get(k)
+                    .and_then(|x| x.as_str())
+                    .ok_or_else(|| format!("a crt.sh entry has no '{k}'"))
+            };
             Ok(CtEntry {
-                log_id: e.get("id").and_then(serde_json::Value::as_u64).ok_or("a crt.sh entry has no 'id'")?,
+                log_id: e
+                    .get("id")
+                    .and_then(serde_json::Value::as_u64)
+                    .ok_or("a crt.sh entry has no 'id'")?,
                 issuer: field("issuer_name")?.to_string(),
                 serial: norm_serial(field("serial_number")?),
-                not_before: ts(field("not_before")?).ok_or("a crt.sh entry has a malformed not_before")?,
-                not_after: ts(field("not_after")?).ok_or("a crt.sh entry has a malformed not_after")?,
-                logged_at: e.get("entry_timestamp").and_then(|x| x.as_str()).and_then(ts),
-                names: field("name_value")?.lines().map(|l| l.trim().to_ascii_lowercase()).filter(|l| !l.is_empty()).collect(),
+                not_before: ts(field("not_before")?)
+                    .ok_or("a crt.sh entry has a malformed not_before")?,
+                not_after: ts(field("not_after")?)
+                    .ok_or("a crt.sh entry has a malformed not_after")?,
+                logged_at: e
+                    .get("entry_timestamp")
+                    .and_then(|x| x.as_str())
+                    .and_then(ts),
+                names: field("name_value")?
+                    .lines()
+                    .map(|l| l.trim().to_ascii_lowercase())
+                    .filter(|l| !l.is_empty())
+                    .collect(),
             })
         })
         .collect()
@@ -120,7 +149,10 @@ pub struct CrtSh {
 impl CrtSh {
     #[must_use]
     pub fn new(source: Arc<dyn SignalSource>) -> Self {
-        CrtSh { source, base: "https://crt.sh".to_string() }
+        CrtSh {
+            source,
+            base: "https://crt.sh".to_string(),
+        }
     }
 
     /// The production source over [`crate::ca_trust::HttpsSource`].
@@ -175,7 +207,12 @@ impl Expected {
     pub fn add_material(&mut self, material: &CertMaterial) {
         if let Some(der) = crate::x509::leaf_der(&material.chain_pem) {
             if let Some(c) = crate::x509::parse(&der) {
-                self.serials.insert(norm_serial(&c.serial.iter().map(|b| format!("{b:02x}")).collect::<String>()));
+                self.serials.insert(norm_serial(
+                    &c.serial
+                        .iter()
+                        .map(|b| format!("{b:02x}"))
+                        .collect::<String>(),
+                ));
             }
         }
     }
@@ -230,7 +267,10 @@ impl CtReport {
     /// Findings above `Info`.
     #[must_use]
     pub fn actionable(&self) -> usize {
-        self.findings.iter().filter(|f| f.severity > Severity::Info).count()
+        self.findings
+            .iter()
+            .filter(|f| f.severity > Severity::Info)
+            .count()
     }
 }
 
@@ -241,7 +281,12 @@ pub struct CtMonitor {
 }
 
 fn covers(entry_name: &str, ours: &str) -> bool {
-    entry_name == ours || entry_name.strip_prefix("*.").is_some_and(|d| ours.strip_suffix(d).is_some_and(|label| label.ends_with('.') && !label[..label.len() - 1].contains('.') && label.len() > 1))
+    entry_name == ours
+        || entry_name.strip_prefix("*.").is_some_and(|d| {
+            ours.strip_suffix(d).is_some_and(|label| {
+                label.ends_with('.') && !label[..label.len() - 1].contains('.') && label.len() > 1
+            })
+        })
 }
 
 fn within(name: &str, apex: &str) -> bool {
@@ -251,18 +296,33 @@ fn within(name: &str, apex: &str) -> bool {
 impl CtMonitor {
     #[must_use]
     pub fn new(source: Arc<dyn CtSource>) -> Self {
-        CtMonitor { source, scts_required: true }
+        CtMonitor {
+            source,
+            scts_required: true,
+        }
     }
 
     /// Does `issuer` (a DN string) belong to any CA on the allow-list, whatever its standing?
     fn known_issuer(policy: &CaPolicy, issuer: &str) -> bool {
         let issuer = issuer.to_ascii_lowercase();
-        policy.cas.iter().any(|c| c.issuer_names.iter().any(|n| issuer.contains(&n.to_ascii_lowercase())))
+        policy.cas.iter().any(|c| {
+            c.issuer_names
+                .iter()
+                .any(|n| issuer.contains(&n.to_ascii_lowercase()))
+        })
     }
 
     /// Judge one logged certificate for a watched name. Pure.
     #[must_use]
-    pub fn judge(&self, policy: &CaPolicy, expected: &Expected, name: &str, scope: &NameScope, e: &CtEntry, now: i64) -> Option<CtFinding> {
+    pub fn judge(
+        &self,
+        policy: &CaPolicy,
+        expected: &Expected,
+        name: &str,
+        scope: &NameScope,
+        e: &CtEntry,
+        now: i64,
+    ) -> Option<CtFinding> {
         if e.not_after <= now {
             return None;
         }
@@ -275,23 +335,52 @@ impl CtMonitor {
         if e.logged_at.unwrap_or(e.not_before) > now - RECENT_GRACE_SECS {
             return None;
         }
-        let mk = |severity, kind, detail: String| CtFinding { severity, kind, name: name.to_string(), issuer: Some(e.issuer.clone()), serial: Some(e.serial.clone()), detail };
+        let mk = |severity, kind, detail: String| CtFinding {
+            severity,
+            kind,
+            name: name.to_string(),
+            issuer: Some(e.issuer.clone()),
+            serial: Some(e.serial.clone()),
+            detail,
+        };
         if !Self::known_issuer(policy, &e.issuer) {
-            let sev = if own { Severity::Critical } else { Severity::Info };
+            let sev = if own {
+                Severity::Critical
+            } else {
+                Severity::Info
+            };
             return Some(mk(sev, CtFindingKind::UnknownIssuer, format!("a certificate for {name} (serial {}, valid until {}) was issued by '{}', which is on no entry of the CA allow-list", e.serial, e.not_after, e.issuer)));
         }
-        let sev = if own { Severity::Critical } else { Severity::Info };
+        let sev = if own {
+            Severity::Critical
+        } else {
+            Severity::Info
+        };
         Some(mk(sev, CtFindingKind::UnexpectedCertificate, format!("a certificate for {name} (serial {}, valid until {}) was issued by '{}' but is not one we ordered: another account at that CA, or a second deployment", e.serial, e.not_after, e.issuer)))
     }
 
     /// Poll the logs for every watched name and judge what comes back.
-    pub async fn check(&self, policy: &CaPolicy, apexes: &[String], customer_names: &[String], expected: &Expected, now: i64) -> CtReport {
-        let mut report = CtReport { checked_at: now, ..CtReport::default() };
+    pub async fn check(
+        &self,
+        policy: &CaPolicy,
+        apexes: &[String],
+        customer_names: &[String],
+        expected: &Expected,
+        now: i64,
+    ) -> CtReport {
+        let mut report = CtReport {
+            checked_at: now,
+            ..CtReport::default()
+        };
         let mut seen: HashSet<(String, u64)> = HashSet::new();
         let queries: Vec<(CtQuery, NameScope, String)> = apexes
             .iter()
             .map(|a| (CtQuery::Subdomains(a.clone()), NameScope::Own, a.clone()))
-            .chain(customer_names.iter().map(|n| (CtQuery::Exact(n.clone()), NameScope::Customer, n.clone())))
+            .chain(
+                customer_names
+                    .iter()
+                    .map(|n| (CtQuery::Exact(n.clone()), NameScope::Customer, n.clone())),
+            )
             .collect();
         for (q, scope, root) in queries {
             report.queries += 1;
@@ -306,7 +395,15 @@ impl CtMonitor {
             for e in &entries {
                 // Only names we actually watch: a Subdomains query for the apex also returns
                 // certificates whose SANs merely include something under it among many others.
-                let Some(name) = e.names.iter().find(|n| if scope == NameScope::Own { within(n.trim_start_matches("*."), &root) } else { covers(n, &root) || **n == root }) else { continue };
+                let Some(name) = e.names.iter().find(|n| {
+                    if scope == NameScope::Own {
+                        within(n.trim_start_matches("*."), &root)
+                    } else {
+                        covers(n, &root) || **n == root
+                    }
+                }) else {
+                    continue;
+                };
                 if !seen.insert((root.clone(), e.log_id)) {
                     continue;
                 }
@@ -322,9 +419,20 @@ impl CtMonitor {
     /// CT refuse it), or it is a precertificate.
     #[must_use]
     pub fn check_obtained(&self, name: &str, material: &CertMaterial) -> Vec<CtFinding> {
-        let mk = |severity, kind, detail: &str| CtFinding { severity, kind, name: name.to_string(), issuer: None, serial: None, detail: detail.to_string() };
-        let Some(der) = crate::x509::leaf_der(&material.chain_pem) else { return Vec::new() };
-        let Some(cert) = crate::x509::parse(&der) else { return Vec::new() };
+        let mk = |severity, kind, detail: &str| CtFinding {
+            severity,
+            kind,
+            name: name.to_string(),
+            issuer: None,
+            serial: None,
+            detail: detail.to_string(),
+        };
+        let Some(der) = crate::x509::leaf_der(&material.chain_pem) else {
+            return Vec::new();
+        };
+        let Some(cert) = crate::x509::parse(&der) else {
+            return Vec::new();
+        };
         let mut out = Vec::new();
         if cert.is_precertificate() {
             out.push(mk(Severity::Error, CtFindingKind::PrecertificateServed, "the certificate carries the CT precertificate poison: it is a precertificate, not a certificate"));
@@ -355,7 +463,15 @@ mod tests {
     }
 
     fn ct(id: u64, issuer: &str, serial: &str, names: &[&str]) -> CtEntry {
-        CtEntry { log_id: id, issuer: issuer.into(), serial: norm_serial(serial), not_before: NOW - 10 * HOUR, not_after: NOW + 80 * 24 * HOUR, logged_at: Some(NOW - 9 * HOUR), names: names.iter().map(|s| (*s).to_string()).collect() }
+        CtEntry {
+            log_id: id,
+            issuer: issuer.into(),
+            serial: norm_serial(serial),
+            not_before: NOW - 10 * HOUR,
+            not_after: NOW + 80 * 24 * HOUR,
+            logged_at: Some(NOW - 9 * HOUR),
+            names: names.iter().map(|s| (*s).to_string()).collect(),
+        }
     }
 
     struct Fake {
@@ -363,14 +479,23 @@ mod tests {
     }
     impl CtSource for Fake {
         fn query<'a>(&'a self, q: &'a CtQuery) -> BoxFuture<'a, Result<Vec<CtEntry>, String>> {
-            Box::pin(async move { self.by_query.lock().unwrap().iter().find(|(k, _)| k == q).map_or_else(|| Ok(Vec::new()), |(_, v)| v.clone()) })
+            Box::pin(async move {
+                self.by_query
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .find(|(k, _)| k == q)
+                    .map_or_else(|| Ok(Vec::new()), |(_, v)| v.clone())
+            })
         }
     }
 
     type Canned = (CtQuery, Result<Vec<CtEntry>, String>);
 
     fn monitor(entries: Vec<Canned>) -> CtMonitor {
-        CtMonitor::new(Arc::new(Fake { by_query: Mutex::new(entries) }))
+        CtMonitor::new(Arc::new(Fake {
+            by_query: Mutex::new(entries),
+        }))
     }
 
     #[tokio::test]
@@ -378,21 +503,66 @@ mod tests {
         let mut expected = Expected::default();
         expected.add_serial("0A0B");
         let apex = CtQuery::Subdomains("tascloud.app".into());
-        let m = monitor(vec![(apex, Ok(vec![
-            ct(1, "C=US, O=Let's Encrypt, CN=R11", "0a0b", &["*.tascloud.app", "tascloud.app"]),
-            ct(2, "C=US, O=Let's Encrypt, CN=R11", "ffee01", &["login.tascloud.app"]),
-            ct(3, "C=XX, O=Sketchy CA, CN=Sketchy Issuing CA", "123", &["tascloud.app"]),
-            ct(4, "C=US, O=Google Trust Services, CN=WR1", "9999", &["*.tascloud.app"]),
-            ct(5, "C=US, O=Let's Encrypt, CN=R11", "77", &["unrelated.example.org"]),
-        ]))]);
-        let r = m.check(&pol(), &["tascloud.app".into()], &[], &expected, NOW).await;
+        let m = monitor(vec![(
+            apex,
+            Ok(vec![
+                ct(
+                    1,
+                    "C=US, O=Let's Encrypt, CN=R11",
+                    "0a0b",
+                    &["*.tascloud.app", "tascloud.app"],
+                ),
+                ct(
+                    2,
+                    "C=US, O=Let's Encrypt, CN=R11",
+                    "ffee01",
+                    &["login.tascloud.app"],
+                ),
+                ct(
+                    3,
+                    "C=XX, O=Sketchy CA, CN=Sketchy Issuing CA",
+                    "123",
+                    &["tascloud.app"],
+                ),
+                ct(
+                    4,
+                    "C=US, O=Google Trust Services, CN=WR1",
+                    "9999",
+                    &["*.tascloud.app"],
+                ),
+                ct(
+                    5,
+                    "C=US, O=Let's Encrypt, CN=R11",
+                    "77",
+                    &["unrelated.example.org"],
+                ),
+            ]),
+        )]);
+        let r = m
+            .check(&pol(), &["tascloud.app".into()], &[], &expected, NOW)
+            .await;
         assert!(r.errors.is_empty(), "{r:?}");
         assert_eq!(r.entries_seen, 5);
-        let kinds: Vec<(CtFindingKind, &str)> = r.findings.iter().map(|f| (f.kind, f.serial.as_deref().unwrap_or(""))).collect();
-        assert_eq!(kinds, vec![(CtFindingKind::UnexpectedCertificate, "ffee01"), (CtFindingKind::UnknownIssuer, "123"), (CtFindingKind::UnexpectedCertificate, "9999")], "{r:?}");
+        let kinds: Vec<(CtFindingKind, &str)> = r
+            .findings
+            .iter()
+            .map(|f| (f.kind, f.serial.as_deref().unwrap_or("")))
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                (CtFindingKind::UnexpectedCertificate, "ffee01"),
+                (CtFindingKind::UnknownIssuer, "123"),
+                (CtFindingKind::UnexpectedCertificate, "9999")
+            ],
+            "{r:?}"
+        );
         assert!(r.findings.iter().all(|f| f.severity == Severity::Critical));
         assert_eq!(r.actionable(), 3);
-        assert!(r.findings[1].detail.contains("Sketchy"), "the issuer is named");
+        assert!(
+            r.findings[1].detail.contains("Sketchy"),
+            "the issuer is named"
+        );
     }
 
     #[tokio::test]
@@ -400,9 +570,23 @@ mod tests {
         // A retired CA's certificates still exist and are still ours; a CA that was never listed is not.
         let mut p = pol();
         p.cas[0].status = CaStatus::Distrusted;
-        let m = monitor(vec![(CtQuery::Subdomains("tascloud.app".into()), Ok(vec![ct(1, "O=Let's Encrypt, CN=R11", "5", &["x.tascloud.app"])]))]);
-        let r = m.check(&p, &["tascloud.app".into()], &[], &Expected::default(), NOW).await;
-        assert_eq!(r.findings[0].kind, CtFindingKind::UnexpectedCertificate, "known issuer, unknown serial -- not 'unknown issuer'");
+        let m = monitor(vec![(
+            CtQuery::Subdomains("tascloud.app".into()),
+            Ok(vec![ct(
+                1,
+                "O=Let's Encrypt, CN=R11",
+                "5",
+                &["x.tascloud.app"],
+            )]),
+        )]);
+        let r = m
+            .check(&p, &["tascloud.app".into()], &[], &Expected::default(), NOW)
+            .await;
+        assert_eq!(
+            r.findings[0].kind,
+            CtFindingKind::UnexpectedCertificate,
+            "known issuer, unknown serial -- not 'unknown issuer'"
+        );
     }
 
     #[tokio::test]
@@ -411,31 +595,86 @@ mod tests {
         stale.not_after = NOW - 1;
         let mut fresh = ct(2, "O=Let's Encrypt", "2", &["b.tascloud.app"]);
         fresh.logged_at = Some(NOW - 60); // the precert of an order in flight
-        let m = monitor(vec![(CtQuery::Subdomains("tascloud.app".into()), Ok(vec![stale, fresh]))]);
-        let r = m.check(&pol(), &["tascloud.app".into()], &[], &Expected::default(), NOW).await;
+        let m = monitor(vec![(
+            CtQuery::Subdomains("tascloud.app".into()),
+            Ok(vec![stale, fresh]),
+        )]);
+        let r = m
+            .check(
+                &pol(),
+                &["tascloud.app".into()],
+                &[],
+                &Expected::default(),
+                NOW,
+            )
+            .await;
         assert!(r.findings.is_empty(), "{r:?}");
         // The same fresh entry is judged on the next pass once the grace has elapsed.
-        let r = m.check(&pol(), &["tascloud.app".into()], &[], &Expected::default(), NOW + RECENT_GRACE_SECS + 120).await;
+        let r = m
+            .check(
+                &pol(),
+                &["tascloud.app".into()],
+                &[],
+                &Expected::default(),
+                NOW + RECENT_GRACE_SECS + 120,
+            )
+            .await;
         assert_eq!(r.findings.len(), 1);
     }
 
     #[tokio::test]
     async fn customer_names_are_informational_and_wildcards_cover_one_label() {
         let m = monitor(vec![
-            (CtQuery::Exact("app.acme.com.au".into()), Ok(vec![ct(1, "O=Some Other CA", "9", &["app.acme.com.au"]), ct(2, "O=Let's Encrypt", "8", &["*.acme.com.au"])])),
-            (CtQuery::Exact("deep.sub.acme.com.au".into()), Ok(vec![ct(3, "O=Some Other CA", "7", &["*.acme.com.au"])])),
+            (
+                CtQuery::Exact("app.acme.com.au".into()),
+                Ok(vec![
+                    ct(1, "O=Some Other CA", "9", &["app.acme.com.au"]),
+                    ct(2, "O=Let's Encrypt", "8", &["*.acme.com.au"]),
+                ]),
+            ),
+            (
+                CtQuery::Exact("deep.sub.acme.com.au".into()),
+                Ok(vec![ct(3, "O=Some Other CA", "7", &["*.acme.com.au"])]),
+            ),
         ]);
-        let r = m.check(&pol(), &[], &["app.acme.com.au".into(), "deep.sub.acme.com.au".into()], &Expected::default(), NOW).await;
+        let r = m
+            .check(
+                &pol(),
+                &[],
+                &["app.acme.com.au".into(), "deep.sub.acme.com.au".into()],
+                &Expected::default(),
+                NOW,
+            )
+            .await;
         assert_eq!(r.findings.len(), 2, "{r:?}");
-        assert!(r.findings.iter().all(|f| f.severity == Severity::Info), "a customer's other certificates are theirs to hold: {r:?}");
+        assert!(
+            r.findings.iter().all(|f| f.severity == Severity::Info),
+            "a customer's other certificates are theirs to hold: {r:?}"
+        );
         assert_eq!(r.actionable(), 0);
-        assert!(covers("*.acme.com.au", "app.acme.com.au") && !covers("*.acme.com.au", "a.b.acme.com.au") && !covers("*.acme.com.au", "acme.com.au"));
+        assert!(
+            covers("*.acme.com.au", "app.acme.com.au")
+                && !covers("*.acme.com.au", "a.b.acme.com.au")
+                && !covers("*.acme.com.au", "acme.com.au")
+        );
     }
 
     #[tokio::test]
-    async fn an_unreachable_or_malformed_source_is_an_error_entry_never_a_finding_and_never_a_panic() {
-        let m = monitor(vec![(CtQuery::Subdomains("tascloud.app".into()), Err("HTTP 503".into()))]);
-        let r = m.check(&pol(), &["tascloud.app".into(), "other.app".into()], &[], &Expected::default(), NOW).await;
+    async fn an_unreachable_or_malformed_source_is_an_error_entry_never_a_finding_and_never_a_panic(
+    ) {
+        let m = monitor(vec![(
+            CtQuery::Subdomains("tascloud.app".into()),
+            Err("HTTP 503".into()),
+        )]);
+        let r = m
+            .check(
+                &pol(),
+                &["tascloud.app".into(), "other.app".into()],
+                &[],
+                &Expected::default(),
+                NOW,
+            )
+            .await;
         assert_eq!(r.errors.len(), 1);
         assert!(r.findings.is_empty());
         assert_eq!(r.queries, 2);
@@ -448,9 +687,16 @@ mod tests {
         assert_eq!(entries.len(), 1);
         let e = &entries[0];
         assert_eq!(e.issuer, "C=US, O=Let's Encrypt, CN=YE2");
-        assert_eq!(e.serial, "6591c662889b639d35f82ee6330ab181238", "leading zero stripped");
+        assert_eq!(
+            e.serial, "6591c662889b639d35f82ee6330ab181238",
+            "leading zero stripped"
+        );
         assert_eq!(e.names, ["*.ccadb.org", "ccadb.org"]);
-        assert_eq!(e.not_after - e.not_before, 89 * 86_400 + 86_399, "a 90-day certificate");
+        assert_eq!(
+            e.not_after - e.not_before,
+            89 * 86_400 + 86_399,
+            "a 90-day certificate"
+        );
         assert_eq!(e.logged_at, None);
         // Malformed documents are errors, not 'no certificates'.
         assert!(parse_crtsh(b"<html>rate limited</html>").is_err());
@@ -465,7 +711,11 @@ mod tests {
     async fn crtsh_queries_are_built_and_parsed_through_the_bounded_source() {
         struct Canned(Mutex<Vec<String>>);
         impl SignalSource for Canned {
-            fn fetch<'a>(&'a self, url: &'a str, _max: usize) -> BoxFuture<'a, Result<Vec<u8>, String>> {
+            fn fetch<'a>(
+                &'a self,
+                url: &'a str,
+                _max: usize,
+            ) -> BoxFuture<'a, Result<Vec<u8>, String>> {
                 Box::pin(async move {
                     self.0.lock().unwrap().push(url.to_string());
                     Ok(include_bytes!("../tests/fixtures/crtsh_ccadb_org.json").to_vec())
@@ -474,27 +724,49 @@ mod tests {
         }
         let src = Arc::new(Canned(Mutex::default()));
         let crt = CrtSh::new(src.clone());
-        let got = crt.query(&CtQuery::Subdomains("ccadb.org".into())).await.unwrap();
+        let got = crt
+            .query(&CtQuery::Subdomains("ccadb.org".into()))
+            .await
+            .unwrap();
         assert_eq!(got.len(), 1);
-        crt.query(&CtQuery::Exact("*.ccadb.org".into())).await.unwrap();
+        crt.query(&CtQuery::Exact("*.ccadb.org".into()))
+            .await
+            .unwrap();
         let urls = src.0.lock().unwrap().clone();
-        assert_eq!(urls[0], "https://crt.sh/?q=%25.ccadb.org&output=json&exclude=expired");
-        assert_eq!(urls[1], "https://crt.sh/?q=%2A.ccadb.org&output=json&exclude=expired");
+        assert_eq!(
+            urls[0],
+            "https://crt.sh/?q=%25.ccadb.org&output=json&exclude=expired"
+        );
+        assert_eq!(
+            urls[1],
+            "https://crt.sh/?q=%2A.ccadb.org&output=json&exclude=expired"
+        );
     }
 
     fn cert_with(scts: bool, poison: bool) -> CertMaterial {
         let key = rcgen::KeyPair::generate().unwrap();
         let mut params = rcgen::CertificateParams::new(vec!["x.tascloud.app".to_string()]).unwrap();
         if scts {
-            params.custom_extensions.push(rcgen::CustomExtension::from_oid_content(&[1, 3, 6, 1, 4, 1, 11129, 2, 4, 2], vec![0x04, 0x02, 0x00, 0x00]));
+            params
+                .custom_extensions
+                .push(rcgen::CustomExtension::from_oid_content(
+                    &[1, 3, 6, 1, 4, 1, 11129, 2, 4, 2],
+                    vec![0x04, 0x02, 0x00, 0x00],
+                ));
         }
         if poison {
-            let mut p = rcgen::CustomExtension::from_oid_content(&[1, 3, 6, 1, 4, 1, 11129, 2, 4, 3], vec![0x05, 0x00]);
+            let mut p = rcgen::CustomExtension::from_oid_content(
+                &[1, 3, 6, 1, 4, 1, 11129, 2, 4, 3],
+                vec![0x05, 0x00],
+            );
             p.set_criticality(true);
             params.custom_extensions.push(p);
         }
         let cert = params.self_signed(&key).unwrap();
-        CertMaterial { chain_pem: cert.pem(), key_pem: String::new() }
+        CertMaterial {
+            chain_pem: cert.pem(),
+            key_pem: String::new(),
+        }
     }
 
     #[test]
@@ -506,13 +778,24 @@ mod tests {
         assert_eq!(f[0].kind, CtFindingKind::MissingEmbeddedScts);
         assert_eq!(f[0].severity, Severity::Error);
         let f = m.check_obtained("x", &cert_with(true, true));
-        assert_eq!(f.iter().map(|x| x.kind).collect::<Vec<_>>(), [CtFindingKind::PrecertificateServed]);
+        assert_eq!(
+            f.iter().map(|x| x.kind).collect::<Vec<_>>(),
+            [CtFindingKind::PrecertificateServed]
+        );
         // A test CA that does not log can be exempted explicitly.
         let mut lax = monitor(vec![]);
         lax.scts_required = false;
         assert!(lax.check_obtained("x", &cert_with(false, false)).is_empty());
         // Garbage is not a finding about a certificate.
-        assert!(m.check_obtained("x", &CertMaterial { chain_pem: "nope".into(), key_pem: String::new() }).is_empty());
+        assert!(m
+            .check_obtained(
+                "x",
+                &CertMaterial {
+                    chain_pem: "nope".into(),
+                    key_pem: String::new()
+                }
+            )
+            .is_empty());
     }
 
     #[test]

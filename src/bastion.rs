@@ -64,7 +64,9 @@ pub struct BastionAccess {
 }
 
 impl Default for BastionAccess {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl BastionAccess {
@@ -81,16 +83,25 @@ impl BastionAccess {
     #[must_use]
     pub fn mint_enrollment_token(&self, label: impl Into<String>, ttl: Duration) -> [u8; 32] {
         let token = random_bytes_32();
-        self.pending_tokens.lock().unwrap_or_else(|e| e.into_inner()).insert(
-            token,
-            PendingToken { label: label.into(), expires_at: Instant::now() + ttl },
-        );
+        self.pending_tokens
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                token,
+                PendingToken {
+                    label: label.into(),
+                    expires_at: Instant::now() + ttl,
+                },
+            );
         token
     }
 
     /// Present `token` as `peer`. On success, peer is pinned and token is spent.
     pub fn enroll(&self, token: &[u8; 32], peer: PeerId) -> Result<String, String> {
-        let mut tokens = self.pending_tokens.lock().unwrap_or_else(|e| e.into_inner());
+        let mut tokens = self
+            .pending_tokens
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let Some(pending) = tokens.remove(token) else {
             return Err("enrollment token unknown or already spent".to_string());
         };
@@ -98,29 +109,48 @@ impl BastionAccess {
             return Err("enrollment token expired".to_string());
         }
         drop(tokens);
-        self.pins.lock().unwrap_or_else(|e| e.into_inner()).insert(peer, pending.label.clone());
+        self.pins
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(peer, pending.label.clone());
         Ok(pending.label)
     }
 
     /// Pin `peer` under `label` directly (no token — operator already knows this key).
     pub fn pin(&self, peer: PeerId, label: impl Into<String>) {
-        self.pins.lock().unwrap_or_else(|e| e.into_inner()).insert(peer, label.into());
+        self.pins
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(peer, label.into());
     }
 
     /// Grant `peer` access to `port`, optionally expiring after `ttl`.
     pub fn grant(&self, port: u16, peer: PeerId, label: impl Into<String>, ttl: Option<Duration>) {
         let expires_at = ttl.map(|d| Instant::now() + d);
-        self.grants.lock().unwrap_or_else(|e| e.into_inner())
-            .entry(port).or_default()
-            .push(Grant { peer, label: label.into(), expires_at });
+        self.grants
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(port)
+            .or_default()
+            .push(Grant {
+                peer,
+                label: label.into(),
+                expires_at,
+            });
     }
 
     /// Revoke `port`'s grants — for `peer` specifically if given.
     pub fn revoke(&self, port: u16, peer: Option<PeerId>) {
         let mut grants = self.grants.lock().unwrap_or_else(|e| e.into_inner());
         match peer {
-            Some(peer) => { if let Some(list) = grants.get_mut(&port) { list.retain(|g| g.peer != peer); } }
-            None => { grants.remove(&port); }
+            Some(peer) => {
+                if let Some(list) = grants.get_mut(&port) {
+                    list.retain(|g| g.peer != peer);
+                }
+            }
+            None => {
+                grants.remove(&port);
+            }
         }
     }
 
@@ -128,21 +158,30 @@ impl BastionAccess {
     #[must_use]
     pub fn is_allowed(&self, port: u16, peer: PeerId) -> bool {
         let grants = self.grants.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(list) = grants.get(&port) else { return false };
+        let Some(list) = grants.get(&port) else {
+            return false;
+        };
         let now = Instant::now();
-        list.iter().any(|g| g.peer == peer && g.expires_at.is_none_or(|exp| now <= exp))
+        list.iter()
+            .any(|g| g.peer == peer && g.expires_at.is_none_or(|exp| now <= exp))
     }
 
     /// Snapshot of every grant.
     #[must_use]
     pub fn list_grants(&self) -> Vec<GrantInfo> {
         let now = Instant::now();
-        self.grants.lock().unwrap_or_else(|e| e.into_inner())
+        self.grants
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
             .iter()
-            .flat_map(|(&port, grants)| grants.iter().map(move |g| GrantInfo {
-                port, peer: g.peer, label: g.label.clone(),
-                expired: g.expires_at.is_some_and(|exp| now > exp),
-            }))
+            .flat_map(|(&port, grants)| {
+                grants.iter().map(move |g| GrantInfo {
+                    port,
+                    peer: g.peer,
+                    label: g.label.clone(),
+                    expired: g.expires_at.is_some_and(|exp| now > exp),
+                })
+            })
             .collect()
     }
 }

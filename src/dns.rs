@@ -178,7 +178,8 @@ impl Name {
     /// the owner-name encoding a DS digest is computed over (RFC 4034 §5.1.4).
     #[must_use]
     pub fn canonical_wire(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(self.labels.iter().map(|l| l.len() + 1).sum::<usize>() + 1);
+        let mut out =
+            Vec::with_capacity(self.labels.iter().map(|l| l.len() + 1).sum::<usize>() + 1);
         for l in &self.labels {
             out.push(u8::try_from(l.len()).unwrap_or(0));
             out.extend(l.bytes().map(|b| b.to_ascii_lowercase()));
@@ -360,7 +361,10 @@ pub enum RData {
     },
     /// Authenticated denial (RFC 4034 §4.1): the next owner name and the raw type bit maps
     /// (read them with [`nsec_types`]). Modelled only so a signed zone's negative answers parse.
-    Nsec { next: Name, type_bitmaps: Vec<u8> },
+    Nsec {
+        next: Name,
+        type_bitmaps: Vec<u8>,
+    },
     /// A type this enum does not model, carried through verbatim.
     Unknown(u16, Vec<u8>),
 }
@@ -385,7 +389,11 @@ pub fn dnskey_key_tag(flags: u16, protocol: u8, algorithm: u8, public_key: &[u8]
     }
     let mut acc: u32 = 0;
     for (i, b) in rdata.iter().enumerate() {
-        acc = acc.wrapping_add(if i & 1 == 1 { u32::from(*b) } else { u32::from(*b) << 8 });
+        acc = acc.wrapping_add(if i & 1 == 1 {
+            u32::from(*b)
+        } else {
+            u32::from(*b) << 8
+        });
     }
     acc = acc.wrapping_add((acc >> 16) & 0xFFFF);
     u16::try_from(acc & 0xFFFF).unwrap_or(0)
@@ -468,7 +476,15 @@ impl RData {
             RData::A(ip) => out.extend_from_slice(&ip.octets()),
             RData::Aaaa(ip) => out.extend_from_slice(&ip.octets()),
             RData::Ns(n) | RData::Cname(n) => n.encode(out),
-            RData::Soa { mname, rname, serial, refresh, retry, expire, minimum } => {
+            RData::Soa {
+                mname,
+                rname,
+                serial,
+                refresh,
+                retry,
+                expire,
+                minimum,
+            } => {
                 mname.encode(out);
                 rname.encode(out);
                 for v in [serial, refresh, retry, expire, minimum] {
@@ -481,7 +497,12 @@ impl RData {
                     out.extend_from_slice(&s[..s.len().min(255)]);
                 }
             }
-            RData::Srv { priority, weight, port, target } => {
+            RData::Srv {
+                priority,
+                weight,
+                port,
+                target,
+            } => {
                 out.extend_from_slice(&priority.to_be_bytes());
                 out.extend_from_slice(&weight.to_be_bytes());
                 out.extend_from_slice(&port.to_be_bytes());
@@ -493,16 +514,36 @@ impl RData {
                 out.extend_from_slice(tag.as_bytes());
                 out.extend_from_slice(value);
             }
-            RData::Ds { key_tag, algorithm, digest_type, digest } => {
+            RData::Ds {
+                key_tag,
+                algorithm,
+                digest_type,
+                digest,
+            } => {
                 out.extend_from_slice(&key_tag.to_be_bytes());
                 out.push(*algorithm);
                 out.push(*digest_type);
                 out.extend_from_slice(digest);
             }
-            RData::Dnskey { flags, protocol, algorithm, public_key } => {
+            RData::Dnskey {
+                flags,
+                protocol,
+                algorithm,
+                public_key,
+            } => {
                 out.extend_from_slice(&dnskey_rdata(*flags, *protocol, *algorithm, public_key));
             }
-            RData::Rrsig { type_covered, algorithm, labels, original_ttl, expiration, inception, key_tag, signer, signature } => {
+            RData::Rrsig {
+                type_covered,
+                algorithm,
+                labels,
+                original_ttl,
+                expiration,
+                inception,
+                key_tag,
+                signer,
+                signature,
+            } => {
                 out.extend_from_slice(&type_covered.code().to_be_bytes());
                 out.push(*algorithm);
                 out.push(*labels);
@@ -615,7 +656,10 @@ impl RData {
                 let (signer, after) = Name::decode(buf, pos + 18)?;
                 // The name must end inside this record, or its "signature" would be read out of
                 // the next record.
-                let signature = buf.get(after..pos + len).ok_or(DnsError::Truncated)?.to_vec();
+                let signature = buf
+                    .get(after..pos + len)
+                    .ok_or(DnsError::Truncated)?
+                    .to_vec();
                 RData::Rrsig {
                     type_covered: RecordType::from_code(be16(body, 0)?),
                     algorithm: *body.get(2).ok_or(DnsError::Truncated)?,
@@ -630,7 +674,13 @@ impl RData {
             }
             RecordType::NSEC => {
                 let (next, after) = Name::decode(buf, pos)?;
-                RData::Nsec { next, type_bitmaps: buf.get(after..pos + len).ok_or(DnsError::Truncated)?.to_vec() }
+                RData::Nsec {
+                    next,
+                    type_bitmaps: buf
+                        .get(after..pos + len)
+                        .ok_or(DnsError::Truncated)?
+                        .to_vec(),
+                }
             }
             RecordType::Unknown(c) => RData::Unknown(c, body.to_vec()),
         })
@@ -651,7 +701,12 @@ impl Record {
     /// An IN-class record with `ttl` seconds.
     #[must_use]
     pub fn new(name: Name, ttl: u32, data: RData) -> Self {
-        Record { name, class: 1, ttl, data }
+        Record {
+            name,
+            class: 1,
+            ttl,
+            data,
+        }
     }
 }
 
@@ -667,7 +722,11 @@ impl Question {
     /// An IN-class question.
     #[must_use]
     pub fn new(name: Name, qtype: RecordType) -> Self {
-        Question { name, qtype, qclass: 1 }
+        Question {
+            name,
+            qtype,
+            qclass: 1,
+        }
     }
 }
 
@@ -783,7 +842,10 @@ impl Message {
     pub fn response(id: u16) -> Self {
         Message {
             id,
-            flags: Flags { response: true, ..Flags::default() },
+            flags: Flags {
+                response: true,
+                ..Flags::default()
+            },
             ..Message::default()
         }
     }
@@ -794,7 +856,12 @@ impl Message {
     pub fn error(id: u16, opcode: u8, code: ResponseCode) -> Self {
         Message {
             id,
-            flags: Flags { response: true, opcode, response_code: code, ..Flags::default() },
+            flags: Flags {
+                response: true,
+                opcode,
+                response_code: code,
+                ..Flags::default()
+            },
             ..Message::default()
         }
     }
@@ -870,7 +937,12 @@ impl Message {
                 let ttl = u32::from_be_bytes([h[4], h[5], h[6], h[7]]);
                 let rdlen = usize::from(u16::from_be_bytes([h[8], h[9]]));
                 let data = RData::decode(buf, next + 10, rdlen, rtype)?;
-                out.push(Record { name, class, ttl, data });
+                out.push(Record {
+                    name,
+                    class,
+                    ttl,
+                    data,
+                });
                 *pos = next + 10 + rdlen;
             }
             Ok(out)
@@ -879,7 +951,14 @@ impl Message {
         let authorities = read_section(nauth, &mut pos)?;
         let additionals = read_section(nadd, &mut pos)?;
 
-        Ok(Message { id, flags, questions, answers, authorities, additionals })
+        Ok(Message {
+            id,
+            flags,
+            questions,
+            answers,
+            authorities,
+            additionals,
+        })
     }
 }
 
@@ -924,8 +1003,17 @@ mod tests {
             RData::Ns(n("ns1.example.com")),
             RData::Cname(n("target.example.com")),
             RData::Txt(vec![b"v=spf1 -all".to_vec()]),
-            RData::Srv { priority: 10, weight: 5, port: 8443, target: n("svc.example.com") },
-            RData::Caa { flags: 0, tag: "issue".into(), value: b"letsencrypt.org".to_vec() },
+            RData::Srv {
+                priority: 10,
+                weight: 5,
+                port: 8443,
+                target: n("svc.example.com"),
+            },
+            RData::Caa {
+                flags: 0,
+                tag: "issue".into(),
+                value: b"letsencrypt.org".to_vec(),
+            },
             RData::Soa {
                 mname: n("ns1.example.com"),
                 rname: n("hostmaster.example.com"),
@@ -939,7 +1027,8 @@ mod tests {
         ];
         for data in cases {
             let mut m = Message::response(0x1234);
-            m.answers.push(Record::new(n("example.com"), 300, data.clone()));
+            m.answers
+                .push(Record::new(n("example.com"), 300, data.clone()));
             let back = Message::from_bytes(&m.to_bytes()).expect("round trip");
             assert_eq!(back.answers.len(), 1, "{data:?}");
             assert_eq!(back.answers[0].data, data, "{data:?}");
@@ -952,7 +1041,8 @@ mod tests {
     fn txt_keeps_its_strings_separate() {
         let data = RData::Txt(vec![b"part-one".to_vec(), b"part-two".to_vec()]);
         let mut m = Message::response(1);
-        m.answers.push(Record::new(n("x.example.com"), 60, data.clone()));
+        m.answers
+            .push(Record::new(n("x.example.com"), 60, data.clone()));
         let back = Message::from_bytes(&m.to_bytes()).unwrap();
         assert_eq!(back.answers[0].data, data);
     }
@@ -964,7 +1054,8 @@ mod tests {
         m.flags.recursion_desired = true;
         m.flags.recursion_available = false;
         m.flags.response_code = ResponseCode::NxDomain;
-        m.questions.push(Question::new(n("example.com"), RecordType::A));
+        m.questions
+            .push(Question::new(n("example.com"), RecordType::A));
         let back = Message::from_bytes(&m.to_bytes()).unwrap();
         assert_eq!(back.id, 0xBEEF);
         assert_eq!(back.flags, m.flags);
@@ -986,7 +1077,7 @@ mod tests {
         n("example.com").encode(&mut buf);
         buf.extend_from_slice(&1u16.to_be_bytes()); // A
         buf.extend_from_slice(&1u16.to_be_bytes()); // IN
-        // the answer's name is a POINTER back to the question's name
+                                                    // the answer's name is a POINTER back to the question's name
         buf.push(0xC0);
         buf.push(u8::try_from(qname_at).unwrap());
         buf.extend_from_slice(&1u16.to_be_bytes());
@@ -1027,7 +1118,11 @@ mod tests {
     #[test]
     fn a_truncated_message_is_an_error_not_a_panic() {
         let mut m = Message::response(7);
-        m.answers.push(Record::new(n("example.com"), 60, RData::A(Ipv4Addr::LOCALHOST)));
+        m.answers.push(Record::new(
+            n("example.com"),
+            60,
+            RData::A(Ipv4Addr::LOCALHOST),
+        ));
         let full = m.to_bytes();
         for cut in 0..full.len() {
             // must never panic; the only acceptable outcomes are Ok or a DnsError
@@ -1040,14 +1135,21 @@ mod tests {
     #[test]
     fn encoding_is_deterministic() {
         let mut m = Message::response(42);
-        m.answers.push(Record::new(n("a.example.com"), 300, RData::A(Ipv4Addr::LOCALHOST)));
+        m.answers.push(Record::new(
+            n("a.example.com"),
+            300,
+            RData::A(Ipv4Addr::LOCALHOST),
+        ));
         m.answers.push(Record::new(
             n("b.example.com"),
             300,
             RData::Txt(vec![b"hello".to_vec()]),
         ));
         assert_eq!(m.to_bytes(), m.to_bytes());
-        assert_eq!(Message::from_bytes(&m.to_bytes()).unwrap().to_bytes(), m.to_bytes());
+        assert_eq!(
+            Message::from_bytes(&m.to_bytes()).unwrap().to_bytes(),
+            m.to_bytes()
+        );
     }
 
     // ── DNSSEC records (RFC 4034) ─────────────────────────────────────────────────────────
@@ -1062,10 +1164,30 @@ mod tests {
 
     fn dnssec_samples() -> Vec<RData> {
         vec![
-            RData::Ds { key_tag: 60485, algorithm: 5, digest_type: 2, digest: vec![0xd4; 32] },
-            RData::Ds { key_tag: 1, algorithm: 13, digest_type: 4, digest: Vec::new() },
-            RData::Dnskey { flags: 257, protocol: 3, algorithm: 13, public_key: vec![7; 64] },
-            RData::Dnskey { flags: 256, protocol: 3, algorithm: 15, public_key: Vec::new() },
+            RData::Ds {
+                key_tag: 60485,
+                algorithm: 5,
+                digest_type: 2,
+                digest: vec![0xd4; 32],
+            },
+            RData::Ds {
+                key_tag: 1,
+                algorithm: 13,
+                digest_type: 4,
+                digest: Vec::new(),
+            },
+            RData::Dnskey {
+                flags: 257,
+                protocol: 3,
+                algorithm: 13,
+                public_key: vec![7; 64],
+            },
+            RData::Dnskey {
+                flags: 256,
+                protocol: 3,
+                algorithm: 15,
+                public_key: Vec::new(),
+            },
             RData::Rrsig {
                 type_covered: RecordType::DNSKEY,
                 algorithm: 13,
@@ -1088,8 +1210,14 @@ mod tests {
                 signer: Name::root(),
                 signature: Vec::new(),
             },
-            RData::Nsec { next: n("b.example.com"), type_bitmaps: vec![0, 6, 0x40, 0x01, 0, 0, 0, 0x03] },
-            RData::Nsec { next: Name::root(), type_bitmaps: Vec::new() },
+            RData::Nsec {
+                next: n("b.example.com"),
+                type_bitmaps: vec![0, 6, 0x40, 0x01, 0, 0, 0, 0x03],
+            },
+            RData::Nsec {
+                next: Name::root(),
+                type_bitmaps: Vec::new(),
+            },
         ]
     }
 
@@ -1097,31 +1225,74 @@ mod tests {
     fn dnssec_records_round_trip_through_the_wire() {
         for data in dnssec_samples() {
             let mut m = Message::response(0x4242);
-            m.answers.push(Record::new(n("example.com"), 300, data.clone()));
+            m.answers
+                .push(Record::new(n("example.com"), 300, data.clone()));
             // a record after it proves the RDLENGTH bookkeeping leaves the stream aligned
-            m.answers.push(Record::new(n("example.com"), 300, RData::A(Ipv4Addr::LOCALHOST)));
-            let back = Message::from_bytes(&m.to_bytes()).unwrap_or_else(|e| panic!("{data:?}: {e}"));
+            m.answers.push(Record::new(
+                n("example.com"),
+                300,
+                RData::A(Ipv4Addr::LOCALHOST),
+            ));
+            let back =
+                Message::from_bytes(&m.to_bytes()).unwrap_or_else(|e| panic!("{data:?}: {e}"));
             assert_eq!(back.answers.len(), 2, "{data:?}");
             assert_eq!(back.answers[0].data, data);
             assert_eq!(back.answers[1].data, RData::A(Ipv4Addr::LOCALHOST));
-            assert_eq!(back.to_bytes(), m.to_bytes(), "encoding is canonical for {data:?}");
+            assert_eq!(
+                back.to_bytes(),
+                m.to_bytes(),
+                "encoding is canonical for {data:?}"
+            );
         }
     }
 
     #[test]
     fn dnssec_record_types_are_the_unknown_codes_underneath() {
-        for (t, code) in [(RecordType::DS, 43), (RecordType::RRSIG, 46), (RecordType::NSEC, 47), (RecordType::DNSKEY, 48)] {
+        for (t, code) in [
+            (RecordType::DS, 43),
+            (RecordType::RRSIG, 46),
+            (RecordType::NSEC, 47),
+            (RecordType::DNSKEY, 48),
+        ] {
             assert_eq!(t.code(), code);
             assert_eq!(RecordType::from_code(code), t);
         }
-        assert_eq!(RData::Ds { key_tag: 0, algorithm: 0, digest_type: 0, digest: vec![] }.record_type(), RecordType::DS);
-        assert_eq!(RData::Nsec { next: Name::root(), type_bitmaps: vec![] }.record_type(), RecordType::NSEC);
+        assert_eq!(
+            RData::Ds {
+                key_tag: 0,
+                algorithm: 0,
+                digest_type: 0,
+                digest: vec![]
+            }
+            .record_type(),
+            RecordType::DS
+        );
+        assert_eq!(
+            RData::Nsec {
+                next: Name::root(),
+                type_bitmaps: vec![]
+            }
+            .record_type(),
+            RecordType::NSEC
+        );
         // A DS that arrives as a record this build does not recognise would be `Unknown(43, ..)`;
         // the wire decoder must turn it into the typed payload.
         let mut m = Message::response(1);
-        m.answers.push(Record::new(n("x.example"), 5, RData::Unknown(43, vec![0, 9, 13, 2, 0xaa])));
+        m.answers.push(Record::new(
+            n("x.example"),
+            5,
+            RData::Unknown(43, vec![0, 9, 13, 2, 0xaa]),
+        ));
         let back = Message::from_bytes(&m.to_bytes()).unwrap();
-        assert_eq!(back.answers[0].data, RData::Ds { key_tag: 9, algorithm: 13, digest_type: 2, digest: vec![0xaa] });
+        assert_eq!(
+            back.answers[0].data,
+            RData::Ds {
+                key_tag: 9,
+                algorithm: 13,
+                digest_type: 2,
+                digest: vec![0xaa]
+            }
+        );
     }
 
     #[test]
@@ -1140,7 +1311,10 @@ mod tests {
 
     #[test]
     fn canonical_wire_lowercases_and_never_compresses() {
-        assert_eq!(n("DsKey.Example.COM").canonical_wire(), b"\x05dskey\x07example\x03com\x00".to_vec());
+        assert_eq!(
+            n("DsKey.Example.COM").canonical_wire(),
+            b"\x05dskey\x07example\x03com\x00".to_vec()
+        );
         assert_eq!(Name::root().canonical_wire(), vec![0]);
     }
 
@@ -1152,7 +1326,11 @@ mod tests {
         assert_eq!(serial_secs_until(1_800_000_000, now), 0);
         // Across the 2106 wrap: `now` just before 2^32, the signature expiring just after it.
         let near_wrap = (1i64 << 32) - 10;
-        assert_eq!(serial_secs_until(5, near_wrap), 15, "expires 15 s after the 32-bit counter wraps");
+        assert_eq!(
+            serial_secs_until(5, near_wrap),
+            15,
+            "expires 15 s after the 32-bit counter wraps"
+        );
         assert_eq!(serial_secs_until(u32::MAX - 20, near_wrap), -11);
         // And past the wrap on the clock side.
         assert_eq!(serial_secs_until(100, (1i64 << 32) + 40), 60);
@@ -1164,7 +1342,14 @@ mod tests {
         let bm = [0u8, 6, 0x40, 0x01, 0, 0, 0, 0x03, 1, 1, 0x40];
         assert_eq!(nsec_types(&bm), Some(vec![1, 15, 46, 47, 257]));
         assert_eq!(nsec_types(&[]), Some(vec![]));
-        for bad in [&[0u8][..], &[0, 0][..], &[0, 33, 1][..], &[0, 2, 1][..], &[1, 1, 0x80, 0, 1, 0x80][..], &[0, 1, 0x80, 0, 1, 0x80][..]] {
+        for bad in [
+            &[0u8][..],
+            &[0, 0][..],
+            &[0, 33, 1][..],
+            &[0, 2, 1][..],
+            &[1, 1, 0x80, 0, 1, 0x80][..],
+            &[0, 1, 0x80, 0, 1, 0x80][..],
+        ] {
             assert_eq!(nsec_types(bad), None, "{bad:?}");
         }
     }
@@ -1178,7 +1363,11 @@ mod tests {
         buf.extend_from_slice(&rtype.to_be_bytes());
         buf.extend_from_slice(&1u16.to_be_bytes());
         buf.extend_from_slice(&60u32.to_be_bytes());
-        buf.extend_from_slice(&rdlen_override.unwrap_or(u16::try_from(rdata.len()).unwrap()).to_be_bytes());
+        buf.extend_from_slice(
+            &rdlen_override
+                .unwrap_or(u16::try_from(rdata.len()).unwrap())
+                .to_be_bytes(),
+        );
         buf.extend_from_slice(rdata);
         buf
     }
@@ -1203,30 +1392,45 @@ mod tests {
         rdata.extend_from_slice(b"\x05abcde"); // a label that the RDATA ends in the middle of
         let mut wire = raw_record_message(46, &rdata, None);
         wire.extend_from_slice(b"\x00tail-bytes-that-are-not-part-of-the-record");
-        assert!(Message::from_bytes(&wire).is_err(), "the signer name must end inside its record");
+        assert!(
+            Message::from_bytes(&wire).is_err(),
+            "the signer name must end inside its record"
+        );
         // A signer name that is a self pointer (header 12 + owner 3 + record header 10 + 18 fixed = 43).
         let mut rdata = vec![0u8; 18];
         rdata.extend_from_slice(&[0xC0, 43]);
-        assert_eq!(Message::from_bytes(&raw_record_message(46, &rdata, None)), Err(DnsError::BadPointer));
+        assert_eq!(
+            Message::from_bytes(&raw_record_message(46, &rdata, None)),
+            Err(DnsError::BadPointer)
+        );
         // NSEC with an unterminated next-name.
         assert!(Message::from_bytes(&raw_record_message(47, b"\x03abc", None)).is_err());
         // RRSIG with a pointer in the signer name is accepted (resolvers may compress it).
         let mut m = Message::response(3);
-        m.questions.push(Question::new(n("example.com"), RecordType::DNSKEY));
+        m.questions
+            .push(Question::new(n("example.com"), RecordType::DNSKEY));
         let mut wire = m.to_bytes();
         wire[7] = 1; // ancount = 1
         wire.extend_from_slice(&[0xC0, 12]); // owner: pointer to the question name
         wire.extend_from_slice(&46u16.to_be_bytes());
         wire.extend_from_slice(&1u16.to_be_bytes());
         wire.extend_from_slice(&60u32.to_be_bytes());
-        let mut rd = vec![0u8, 48, 13, 2, 0, 0, 0x0e, 0x10, 0x6b, 0x49, 0xd2, 0, 0x6a, 0xfc, 0xe9, 0x00, 0x10, 0x92];
+        let mut rd = vec![
+            0u8, 48, 13, 2, 0, 0, 0x0e, 0x10, 0x6b, 0x49, 0xd2, 0, 0x6a, 0xfc, 0xe9, 0x00, 0x10,
+            0x92,
+        ];
         rd.extend_from_slice(&[0xC0, 12]); // signer: pointer
         rd.extend_from_slice(&[9u8; 8]);
         wire.extend_from_slice(&u16::try_from(rd.len()).unwrap().to_be_bytes());
         wire.extend_from_slice(&rd);
         let back = Message::from_bytes(&wire).expect("compressed signer name");
         match &back.answers[0].data {
-            RData::Rrsig { signer, signature, type_covered, .. } => {
+            RData::Rrsig {
+                signer,
+                signature,
+                type_covered,
+                ..
+            } => {
                 assert_eq!(*signer, n("example.com"));
                 assert_eq!(signature, &vec![9u8; 8]);
                 assert_eq!(*type_covered, RecordType::DNSKEY);
@@ -1252,7 +1456,9 @@ mod tests {
         // Pure noise, with the header's section counts forced high so the record parser runs.
         for _ in 0..20_000 {
             let len = usize::try_from(rng.next() % 200).unwrap();
-            let mut buf: Vec<u8> = (0..len).map(|_| u8::try_from(rng.next() & 0xff).unwrap()).collect();
+            let mut buf: Vec<u8> = (0..len)
+                .map(|_| u8::try_from(rng.next() & 0xff).unwrap())
+                .collect();
             if buf.len() >= 12 {
                 buf[4] = 0;
                 buf[5] = 1;
@@ -1264,12 +1470,16 @@ mod tests {
         // Valid messages carrying every DNSSEC type, with random bit flips, truncation and
         // length-field corruption.
         let mut m = Message::response(9);
-        m.questions.push(Question::new(n("example.com"), RecordType::DNSKEY));
+        m.questions
+            .push(Question::new(n("example.com"), RecordType::DNSKEY));
         for data in dnssec_samples() {
             m.answers.push(Record::new(n("example.com"), 1, data));
         }
         let good = m.to_bytes();
-        assert_eq!(Message::from_bytes(&good).unwrap().answers.len(), m.answers.len());
+        assert_eq!(
+            Message::from_bytes(&good).unwrap().answers.len(),
+            m.answers.len()
+        );
         for _ in 0..30_000 {
             let mut buf = good.clone();
             for _ in 0..(1 + rng.next() % 4) {

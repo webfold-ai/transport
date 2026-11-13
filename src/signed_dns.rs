@@ -105,7 +105,9 @@ impl PublicKey {
     /// # Errors
     /// [`SignedDnsError::BadPublicKey`] if it is not valid z-base32 of exactly 32 bytes.
     pub fn from_z32(s: &str) -> Result<Self, SignedDnsError> {
-        let raw = ZBASE32.decode(s).map_err(|_| SignedDnsError::BadPublicKey)?;
+        let raw = ZBASE32
+            .decode(s)
+            .map_err(|_| SignedDnsError::BadPublicKey)?;
         let bytes: [u8; 32] = raw.try_into().map_err(|_| SignedDnsError::BadPublicKey)?;
         Ok(PublicKey(bytes))
     }
@@ -137,7 +139,9 @@ impl core::fmt::Debug for Keypair {
     /// Prints the PUBLIC half only. A `Debug` that renders a private key puts it in every log
     /// line that ever formats the containing struct.
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("Keypair").field("public", &self.public_key().to_z32()).finish()
+        f.debug_struct("Keypair")
+            .field("public", &self.public_key().to_z32())
+            .finish()
     }
 }
 
@@ -209,7 +213,12 @@ impl SignedPacket {
             return Err(SignedDnsError::ValueTooLong);
         }
         let signature = keypair.sign(&preimage(seq, &value));
-        Ok(SignedPacket { public_key: keypair.public_key(), signature, seq, value })
+        Ok(SignedPacket {
+            public_key: keypair.public_key(),
+            signature,
+            seq,
+            value,
+        })
     }
 
     /// Parse a relay payload — `signature ‖ seq ‖ v` — **and verify it** against `public_key`.
@@ -227,14 +236,23 @@ impl SignedPacket {
         if value.len() > MAX_VALUE_LEN {
             return Err(SignedDnsError::ValueTooLong);
         }
-        let signature: [u8; 64] = sig_bytes.try_into().map_err(|_| SignedDnsError::Truncated)?;
+        let signature: [u8; 64] = sig_bytes
+            .try_into()
+            .map_err(|_| SignedDnsError::Truncated)?;
         let seq = u64::from_be_bytes(
-            seq_bytes.try_into().map_err(|_| SignedDnsError::Truncated)?,
+            seq_bytes
+                .try_into()
+                .map_err(|_| SignedDnsError::Truncated)?,
         );
         if !public_key.verify(&preimage(seq, &value), &signature) {
             return Err(SignedDnsError::BadSignature);
         }
-        Ok(SignedPacket { public_key, signature, seq, value })
+        Ok(SignedPacket {
+            public_key,
+            signature,
+            seq,
+            value,
+        })
     }
 
     /// The relay wire form: `signature(64) ‖ seq(8, big-endian) ‖ v`.
@@ -309,14 +327,21 @@ mod tests {
     fn a_keypair_is_deterministic_in_its_seed() {
         assert_eq!(kp(7).to_z32(), kp(7).to_z32());
         assert_ne!(kp(7).to_z32(), kp(8).to_z32());
-        assert_eq!(kp(7).to_z32().len(), 52, "a 32-byte key is a 52-character label");
+        assert_eq!(
+            kp(7).to_z32().len(),
+            52,
+            "a 32-byte key is a 52-character label"
+        );
     }
 
     #[test]
     fn a_public_key_round_trips_through_its_label() {
         let pk = kp(3).public_key();
         assert_eq!(PublicKey::from_z32(&pk.to_z32()).unwrap(), pk);
-        assert_eq!(PublicKey::from_z32("not-a-key"), Err(SignedDnsError::BadPublicKey));
+        assert_eq!(
+            PublicKey::from_z32("not-a-key"),
+            Err(SignedDnsError::BadPublicKey)
+        );
     }
 
     /// `Debug` must never render the private half — otherwise every log line that formats a

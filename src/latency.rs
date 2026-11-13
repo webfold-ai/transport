@@ -19,8 +19,8 @@
 //! - **self** = the affinity check (the map turned on itself — "is this peer healthy right now?")
 
 use super::PeerId;
-use apeiron::map::hashtrinity::Table;
 use apeiron::map::hashtrinity::crypto::to_hex;
+use apeiron::map::hashtrinity::Table;
 use std::time::Duration;
 
 fn peer_key(peer: PeerId) -> String {
@@ -50,7 +50,9 @@ pub struct LatencyTracker {
 
 impl LatencyTracker {
     pub fn new() -> Self {
-        LatencyTracker { rtt_us: Table::new() }
+        LatencyTracker {
+            rtt_us: Table::new(),
+        }
     }
 
     /// Record a round-trip time measurement for `peer`. Uses EMA: new_rtt = 0.8·old + 0.2·measured.
@@ -65,7 +67,9 @@ impl LatencyTracker {
     /// The EMA-smoothed RTT for `peer`, or None if never measured.
     #[must_use]
     pub fn rtt(&self, peer: PeerId) -> Option<Duration> {
-        self.rtt_us.get(&peer_key(peer)).map(|&us| Duration::from_micros(us as u64))
+        self.rtt_us
+            .get(&peer_key(peer))
+            .map(|&us| Duration::from_micros(us as u64))
     }
 
     /// All tracked peers, ordered by ascending RTT (fastest first) — O(P log P) full sort.
@@ -132,7 +136,10 @@ impl PeerAffinity {
     pub const DEFAULT_MAX_ERRORS: u32 = 32;
 
     pub fn new(max_errors: u32) -> Self {
-        PeerAffinity { errors: Table::new(), max_errors }
+        PeerAffinity {
+            errors: Table::new(),
+            max_errors,
+        }
     }
 
     /// Record a failure for `peer` — increments the error counter.
@@ -207,7 +214,11 @@ mod tests {
         tracker.record(peer, Duration::from_millis(1000));
         let rtt = tracker.rtt(peer).unwrap();
         // EMA: 0.8*100 + 0.2*1000 = 280ms, not 1000
-        assert!(rtt.as_millis() < 500, "EMA should dampen spikes: got {}ms", rtt.as_millis());
+        assert!(
+            rtt.as_millis() < 500,
+            "EMA should dampen spikes: got {}ms",
+            rtt.as_millis()
+        );
     }
 
     #[test]

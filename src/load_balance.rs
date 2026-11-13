@@ -11,4 +11,7 @@
 //! also carries `Tuple`/`Relationships`/`Upstream`/`Backends`, which this module's version
 //! didn't) and is already what `bedrock` itself re-exports on both remotes, so it's canonical —
 //! this module is now a thin re-export rather than a second fork of the same algorithm.
-pub use relayfold::{coord_of, consistent_ring_index, pick_index, splitmix64, HealthEstimator, LoadBalance, CONSISTENT_HASH_VNODES};
+pub use relayfold::{
+    consistent_ring_index, coord_of, pick_index, splitmix64, HealthEstimator, LoadBalance,
+    CONSISTENT_HASH_VNODES,
+};

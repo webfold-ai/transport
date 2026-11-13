@@ -18,7 +18,7 @@
 //! - **B/U** = the message counter (how many messages we've sent/received)
 //! - **self** = the gossip itself (the medium turned on itself — broadcast)
 
-use super::{Transport, PeerId};
+use super::{PeerId, Transport};
 use apeiron::map::hashtrinity::crypto::blake3;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -114,7 +114,12 @@ impl GossipBus {
 
     /// Known peer addresses (for fanout).
     pub async fn peer_addrs(&self) -> Vec<String> {
-        self.peers.lock().await.iter().map(|(_, a)| a.clone()).collect()
+        self.peers
+            .lock()
+            .await
+            .iter()
+            .map(|(_, a)| a.clone())
+            .collect()
     }
 
     /// This endpoint's ID.
@@ -181,8 +186,12 @@ impl std::fmt::Display for GossipError {
 impl std::error::Error for GossipError {}
 
 /// Bind a native gossip endpoint — convenience over `NativeEndpoint::bind`.
-pub async fn bind_with_bootstrap(_bootstrap: &[super::PeerAddr]) -> Result<NativeEndpoint, GossipError> {
-    NativeEndpoint::bind("0.0.0.0:0").await.map_err(|e| GossipError::Bind(e.to_string()))
+pub async fn bind_with_bootstrap(
+    _bootstrap: &[super::PeerAddr],
+) -> Result<NativeEndpoint, GossipError> {
+    NativeEndpoint::bind("0.0.0.0:0")
+        .await
+        .map_err(|e| GossipError::Bind(e.to_string()))
 }
 
 /// ALPN for the gossip protocol. `NativeEndpoint::connect` currently ignores it; it is sent so the
@@ -263,7 +272,9 @@ impl GossipTopic {
                 let bus = accept_bus.clone();
                 tokio::spawn(async move {
                     use super::Connection;
-                    let Ok((_send, mut recv)) = conn.accept_bi().await else { return };
+                    let Ok((_send, mut recv)) = conn.accept_bi().await else {
+                        return;
+                    };
                     let mut buf = vec![0u8; MAX_GOSSIP_FRAME];
                     // One frame per connection: a gossip message is a datagram, not a session.
                     if let Ok(n) = recv.read(&mut buf).await {
@@ -297,13 +308,24 @@ impl GossipTopic {
         let data_vec = data.to_vec();
         let hash = self.bus.broadcast(self.topic, data_vec.clone()).await;
 
-        let Some(endpoint) = self.endpoint.as_ref() else { return Ok(()) };
-        let msg = GossipMessage { topic: self.topic, hash, data: data_vec, origin: self.bus.id() };
+        let Some(endpoint) = self.endpoint.as_ref() else {
+            return Ok(());
+        };
+        let msg = GossipMessage {
+            topic: self.topic,
+            hash,
+            data: data_vec,
+            origin: self.bus.id(),
+        };
         let framed = encode_message(&msg);
         for peer in &self.peers {
             let addr = format!("{}:{}", peer.host, peer.port);
-            let Ok(conn) = endpoint.connect(&addr, GOSSIP_ALPN).await else { continue };
-            let Ok((mut send, _recv)) = conn.open_bi().await else { continue };
+            let Ok(conn) = endpoint.connect(&addr, GOSSIP_ALPN).await else {
+                continue;
+            };
+            let Ok((mut send, _recv)) = conn.open_bi().await else {
+                continue;
+            };
             if send.write_all(&framed).await.is_ok() {
                 let _ = send.finish().await;
             }
@@ -330,7 +352,11 @@ impl GossipTopic {
         for m in msgs {
             d.push(Bytes::from(m));
         }
-        if d.is_empty() { None } else { Some(d.remove(0)) }
+        if d.is_empty() {
+            None
+        } else {
+            Some(d.remove(0))
+        }
     }
 
     /// Receive the next message on this topic, waiting until one arrives.
@@ -386,10 +412,15 @@ mod tests {
         let bus = GossipBus::new([1u8; 32]);
         bus.join(topic_id_for("joined")).await;
 
-        bus.broadcast(topic_id_for("other"), b"not mine".to_vec()).await;
-        assert!(bus.drain_delivered().await.is_empty(), "a topic never joined must not deliver");
+        bus.broadcast(topic_id_for("other"), b"not mine".to_vec())
+            .await;
+        assert!(
+            bus.drain_delivered().await.is_empty(),
+            "a topic never joined must not deliver"
+        );
 
-        bus.broadcast(topic_id_for("joined"), b"mine".to_vec()).await;
+        bus.broadcast(topic_id_for("joined"), b"mine".to_vec())
+            .await;
         assert_eq!(bus.drain_delivered().await, vec![b"mine".to_vec()]);
     }
 
@@ -406,10 +437,16 @@ mod tests {
         let b_peer = PeerAddr::new(ep_b.id(), host, port.parse::<u16>().expect("port"));
 
         let topic = topic_id_for("fanout");
-        let a = GossipTopic::join_networked(ep_a, topic, vec![b_peer]).await.expect("join a");
-        let b = GossipTopic::join_networked(ep_b, topic, vec![]).await.expect("join b");
+        let a = GossipTopic::join_networked(ep_a, topic, vec![b_peer])
+            .await
+            .expect("join a");
+        let b = GossipTopic::join_networked(ep_b, topic, vec![])
+            .await
+            .expect("join b");
 
-        a.broadcast(Bytes::from_static(b"over the wire")).await.expect("broadcast");
+        a.broadcast(Bytes::from_static(b"over the wire"))
+            .await
+            .expect("broadcast");
 
         let got = tokio::time::timeout(std::time::Duration::from_secs(10), b.recv())
             .await
@@ -430,7 +467,10 @@ mod tests {
             origin: [2u8; 32],
             data: b"hello".to_vec(),
         };
-        assert!(!bus.receive(msg.clone()).await, "broadcast already marked as seen");
+        assert!(
+            !bus.receive(msg.clone()).await,
+            "broadcast already marked as seen"
+        );
 
         // A NEW message (different hash) should be accepted
         let new_hash = blake3(b"world");
@@ -440,7 +480,10 @@ mod tests {
             origin: [2u8; 32],
             data: b"world".to_vec(),
         };
-        assert!(bus.receive(new_msg.clone()).await, "new message should be accepted");
+        assert!(
+            bus.receive(new_msg.clone()).await,
+            "new message should be accepted"
+        );
         assert!(!bus.receive(new_msg).await, "duplicate should be rejected");
     }
 }

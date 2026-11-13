@@ -137,7 +137,9 @@ impl fmt::Display for SyncError {
         match self {
             SyncError::Malformed(w) => write!(f, "zone-sync: malformed ({w})"),
             SyncError::BadSignature => f.write_str("zone-sync: signature does not verify"),
-            SyncError::PeerMismatch => f.write_str("zone-sync: connected peer is not the pinned identity"),
+            SyncError::PeerMismatch => {
+                f.write_str("zone-sync: connected peer is not the pinned identity")
+            }
             SyncError::Protocol(w) => write!(f, "zone-sync: protocol violation ({w})"),
             SyncError::Timeout => f.write_str("zone-sync: timed out"),
             SyncError::Io(e) => write!(f, "zone-sync: io: {e}"),
@@ -193,7 +195,14 @@ fn check_bounds(id: &[u8], body: &[u8]) -> Result<(), SyncError> {
 
 /// The bytes a signature covers: domain tag, kind, then every field length-prefixed or fixed
 /// width, so no choice of one field can shift bytes into another.
-fn preimage(kind: ObjectKind, id: &[u8], signer: &[u8; 32], epoch: u64, version: u64, body: &[u8]) -> Vec<u8> {
+fn preimage(
+    kind: ObjectKind,
+    id: &[u8],
+    signer: &[u8; 32],
+    epoch: u64,
+    version: u64,
+    body: &[u8],
+) -> Vec<u8> {
     let mut out = Vec::with_capacity(DOMAIN.len() + 1 + 2 + id.len() + 32 + 16 + 4 + body.len());
     out.extend_from_slice(DOMAIN);
     out.push(kind.code());
@@ -223,7 +232,15 @@ impl SignedObject {
         check_bounds(&id, &body)?;
         let signer = *keypair.public_key().as_bytes();
         let signature = keypair.sign(&preimage(kind, &id, &signer, epoch, version, &body));
-        Ok(SignedObject { kind, id, signer, epoch, version, body, signature })
+        Ok(SignedObject {
+            kind,
+            id,
+            signer,
+            epoch,
+            version,
+            body,
+            signature,
+        })
     }
 
     /// Check the bounds and the signature. `decode` has already done this; it is public so a
@@ -233,8 +250,16 @@ impl SignedObject {
     /// [`SyncError::Malformed`] or [`SyncError::BadSignature`].
     pub fn verify(&self) -> Result<(), SyncError> {
         check_bounds(&self.id, &self.body)?;
-        let key = PublicKey::from_bytes(&self.signer).map_err(|_| SyncError::Malformed("signer key"))?;
-        let msg = preimage(self.kind, &self.id, &self.signer, self.epoch, self.version, &self.body);
+        let key =
+            PublicKey::from_bytes(&self.signer).map_err(|_| SyncError::Malformed("signer key"))?;
+        let msg = preimage(
+            self.kind,
+            &self.id,
+            &self.signer,
+            self.epoch,
+            self.version,
+            &self.body,
+        );
         if key.verify(&msg, &self.signature) {
             Ok(())
         } else {
@@ -299,20 +324,35 @@ impl SignedObject {
     /// Its summary row.
     #[must_use]
     pub fn summary(&self) -> Summary {
-        Summary { kind: self.kind, id_hash: self.id_hash(), epoch: self.epoch, version: self.version, digest: self.digest() }
+        Summary {
+            kind: self.kind,
+            id_hash: self.id_hash(),
+            epoch: self.epoch,
+            version: self.version,
+            digest: self.digest(),
+        }
     }
 
     /// Wire / disk form: `kind ‖ id_len:u16 ‖ id ‖ signer ‖ epoch ‖ version ‖ body_len:u32 ‖ body ‖ sig`.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(1 + 2 + self.id.len() + 32 + 16 + 4 + self.body.len() + 64);
+        let mut out =
+            Vec::with_capacity(1 + 2 + self.id.len() + 32 + 16 + 4 + self.body.len() + 64);
         out.push(self.kind.code());
-        out.extend_from_slice(&u16::try_from(self.id.len()).unwrap_or(u16::MAX).to_be_bytes());
+        out.extend_from_slice(
+            &u16::try_from(self.id.len())
+                .unwrap_or(u16::MAX)
+                .to_be_bytes(),
+        );
         out.extend_from_slice(&self.id);
         out.extend_from_slice(&self.signer);
         out.extend_from_slice(&self.epoch.to_be_bytes());
         out.extend_from_slice(&self.version.to_be_bytes());
-        out.extend_from_slice(&u32::try_from(self.body.len()).unwrap_or(u32::MAX).to_be_bytes());
+        out.extend_from_slice(
+            &u32::try_from(self.body.len())
+                .unwrap_or(u32::MAX)
+                .to_be_bytes(),
+        );
         out.extend_from_slice(&self.body);
         out.extend_from_slice(&self.signature);
         out
@@ -331,19 +371,34 @@ impl SignedObject {
             return Err(SyncError::Malformed("id length"));
         }
         let id = r.take(id_len)?.to_vec();
-        let signer: [u8; 32] = r.take(32)?.try_into().map_err(|_| SyncError::Malformed("signer"))?;
+        let signer: [u8; 32] = r
+            .take(32)?
+            .try_into()
+            .map_err(|_| SyncError::Malformed("signer"))?;
         let epoch = r.u64()?;
         let version = r.u64()?;
-        let body_len = usize::try_from(r.u32()?).map_err(|_| SyncError::Malformed("body length"))?;
+        let body_len =
+            usize::try_from(r.u32()?).map_err(|_| SyncError::Malformed("body length"))?;
         if body_len > MAX_BODY_LEN {
             return Err(SyncError::Malformed("body length"));
         }
         let body = r.take(body_len)?.to_vec();
-        let signature: [u8; 64] = r.take(64)?.try_into().map_err(|_| SyncError::Malformed("signature"))?;
+        let signature: [u8; 64] = r
+            .take(64)?
+            .try_into()
+            .map_err(|_| SyncError::Malformed("signature"))?;
         if !r.is_empty() {
             return Err(SyncError::Malformed("trailing bytes"));
         }
-        let obj = SignedObject { kind, id, signer, epoch, version, body, signature };
+        let obj = SignedObject {
+            kind,
+            id,
+            signer,
+            epoch,
+            version,
+            body,
+            signature,
+        };
         obj.verify()?;
         Ok(obj)
     }
@@ -390,11 +445,23 @@ impl Summary {
 
     fn decode(r: &mut Reader<'_>) -> Result<Self, SyncError> {
         let kind = ObjectKind::from_code(r.u8()?).ok_or(SyncError::Malformed("kind"))?;
-        let id_hash: [u8; 32] = r.take(32)?.try_into().map_err(|_| SyncError::Malformed("id hash"))?;
+        let id_hash: [u8; 32] = r
+            .take(32)?
+            .try_into()
+            .map_err(|_| SyncError::Malformed("id hash"))?;
         let epoch = r.u64()?;
         let version = r.u64()?;
-        let digest: [u8; 32] = r.take(32)?.try_into().map_err(|_| SyncError::Malformed("digest"))?;
-        Ok(Summary { kind, id_hash, epoch, version, digest })
+        let digest: [u8; 32] = r
+            .take(32)?
+            .try_into()
+            .map_err(|_| SyncError::Malformed("digest"))?;
+        Ok(Summary {
+            kind,
+            id_hash,
+            epoch,
+            version,
+            digest,
+        })
     }
 }
 
@@ -413,26 +480,47 @@ impl<'a> Reader<'a> {
     }
 
     fn take(&mut self, n: usize) -> Result<&'a [u8], SyncError> {
-        let end = self.pos.checked_add(n).ok_or(SyncError::Malformed("length overflow"))?;
-        let out = self.buf.get(self.pos..end).ok_or(SyncError::Malformed("truncated"))?;
+        let end = self
+            .pos
+            .checked_add(n)
+            .ok_or(SyncError::Malformed("length overflow"))?;
+        let out = self
+            .buf
+            .get(self.pos..end)
+            .ok_or(SyncError::Malformed("truncated"))?;
         self.pos = end;
         Ok(out)
     }
 
     fn u8(&mut self) -> Result<u8, SyncError> {
-        Ok(*self.take(1)?.first().ok_or(SyncError::Malformed("truncated"))?)
+        Ok(*self
+            .take(1)?
+            .first()
+            .ok_or(SyncError::Malformed("truncated"))?)
     }
 
     fn u16(&mut self) -> Result<u16, SyncError> {
-        Ok(u16::from_be_bytes(self.take(2)?.try_into().map_err(|_| SyncError::Malformed("truncated"))?))
+        Ok(u16::from_be_bytes(
+            self.take(2)?
+                .try_into()
+                .map_err(|_| SyncError::Malformed("truncated"))?,
+        ))
     }
 
     fn u32(&mut self) -> Result<u32, SyncError> {
-        Ok(u32::from_be_bytes(self.take(4)?.try_into().map_err(|_| SyncError::Malformed("truncated"))?))
+        Ok(u32::from_be_bytes(
+            self.take(4)?
+                .try_into()
+                .map_err(|_| SyncError::Malformed("truncated"))?,
+        ))
     }
 
     fn u64(&mut self) -> Result<u64, SyncError> {
-        Ok(u64::from_be_bytes(self.take(8)?.try_into().map_err(|_| SyncError::Malformed("truncated"))?))
+        Ok(u64::from_be_bytes(
+            self.take(8)?
+                .try_into()
+                .map_err(|_| SyncError::Malformed("truncated"))?,
+        ))
     }
 
     fn is_empty(&self) -> bool {
@@ -613,7 +701,9 @@ async fn send_msg(send: &mut dyn BiStream, ty: u8, body: &[u8]) -> Result<(), Sy
 
 async fn recv_msg(recv: &mut dyn BiStream, idle: Duration) -> Result<(u8, Vec<u8>), SyncError> {
     let mut hdr = [0u8; 8];
-    tokio::time::timeout(idle, recv.read_exact(&mut hdr)).await.map_err(|_| SyncError::Timeout)??;
+    tokio::time::timeout(idle, recv.read_exact(&mut hdr))
+        .await
+        .map_err(|_| SyncError::Timeout)??;
     if hdr[0] != WIRE_VERSION {
         return Err(SyncError::Protocol("version"));
     }
@@ -624,7 +714,9 @@ async fn recv_msg(recv: &mut dyn BiStream, idle: Duration) -> Result<(u8, Vec<u8
     }
     let mut body = vec![0u8; len];
     if len > 0 {
-        tokio::time::timeout(idle, recv.read_exact(&mut body)).await.map_err(|_| SyncError::Timeout)??;
+        tokio::time::timeout(idle, recv.read_exact(&mut body))
+            .await
+            .map_err(|_| SyncError::Timeout)??;
     }
     Ok((hdr[1], body))
 }
@@ -679,7 +771,11 @@ pub struct SessionLimits {
 
 impl Default for SessionLimits {
     fn default() -> Self {
-        SessionLimits { max_sessions: 32, idle_timeout: Duration::from_secs(20), max_requests: 4096 }
+        SessionLimits {
+            max_sessions: 32,
+            idle_timeout: Duration::from_secs(20),
+            max_requests: 4096,
+        }
     }
 }
 
@@ -702,7 +798,9 @@ pub async fn serve(
         let Some(role) = policy.role(&Connection::peer_id(&conn)) else {
             continue; // not a member: drop (and with it the connection)
         };
-        let Ok(permit) = slots.clone().acquire_owned().await else { return };
+        let Ok(permit) = slots.clone().acquire_owned().await else {
+            return;
+        };
         let store = store.clone();
         tokio::spawn(async move {
             let _permit = permit;
@@ -753,7 +851,12 @@ async fn session(
 }
 
 /// Pure request handler: bytes in, bytes out, no socket.
-fn handle(ty: u8, body: &[u8], store: &dyn SyncStore, peer: PeerId) -> Result<(u8, Vec<u8>), SyncError> {
+fn handle(
+    ty: u8,
+    body: &[u8],
+    store: &dyn SyncStore,
+    peer: PeerId,
+) -> Result<(u8, Vec<u8>), SyncError> {
     match ty {
         T_ROOT => {
             if !body.is_empty() {
@@ -765,7 +868,10 @@ fn handle(ty: u8, body: &[u8], store: &dyn SyncStore, peer: PeerId) -> Result<(u
             let mut r = Reader::new(body);
             let has_after = r.u8()?;
             let kind = r.u8()?;
-            let hash: [u8; 32] = r.take(32)?.try_into().map_err(|_| SyncError::Malformed("after"))?;
+            let hash: [u8; 32] = r
+                .take(32)?
+                .try_into()
+                .map_err(|_| SyncError::Malformed("after"))?;
             let limit = usize::from(r.u16()?).clamp(1, MAX_SUMMARY_PAGE);
             if !r.is_empty() || has_after > 1 {
                 return Err(SyncError::Malformed("LIST body"));
@@ -790,7 +896,10 @@ fn handle(ty: u8, body: &[u8], store: &dyn SyncStore, peer: PeerId) -> Result<(u
             let mut total = 1usize;
             for _ in 0..n {
                 let kind = ObjectKind::from_code(r.u8()?).ok_or(SyncError::Malformed("kind"))?;
-                let hash: [u8; 32] = r.take(32)?.try_into().map_err(|_| SyncError::Malformed("hash"))?;
+                let hash: [u8; 32] = r
+                    .take(32)?
+                    .try_into()
+                    .map_err(|_| SyncError::Malformed("hash"))?;
                 if let Some(o) = store.get(kind, &hash) {
                     let enc_len = o.encode().len() + 4;
                     // keep the reply under the frame ceiling and the per-message object cap;
@@ -849,17 +958,30 @@ impl SyncClient {
     /// A client dialling from `endpoint`, with a per-message timeout.
     #[must_use]
     pub fn new(endpoint: Arc<NativeEndpoint>, io_timeout: Duration) -> Self {
-        SyncClient { endpoint, io_timeout }
+        SyncClient {
+            endpoint,
+            io_timeout,
+        }
     }
 
     async fn dial(
         &self,
         peer: &PeerAddr,
-    ) -> Result<(Box<dyn BiStream>, Box<dyn BiStream>, crate::native::NativeConnection), SyncError> {
+    ) -> Result<
+        (
+            Box<dyn BiStream>,
+            Box<dyn BiStream>,
+            crate::native::NativeConnection,
+        ),
+        SyncError,
+    > {
         let addr = format!("{}:{}", peer.host, peer.port);
-        let conn = tokio::time::timeout(self.io_timeout, Transport::connect(&*self.endpoint, &addr, SYNC_ALPN))
-            .await
-            .map_err(|_| SyncError::Timeout)??;
+        let conn = tokio::time::timeout(
+            self.io_timeout,
+            Transport::connect(&*self.endpoint, &addr, SYNC_ALPN),
+        )
+        .await
+        .map_err(|_| SyncError::Timeout)??;
         if Connection::peer_id(&conn) != peer.peer_id {
             return Err(SyncError::PeerMismatch);
         }
@@ -873,7 +995,11 @@ impl SyncClient {
     /// # Errors
     /// Any transport, framing or pinning failure. A rejected *object* is not an error: it is
     /// counted in the report.
-    pub async fn pull(&self, peer: &PeerAddr, store: &dyn SyncStore) -> Result<PullReport, SyncError> {
+    pub async fn pull(
+        &self,
+        peer: &PeerAddr,
+        store: &dyn SyncStore,
+    ) -> Result<PullReport, SyncError> {
         let (mut send, mut recv, _conn) = self.dial(peer).await?;
         let t = self.io_timeout;
         let mut report = PullReport::default();
@@ -904,7 +1030,11 @@ impl SyncClient {
                     req.extend_from_slice(&[0u8; 32]);
                 }
             }
-            req.extend_from_slice(&u16::try_from(MAX_SUMMARY_PAGE).unwrap_or(u16::MAX).to_be_bytes());
+            req.extend_from_slice(
+                &u16::try_from(MAX_SUMMARY_PAGE)
+                    .unwrap_or(u16::MAX)
+                    .to_be_bytes(),
+            );
             send_msg(&mut *send, T_LIST, &req).await?;
             let (ty, body) = recv_msg(&mut *recv, t).await?;
             if ty != T_SUMMARIES {
@@ -983,7 +1113,11 @@ impl SyncClient {
     ///
     /// # Errors
     /// Any transport, framing or pinning failure.
-    pub async fn push(&self, peer: &PeerAddr, objects: &[SignedObject]) -> Result<Vec<ApplyOutcome>, SyncError> {
+    pub async fn push(
+        &self,
+        peer: &PeerAddr,
+        objects: &[SignedObject],
+    ) -> Result<Vec<ApplyOutcome>, SyncError> {
         let (mut send, mut recv, _conn) = self.dial(peer).await?;
         let mut out = Vec::with_capacity(objects.len());
         for chunk in objects.chunks(MAX_PUSH_OBJECTS) {
@@ -1031,8 +1165,23 @@ mod tests {
         Keypair::from_secret_key(&[tag; 32])
     }
 
-    fn obj(signer: u8, kind: ObjectKind, id: &str, epoch: u64, version: u64, body: &[u8]) -> SignedObject {
-        SignedObject::sign(&kp(signer), kind, id.as_bytes().to_vec(), epoch, version, body.to_vec()).unwrap()
+    fn obj(
+        signer: u8,
+        kind: ObjectKind,
+        id: &str,
+        epoch: u64,
+        version: u64,
+        body: &[u8],
+    ) -> SignedObject {
+        SignedObject::sign(
+            &kp(signer),
+            kind,
+            id.as_bytes().to_vec(),
+            epoch,
+            version,
+            body.to_vec(),
+        )
+        .unwrap()
     }
 
     /// A toy replica: keeps the highest `(epoch, version)` per `(kind, id)`.
@@ -1054,7 +1203,11 @@ mod tests {
         }
 
         fn get(&self, kind: ObjectKind, id_hash: &[u8; 32]) -> Option<SignedObject> {
-            self.held.lock().unwrap().get(&(kind.code(), *id_hash)).cloned()
+            self.held
+                .lock()
+                .unwrap()
+                .get(&(kind.code(), *id_hash))
+                .cloned()
         }
 
         fn apply(&self, object: SignedObject, _from: PeerId) -> ApplyOutcome {
@@ -1092,7 +1245,10 @@ mod tests {
         for i in 0..enc.len() {
             let mut bad = enc.clone();
             bad[i] ^= 0x01;
-            assert!(SignedObject::decode(&bad).is_err(), "flipping byte {i} must not decode");
+            assert!(
+                SignedObject::decode(&bad).is_err(),
+                "flipping byte {i} must not decode"
+            );
         }
     }
 
@@ -1111,7 +1267,11 @@ mod tests {
         assert_eq!(SignedObject::decode(&forged), Err(SyncError::BadSignature));
         let mut forged = enc;
         forged[0] = ObjectKind::Registration.code();
-        assert_eq!(SignedObject::decode(&forged), Err(SyncError::BadSignature), "kind is domain-separated");
+        assert_eq!(
+            SignedObject::decode(&forged),
+            Err(SyncError::BadSignature),
+            "kind is domain-separated"
+        );
     }
 
     #[test]
@@ -1124,19 +1284,39 @@ mod tests {
         let mut trailing = enc.clone();
         trailing.push(0);
         assert!(SignedObject::decode(&trailing).is_err());
-        assert!(SignedObject::sign(&kp(1), ObjectKind::Update, vec![b'a'; 256], 1, 1, vec![]).is_err());
+        assert!(
+            SignedObject::sign(&kp(1), ObjectKind::Update, vec![b'a'; 256], 1, 1, vec![]).is_err()
+        );
         assert!(SignedObject::sign(&kp(1), ObjectKind::Update, vec![], 1, 1, vec![]).is_err());
-        assert!(SignedObject::sign(&kp(1), ObjectKind::Update, vec![1], 1, 1, vec![0; MAX_BODY_LEN + 1]).is_err());
+        assert!(SignedObject::sign(
+            &kp(1),
+            ObjectKind::Update,
+            vec![1],
+            1,
+            1,
+            vec![0; MAX_BODY_LEN + 1]
+        )
+        .is_err());
         // a declared body length over the cap is refused before any copy
         let mut huge = enc.clone();
         let at = 1 + 2 + o.id().len() + 32 + 16;
         huge[at..at + 4].copy_from_slice(&u32::MAX.to_be_bytes());
-        assert_eq!(SignedObject::decode(&huge), Err(SyncError::Malformed("body length")));
+        assert_eq!(
+            SignedObject::decode(&huge),
+            Err(SyncError::Malformed("body length"))
+        );
     }
 
     #[test]
     fn debug_never_prints_the_body() {
-        let o = obj(1, ObjectKind::Update, "example.", 1, 1, b"SECRET-TENANT-DATA");
+        let o = obj(
+            1,
+            ObjectKind::Update,
+            "example.",
+            1,
+            1,
+            b"SECRET-TENANT-DATA",
+        );
         assert!(!format!("{o:?}").contains("SECRET"));
     }
 
@@ -1164,15 +1344,25 @@ mod tests {
         assert_ne!(root_of(&a), root_of(&b));
         b.apply(o1, [0; 32]);
         assert_eq!(root_of(&a), root_of(&b));
-        a.apply(obj(1, ObjectKind::Update, "a.example.", 1, 2, b"x"), [0; 32]);
+        a.apply(
+            obj(1, ObjectKind::Update, "a.example.", 1, 2, b"x"),
+            [0; 32],
+        );
         assert_ne!(root_of(&a), root_of(&b));
     }
 
     async fn node(seed: &str) -> (Arc<NativeEndpoint>, PeerAddr) {
-        let ep = Arc::new(NativeEndpoint::bind_with_dialkey("127.0.0.1:0", seed).await.unwrap());
+        let ep = Arc::new(
+            NativeEndpoint::bind_with_dialkey("127.0.0.1:0", seed)
+                .await
+                .unwrap(),
+        );
         let addr = Transport::local_addr(&*ep).unwrap();
         let port: u16 = addr.rsplit(':').next().unwrap().parse().unwrap();
-        (ep.clone(), PeerAddr::new(Transport::id(&*ep), "127.0.0.1", port))
+        (
+            ep.clone(),
+            PeerAddr::new(Transport::id(&*ep), "127.0.0.1", port),
+        )
     }
 
     /// Two in-process nodes over real sockets: B pulls what A holds, and a second pull is a
@@ -1184,15 +1374,37 @@ mod tests {
         let store_a = Arc::new(MemStore::default());
         let store_b = Arc::new(MemStore::default());
         for i in 0..40u64 {
-            store_a.apply(obj(1, ObjectKind::Update, &format!("z{i}.example."), 1, i + 1, b"body"), [0; 32]);
+            store_a.apply(
+                obj(
+                    1,
+                    ObjectKind::Update,
+                    &format!("z{i}.example."),
+                    1,
+                    i + 1,
+                    b"body",
+                ),
+                [0; 32],
+            );
         }
-        store_a.apply(obj(1, ObjectKind::Registration, "z1.example.", 1, 1, b"reg"), [0; 32]);
+        store_a.apply(
+            obj(1, ObjectKind::Registration, "z1.example.", 1, 1, b"reg"),
+            [0; 32],
+        );
         // B already holds an OLDER z3
-        store_b.apply(obj(1, ObjectKind::Update, "z3.example.", 1, 1, b"old"), [0; 32]);
+        store_b.apply(
+            obj(1, ObjectKind::Update, "z3.example.", 1, 1, b"old"),
+            [0; 32],
+        );
 
         let policy = Arc::new(PeerPolicy::new().with_peer(Transport::id(&*ep_b)));
         let (tx, rx) = tokio::sync::watch::channel(false);
-        let srv = tokio::spawn(serve(ep_a.clone(), store_a.clone(), policy, SessionLimits::default(), rx));
+        let srv = tokio::spawn(serve(
+            ep_a.clone(),
+            store_a.clone(),
+            policy,
+            SessionLimits::default(),
+            rx,
+        ));
 
         let client = SyncClient::new(ep_b.clone(), Duration::from_secs(5));
         let r = client.pull(&addr_a, &*store_b).await.unwrap();
@@ -1211,10 +1423,19 @@ mod tests {
         let (ep_b, _) = node("zs-b2").await;
         let (ep_c, _) = node("zs-c2").await;
         let store_a = Arc::new(MemStore::default());
-        store_a.apply(obj(1, ObjectKind::Update, "z.example.", 1, 1, b"x"), [0; 32]);
+        store_a.apply(
+            obj(1, ObjectKind::Update, "z.example.", 1, 1, b"x"),
+            [0; 32],
+        );
         let policy = Arc::new(PeerPolicy::new().with_peer(Transport::id(&*ep_b)));
         let (tx, rx) = tokio::sync::watch::channel(false);
-        let srv = tokio::spawn(serve(ep_a.clone(), store_a, policy, SessionLimits::default(), rx));
+        let srv = tokio::spawn(serve(
+            ep_a.clone(),
+            store_a,
+            policy,
+            SessionLimits::default(),
+            rx,
+        ));
 
         // C is not in the policy: the server drops it; the pull errors rather than hangs
         let store_c = MemStore::default();
@@ -1227,7 +1448,10 @@ mod tests {
         let client_b = SyncClient::new(ep_b.clone(), Duration::from_secs(2));
         let mut wrong = addr_a.clone();
         wrong.peer_id = [9u8; 32];
-        assert_eq!(client_b.pull(&wrong, &store_b).await, Err(SyncError::PeerMismatch));
+        assert_eq!(
+            client_b.pull(&wrong, &store_b).await,
+            Err(SyncError::PeerMismatch)
+        );
         tx.send(true).unwrap();
         srv.await.unwrap();
     }
@@ -1239,16 +1463,30 @@ mod tests {
         let store_a = Arc::new(MemStore::default());
         let policy = Arc::new(PeerPolicy::new().with_publisher(Transport::id(&*ep_p)));
         let (tx, rx) = tokio::sync::watch::channel(false);
-        let srv = tokio::spawn(serve(ep_a.clone(), store_a.clone(), policy, SessionLimits::default(), rx));
+        let srv = tokio::spawn(serve(
+            ep_a.clone(),
+            store_a.clone(),
+            policy,
+            SessionLimits::default(),
+            rx,
+        ));
         let client = SyncClient::new(ep_p.clone(), Duration::from_secs(5));
 
         let v2 = obj(1, ObjectKind::Update, "z.example.", 1, 2, b"two");
         let v1 = obj(1, ObjectKind::Update, "z.example.", 1, 1, b"one");
         let v2_forked = obj(1, ObjectKind::Update, "z.example.", 1, 2, b"TWO-DIFFERENT");
-        let out = client.push(&addr_a, &[v2.clone(), v1, v2.clone(), v2_forked]).await.unwrap();
+        let out = client
+            .push(&addr_a, &[v2.clone(), v1, v2.clone(), v2_forked])
+            .await
+            .unwrap();
         assert_eq!(
             out,
-            vec![ApplyOutcome::Applied, ApplyOutcome::Stale, ApplyOutcome::Duplicate, ApplyOutcome::Fork]
+            vec![
+                ApplyOutcome::Applied,
+                ApplyOutcome::Stale,
+                ApplyOutcome::Duplicate,
+                ApplyOutcome::Fork
+            ]
         );
         // the held object is still the first v2
         let held = store_a.get(ObjectKind::Update, &v2.id_hash()).unwrap();
@@ -1269,9 +1507,21 @@ mod tests {
         *store_a.deny_signer.lock().unwrap() = Some(*kp(5).public_key().as_bytes());
         let policy = Arc::new(PeerPolicy::new().with_publisher(Transport::id(&*ep_p)));
         let (tx, rx) = tokio::sync::watch::channel(false);
-        let srv = tokio::spawn(serve(ep_a, store_a.clone(), policy, SessionLimits::default(), rx));
+        let srv = tokio::spawn(serve(
+            ep_a,
+            store_a.clone(),
+            policy,
+            SessionLimits::default(),
+            rx,
+        ));
         let client = SyncClient::new(ep_p, Duration::from_secs(5));
-        let out = client.push(&addr_a, &[obj(5, ObjectKind::Update, "z.example.", 1, 1, b"x")]).await.unwrap();
+        let out = client
+            .push(
+                &addr_a,
+                &[obj(5, ObjectKind::Update, "z.example.", 1, 1, b"x")],
+            )
+            .await
+            .unwrap();
         assert_eq!(out, vec![ApplyOutcome::Unauthorized]);
         assert!(store_a.summaries(None, 10).is_empty());
         tx.send(true).unwrap();
@@ -1280,7 +1530,10 @@ mod tests {
 
     #[test]
     fn peer_policy_is_default_deny_and_a_peer_outranks_a_publisher_entry() {
-        let p = PeerPolicy::new().with_publisher([1; 32]).with_peer([2; 32]).with_publisher([2; 32]);
+        let p = PeerPolicy::new()
+            .with_publisher([1; 32])
+            .with_peer([2; 32])
+            .with_publisher([2; 32]);
         assert_eq!(p.role(&[1; 32]), Some(Role::Publisher));
         assert_eq!(p.role(&[2; 32]), Some(Role::Peer));
         assert_eq!(p.role(&[3; 32]), None);
