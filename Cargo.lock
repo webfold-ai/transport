@@ -1311,7 +1311,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 [[package]]
 name = "relayfold"
 version = "0.1.0"
-source = "git+https://github.com/Ptyktos/relayfold?rev=69084250929ca64f526ee86007e0a7f3ef402c32#69084250929ca64f526ee86007e0a7f3ef402c32"
+source = "git+https://github.com/Ptyktos/relayfold?rev=4b10281c85e66a47e39e178a2e7c818f4d2c6439#4b10281c85e66a47e39e178a2e7c818f4d2c6439"
 dependencies = [
  "wirefold",
 ]
@@ -2260,7 +2260,7 @@ checksum = "589f6da84c646204747d1270a2a5661ea66ed1cced2631d546fdfb155959f9ec"
 [[package]]
 name = "wirefold"
 version = "0.1.0"
-source = "git+https://github.com/webfold-ai/wirefold?rev=ed1ffdf4d34a86ab60e128ea14d2475e57650946#ed1ffdf4d34a86ab60e128ea14d2475e57650946"
+source = "git+https://github.com/webfold-ai/wirefold?rev=e4fde11d9e7258ab017d0427024d7c272daa26f2#e4fde11d9e7258ab017d0427024d7c272daa26f2"
 dependencies = [
  "apeiron",
 ]
