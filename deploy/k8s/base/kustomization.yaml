@@ -1,0 +1,25 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+# meshd: the internal service-discovery node (a pkarr relay and an authoritative DNS zone).
+#
+#   kubectl apply -k deploy/k8s/base            into the current namespace
+#   kubectl kustomize deploy/k8s/overlays/example
+#
+# Set the image to the digest of the build you loaded or pushed (`nix build .#meshd-oci-layout`; the
+# digest is in index.json) with an overlay `images:` entry. A tag is not an identity.
+namespace: mesh
+resources:
+  - namespace.yaml
+  - configmap.yaml
+  - statefulset.yaml
+  - service.yaml
+  - networkpolicy.yaml
+images:
+  - name: meshd
+    newName: meshd
+    newTag: nix
+labels:
+  - pairs:
+      app.kubernetes.io/name: meshd
+      app.kubernetes.io/part-of: tas-mesh
+    includeSelectors: false

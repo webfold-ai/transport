@@ -45,19 +45,24 @@ fn env(name: &str) -> Option<String> {
 fn env_parse<T: std::str::FromStr>(name: &str, default: T) -> Result<T, String> {
     match env(name) {
         None => Ok(default),
-        Some(v) => v.trim().parse().map_err(|_| format!("{name}={v:?} is not valid")),
+        Some(v) => v
+            .trim()
+            .parse()
+            .map_err(|_| format!("{name}={v:?} is not valid")),
     }
 }
 
 fn allow_list(path: &str) -> Result<HashSet<[u8; 32]>, String> {
-    let text = std::fs::read_to_string(path).map_err(|e| format!("MESHD_ALLOW_KEYS_FILE {path}: {e}"))?;
+    let text =
+        std::fs::read_to_string(path).map_err(|e| format!("MESHD_ALLOW_KEYS_FILE {path}: {e}"))?;
     let mut keys = HashSet::new();
     for (i, line) in text.lines().enumerate() {
         let line = line.split('#').next().unwrap_or("").trim();
         if line.is_empty() {
             continue;
         }
-        let key = PublicKey::from_z32(line).map_err(|_| format!("{path}:{}: {line:?} is not a z-base-32 public key", i + 1))?;
+        let key = PublicKey::from_z32(line)
+            .map_err(|_| format!("{path}:{}: {line:?} is not a z-base-32 public key", i + 1))?;
         keys.insert(*key.as_bytes());
     }
     Ok(keys)
@@ -69,19 +74,31 @@ async fn healthcheck() -> bool {
     let bind = env("MESHD_HTTP_BIND").unwrap_or_else(|| "0.0.0.0:6881".into());
     let port = bind.rsplit(':').next().unwrap_or("6881");
     let attempt = async {
-        let mut s = tokio::net::TcpStream::connect(format!("127.0.0.1:{port}")).await.ok()?;
-        s.write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n").await.ok()?;
+        let mut s = tokio::net::TcpStream::connect(format!("127.0.0.1:{port}"))
+            .await
+            .ok()?;
+        s.write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .ok()?;
         let mut buf = [0u8; 64];
         let n = s.read(&mut buf).await.ok()?;
         Some(String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/1.1 200"))
     };
-    tokio::time::timeout(Duration::from_secs(3), attempt).await.ok().flatten().unwrap_or(false)
+    tokio::time::timeout(Duration::from_secs(3), attempt)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(false)
 }
 
 #[tokio::main]
 async fn main() -> ExitCode {
     if std::env::args().nth(1).as_deref() == Some("--healthcheck") {
-        return if healthcheck().await { ExitCode::SUCCESS } else { ExitCode::FAILURE };
+        return if healthcheck().await {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::FAILURE
+        };
     }
     match run().await {
         Ok(()) => ExitCode::SUCCESS,
@@ -103,9 +120,16 @@ async fn run() -> Result<(), String> {
     let limits = Limits {
         max_keys: env_parse("MESHD_MAX_KEYS", 100_000usize)?,
         max_age: env("MESHD_MAX_AGE_SECS")
-            .map(|v| v.trim().parse::<u64>().map(Duration::from_secs).map_err(|_| format!("MESHD_MAX_AGE_SECS={v:?} is not valid")))
+            .map(|v| {
+                v.trim()
+                    .parse::<u64>()
+                    .map(Duration::from_secs)
+                    .map_err(|_| format!("MESHD_MAX_AGE_SECS={v:?} is not valid"))
+            })
             .transpose()?,
-        allow: env("MESHD_ALLOW_KEYS_FILE").map(|p| allow_list(&p)).transpose()?,
+        allow: env("MESHD_ALLOW_KEYS_FILE")
+            .map(|p| allow_list(&p))
+            .transpose()?,
     };
     let closed = limits.allow.as_ref().map(HashSet::len);
 
@@ -113,8 +137,12 @@ async fn run() -> Result<(), String> {
         eprintln!("meshd: records are kept in memory only; they are lost on restart");
         Arc::new(RelayStore::in_memory(limits))
     } else {
-        let (store, report) = RelayStore::open(&data_dir, limits).map_err(|e| format!("MESHD_DATA_DIR {data_dir}: {e}"))?;
-        eprintln!("meshd: loaded {} records from {data_dir} ({} files skipped)", report.loaded, report.skipped);
+        let (store, report) = RelayStore::open(&data_dir, limits)
+            .map_err(|e| format!("MESHD_DATA_DIR {data_dir}: {e}"))?;
+        eprintln!(
+            "meshd: loaded {} records from {data_dir} ({} files skipped)",
+            report.loaded, report.skipped
+        );
         Arc::new(store)
     };
     match closed {
@@ -122,20 +150,35 @@ async fn run() -> Result<(), String> {
         None => eprintln!("meshd: any key may publish; keep this port on a private network"),
     }
 
-    let listener = tokio::net::TcpListener::bind(&http_bind).await.map_err(|e| format!("MESHD_HTTP_BIND {http_bind}: {e}"))?;
+    let listener = tokio::net::TcpListener::bind(&http_bind)
+        .await
+        .map_err(|e| format!("MESHD_HTTP_BIND {http_bind}: {e}"))?;
     eprintln!("meshd: relay listening on {http_bind}");
 
     let mut tasks = tokio::task::JoinSet::new();
     tasks.spawn({
         let store = Arc::clone(&store);
-        async move { serve(listener, store).await.map_err(|e| format!("relay: {e}")) }
+        async move {
+            serve(listener, store)
+                .await
+                .map_err(|e| format!("relay: {e}"))
+        }
     });
     if dns_bind != "off" {
-        let handler: Arc<dyn DnsHandler> =
-            Arc::new(MeshZone::new(Arc::clone(&store), &zone, &ns, &hostmaster).map_err(|e| format!("MESHD_ZONE: {e}"))?);
-        for (proto, h, bind) in [("udp", Arc::clone(&handler), dns_bind.clone()), ("tcp", handler, dns_bind.clone())] {
+        let handler: Arc<dyn DnsHandler> = Arc::new(
+            MeshZone::new(Arc::clone(&store), &zone, &ns, &hostmaster)
+                .map_err(|e| format!("MESHD_ZONE: {e}"))?,
+        );
+        for (proto, h, bind) in [
+            ("udp", Arc::clone(&handler), dns_bind.clone()),
+            ("tcp", handler, dns_bind.clone()),
+        ] {
             tasks.spawn(async move {
-                let r = if proto == "udp" { serve_udp_with(&bind, h).await } else { serve_tcp_with(&bind, h).await };
+                let r = if proto == "udp" {
+                    serve_udp_with(&bind, h).await
+                } else {
+                    serve_tcp_with(&bind, h).await
+                };
                 r.map_err(|e| format!("dns {proto} {bind}: {e}"))
             });
         }
@@ -155,7 +198,8 @@ async fn run() -> Result<(), String> {
         }
     });
 
-    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).map_err(|e| e.to_string())?;
+    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .map_err(|e| e.to_string())?;
     tokio::select! {
         _ = term.recv() => { eprintln!("meshd: terminating"); Ok(()) }
         _ = tokio::signal::ctrl_c() => { eprintln!("meshd: interrupted"); Ok(()) }

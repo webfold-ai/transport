@@ -1,0 +1,13 @@
+# Clients: PKARR_RELAYS=http://meshd.mesh.svc:6881   and DNS: meshd.mesh.svc:53 (udp and tcp).
+# DNS is served on 5353 in the pod (the image has no privilege to bind 53) and exposed on 53 here.
+apiVersion: v1
+kind: Service
+metadata:
+  name: meshd
+spec:
+  selector:
+    app.kubernetes.io/name: meshd
+  ports:
+    - { name: relay, port: 6881, targetPort: relay, protocol: TCP }
+    - { name: dns-udp, port: 53, targetPort: dns-udp, protocol: UDP }
+    - { name: dns-tcp, port: 53, targetPort: dns-tcp, protocol: TCP }

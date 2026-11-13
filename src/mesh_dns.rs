@@ -89,7 +89,12 @@ impl MeshZone {
             },
         );
         let ns = Record::new(zone_name.clone(), 300, RData::Ns(mname));
-        Ok(MeshZone { store, zone: zone_name, soa, ns })
+        Ok(MeshZone {
+            store,
+            zone: zone_name,
+            soa,
+            ns,
+        })
     }
 
     /// Answer one query as of `now` (seconds since the epoch). `None` means stay silent.
@@ -113,7 +118,10 @@ impl MeshZone {
         let zl = self.zone.labels().len();
         let ql = question.name.labels();
         let in_zone = ql.len() >= zl
-            && ql[ql.len() - zl..].iter().zip(self.zone.labels()).all(|(a, b)| a.eq_ignore_ascii_case(b));
+            && ql[ql.len() - zl..]
+                .iter()
+                .zip(self.zone.labels())
+                .all(|(a, b)| a.eq_ignore_ascii_case(b));
         if !in_zone {
             reply.flags.authoritative = false;
             reply.flags.response_code = ResponseCode::Refused;
@@ -188,8 +196,19 @@ impl MeshZone {
         };
         let mut out = record.clone();
         out.name = under(&record.name);
-        if let RData::Srv { priority, weight, port, target } = &record.data {
-            out.data = RData::Srv { priority: *priority, weight: *weight, port: *port, target: under(target) };
+        if let RData::Srv {
+            priority,
+            weight,
+            port,
+            target,
+        } = &record.data
+        {
+            out.data = RData::Srv {
+                priority: *priority,
+                weight: *weight,
+                port: *port,
+                target: under(target),
+            };
         }
         out
     }

@@ -12,7 +12,11 @@ use transport::pkarr::RelayClient;
 const BIN: &str = env!("CARGO_BIN_EXE_meshd");
 
 fn free_port() -> u16 {
-    UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    UdpSocket::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
 }
 
 struct Meshd {
@@ -58,7 +62,11 @@ impl Meshd {
     /// SIGTERM, then wait: a clean stop exits 0.
     fn stop(mut self) -> bool {
         let pid = self.child.id().to_string();
-        assert!(Command::new("kill").args(["-TERM", &pid]).status().unwrap().success());
+        assert!(Command::new("kill")
+            .args(["-TERM", &pid])
+            .status()
+            .unwrap()
+            .success());
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             if let Some(status) = self.child.try_wait().unwrap() {
@@ -77,7 +85,11 @@ impl Drop for Meshd {
 }
 
 fn svc(port: u16) -> DialkeyServiceInfo {
-    DialkeyServiceInfo { service: "_billing._tcp".into(), port, metadata: Default::default() }
+    DialkeyServiceInfo {
+        service: "_billing._tcp".into(),
+        port,
+        metadata: Default::default(),
+    }
 }
 
 const IP: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 1, 2, 3));
@@ -93,8 +105,12 @@ async fn publish_resolve_dns_stop_restart() {
     let dir = tmp("e2e");
     let m = Meshd::start(&dir, &[]);
 
-    dialkey::publish(&m.client(), "plane-a", IP, &[svc(7000)]).await.unwrap();
-    let got = dialkey::resolve(&m.client(), "plane-a", "_billing._tcp").await.unwrap();
+    dialkey::publish(&m.client(), "plane-a", IP, &[svc(7000)])
+        .await
+        .unwrap();
+    let got = dialkey::resolve(&m.client(), "plane-a", "_billing._tcp")
+        .await
+        .unwrap();
     assert_eq!(got.peer_addr.port, 7000);
 
     // The same record, as DNS.
@@ -102,19 +118,35 @@ async fn publish_resolve_dns_stop_restart() {
     let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let mut q = Message::default();
     q.id = 9;
-    q.flags = Flags { recursion_desired: true, ..Flags::default() };
-    q.questions.push(Question::new(Name::from_ascii(&format!("{key}.mesh.internal")).unwrap(), RecordType::A));
-    sock.send_to(&q.to_bytes(), format!("127.0.0.1:{}", m.dns)).await.unwrap();
+    q.flags = Flags {
+        recursion_desired: true,
+        ..Flags::default()
+    };
+    q.questions.push(Question::new(
+        Name::from_ascii(&format!("{key}.mesh.internal")).unwrap(),
+        RecordType::A,
+    ));
+    sock.send_to(&q.to_bytes(), format!("127.0.0.1:{}", m.dns))
+        .await
+        .unwrap();
     let mut buf = [0u8; 1500];
-    let (n, _) = tokio::time::timeout(Duration::from_secs(5), sock.recv_from(&mut buf)).await.expect("dns reply").unwrap();
+    let (n, _) = tokio::time::timeout(Duration::from_secs(5), sock.recv_from(&mut buf))
+        .await
+        .expect("dns reply")
+        .unwrap();
     let reply = Message::from_bytes(&buf[..n]).unwrap();
-    assert!(matches!(reply.answers.as_slice(), [r] if r.data == RData::A(Ipv4Addr::new(10, 1, 2, 3))), "{reply:?}");
+    assert!(
+        matches!(reply.answers.as_slice(), [r] if r.data == RData::A(Ipv4Addr::new(10, 1, 2, 3))),
+        "{reply:?}"
+    );
 
     assert!(m.stop(), "SIGTERM is a clean exit");
 
     // A new process on the same data directory still has the record.
     let again = Meshd::start(&dir, &[]);
-    let got = dialkey::resolve(&again.client(), "plane-a", "_billing._tcp").await.expect("persisted across restart");
+    let got = dialkey::resolve(&again.client(), "plane-a", "_billing._tcp")
+        .await
+        .expect("persisted across restart");
     assert_eq!(got.peer_addr.port, 7000);
     drop(again);
     let _ = std::fs::remove_dir_all(&dir);
@@ -125,10 +157,24 @@ async fn an_allowlist_file_closes_publishing() {
     let dir = tmp("allow");
     std::fs::create_dir_all(&dir).unwrap();
     let file = dir.join("allow.txt");
-    std::fs::write(&file, format!("# who may publish\n{}  # plane-a\n\n", native_keypair("plane-a").public_key().to_z32())).unwrap();
-    let m = Meshd::start(&dir.join("data"), &[("MESHD_ALLOW_KEYS_FILE", file.display().to_string())]);
-    assert!(dialkey::publish(&m.client(), "plane-a", IP, &[svc(1)]).await.is_ok());
-    assert!(dialkey::publish(&m.client(), "intruder", IP, &[svc(1)]).await.is_err());
+    std::fs::write(
+        &file,
+        format!(
+            "# who may publish\n{}  # plane-a\n\n",
+            native_keypair("plane-a").public_key().to_z32()
+        ),
+    )
+    .unwrap();
+    let m = Meshd::start(
+        &dir.join("data"),
+        &[("MESHD_ALLOW_KEYS_FILE", file.display().to_string())],
+    );
+    assert!(dialkey::publish(&m.client(), "plane-a", IP, &[svc(1)])
+        .await
+        .is_ok());
+    assert!(dialkey::publish(&m.client(), "intruder", IP, &[svc(1)])
+        .await
+        .is_err());
     drop(m);
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -143,9 +189,17 @@ fn bad_configuration_fails_loudly_and_dns_can_be_turned_off() {
             .env(k, v)
             .output()
             .unwrap();
-        (out.status.success(), String::from_utf8_lossy(&out.stderr).into_owned())
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
     };
-    for (k, v) in [("MESHD_MAX_KEYS", "lots"), ("MESHD_MAX_AGE_SECS", "-1"), ("MESHD_ALLOW_KEYS_FILE", "/nonexistent"), ("MESHD_ZONE", "a..b")] {
+    for (k, v) in [
+        ("MESHD_MAX_KEYS", "lots"),
+        ("MESHD_MAX_AGE_SECS", "-1"),
+        ("MESHD_ALLOW_KEYS_FILE", "/nonexistent"),
+        ("MESHD_ZONE", "a..b"),
+    ] {
         let (ok, err) = bad(k, v);
         assert!(!ok && err.contains(k), "{k}={v}: {err}");
     }

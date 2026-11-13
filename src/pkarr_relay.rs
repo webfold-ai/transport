@@ -71,7 +71,11 @@ pub struct Limits {
 
 impl Default for Limits {
     fn default() -> Self {
-        Limits { max_keys: 100_000, max_age: None, allow: None }
+        Limits {
+            max_keys: 100_000,
+            max_age: None,
+            allow: None,
+        }
     }
 }
 
@@ -127,7 +131,11 @@ impl RelayStore {
     /// A store that keeps records in memory only.
     #[must_use]
     pub fn in_memory(limits: Limits) -> Self {
-        RelayStore { limits, dir: None, map: Mutex::new(HashMap::new()) }
+        RelayStore {
+            limits,
+            dir: None,
+            map: Mutex::new(HashMap::new()),
+        }
     }
 
     /// A store persisted under `dir` (created if missing), reloading what is already there.
@@ -152,13 +160,22 @@ impl RelayStore {
                 None => report.skipped += 1,
             }
         }
-        Ok((RelayStore { limits, dir: Some(dir), map: Mutex::new(map) }, report))
+        Ok((
+            RelayStore {
+                limits,
+                dir: Some(dir),
+                map: Mutex::new(map),
+            },
+            report,
+        ))
     }
 
     fn lock(&self) -> MutexGuard<'_, HashMap<[u8; 32], Entry>> {
         // A poisoned lock means another request panicked mid-update; the map is still a valid
         // map of verified records, so keep serving rather than take the relay down with it.
-        self.map.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        self.map
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     fn expired(&self, entry: &Entry, now: u64) -> bool {
@@ -172,7 +189,12 @@ impl RelayStore {
     /// # Errors
     /// See [`PutError`].
     pub fn put(&self, key: &PublicKey, body: &[u8], now: u64) -> Result<PutOutcome, PutError> {
-        if self.limits.allow.as_ref().is_some_and(|a| !a.contains(key.as_bytes())) {
+        if self
+            .limits
+            .allow
+            .as_ref()
+            .is_some_and(|a| !a.contains(key.as_bytes()))
+        {
             return Err(PutError::NotAllowed);
         }
         if body.len() > MAX_BODY {
@@ -184,19 +206,26 @@ impl RelayStore {
         let held = map.get(key.as_bytes());
         let outcome = match held {
             Some(e) if packet.seq() < e.packet.seq() => {
-                return Err(PutError::Stale { current: e.packet.seq() });
+                return Err(PutError::Stale {
+                    current: e.packet.seq(),
+                });
             }
             Some(e) if packet.seq() == e.packet.seq() => {
                 if e.packet != packet {
-                    return Err(PutError::Stale { current: e.packet.seq() });
+                    return Err(PutError::Stale {
+                        current: e.packet.seq(),
+                    });
                 }
                 PutOutcome::Unchanged
             }
             Some(_) => PutOutcome::Stored,
             None => {
                 if map.len() >= self.limits.max_keys {
-                    let dead: Vec<[u8; 32]> =
-                        map.iter().filter(|(_, e)| self.expired(e, now)).map(|(k, _)| *k).collect();
+                    let dead: Vec<[u8; 32]> = map
+                        .iter()
+                        .filter(|(_, e)| self.expired(e, now))
+                        .map(|(k, _)| *k)
+                        .collect();
                     for k in dead {
                         map.remove(&k);
                         self.remove_file(&PublicKey::from_bytes(&k).ok());
@@ -211,7 +240,13 @@ impl RelayStore {
         if let Some(dir) = &self.dir {
             write_file(dir, key, now, body).map_err(|e| PutError::Io(e.to_string()))?;
         }
-        map.insert(*key.as_bytes(), Entry { packet, stored_at: now });
+        map.insert(
+            *key.as_bytes(),
+            Entry {
+                packet,
+                stored_at: now,
+            },
+        );
         Ok(outcome)
     }
 
@@ -225,14 +260,19 @@ impl RelayStore {
     #[must_use]
     pub fn get_packet(&self, key: &PublicKey, now: u64) -> Option<SignedPacket> {
         let map = self.lock();
-        map.get(key.as_bytes()).filter(|e| !self.expired(e, now)).map(|e| e.packet.clone())
+        map.get(key.as_bytes())
+            .filter(|e| !self.expired(e, now))
+            .map(|e| e.packet.clone())
     }
 
     /// Drop every expired record (and its file). Returns how many.
     pub fn sweep(&self, now: u64) -> usize {
         let mut map = self.lock();
-        let dead: Vec<[u8; 32]> =
-            map.iter().filter(|(_, e)| self.expired(e, now)).map(|(k, _)| *k).collect();
+        let dead: Vec<[u8; 32]> = map
+            .iter()
+            .filter(|(_, e)| self.expired(e, now))
+            .map(|(k, _)| *k)
+            .collect();
         for k in &dead {
             map.remove(k);
             self.remove_file(&PublicKey::from_bytes(k).ok());
@@ -291,7 +331,11 @@ pub struct Response {
 
 impl Response {
     fn text(status: u16, msg: &str) -> Self {
-        Response { status, body: format!("{msg}\n").into_bytes(), content_type: "text/plain" }
+        Response {
+            status,
+            body: format!("{msg}\n").into_bytes(),
+            content_type: "text/plain",
+        }
     }
 }
 
@@ -307,7 +351,10 @@ pub fn handle(store: &RelayStore, method: &str, target: &str, body: &[u8], now: 
             _ => Response::text(405, "method not allowed"),
         };
     }
-    let Some(label) = path.strip_prefix('/').filter(|l| !l.is_empty() && !l.contains('/')) else {
+    let Some(label) = path
+        .strip_prefix('/')
+        .filter(|l| !l.is_empty() && !l.contains('/'))
+    else {
         return Response::text(404, "not found");
     };
     let Ok(key) = PublicKey::from_z32(label) else {
@@ -315,13 +362,19 @@ pub fn handle(store: &RelayStore, method: &str, target: &str, body: &[u8], now: 
     };
     match method {
         "GET" => match store.get(&key, now) {
-            Some(bytes) => Response { status: 200, body: bytes, content_type: "application/octet-stream" },
+            Some(bytes) => Response {
+                status: 200,
+                body: bytes,
+                content_type: "application/octet-stream",
+            },
             None => Response::text(404, "no record"),
         },
         "PUT" => match store.put(&key, body, now) {
             Ok(_) => Response::text(200, "ok"),
             Err(PutError::NotAllowed) => Response::text(403, "key may not publish here"),
-            Err(PutError::Invalid(SignedDnsError::ValueTooLong)) => Response::text(413, "record too large"),
+            Err(PutError::Invalid(SignedDnsError::ValueTooLong)) => {
+                Response::text(413, "record too large")
+            }
             Err(PutError::Invalid(e)) => Response::text(400, &format!("invalid record: {e}")),
             Err(PutError::Stale { current }) => {
                 Response::text(409, &format!("a record with seq {current} is held"))
@@ -396,7 +449,9 @@ async fn serve_one(mut stream: tokio::net::TcpStream, store: &RelayStore) -> io:
 }
 
 /// Read one request: `(method, target, body)`, or the status to answer with.
-async fn read_request(stream: &mut tokio::net::TcpStream) -> Result<(String, String, Vec<u8>), u16> {
+async fn read_request(
+    stream: &mut tokio::net::TcpStream,
+) -> Result<(String, String, Vec<u8>), u16> {
     use tokio::io::AsyncReadExt;
     let mut buf = Vec::with_capacity(1024);
     let mut chunk = [0u8; 1024];

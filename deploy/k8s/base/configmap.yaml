@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: meshd
+data:
+  MESHD_HTTP_BIND: "0.0.0.0:6881"
+  MESHD_DNS_BIND: "0.0.0.0:5353"
+  MESHD_DATA_DIR: "/var/lib/meshd"
+  MESHD_ZONE: "mesh.internal"
+  # Unset keeps a record until it is replaced; a publisher that announced once must not vanish.
+  # MESHD_MAX_AGE_SECS: "86400"
+  # MESHD_MAX_KEYS: "100000"
