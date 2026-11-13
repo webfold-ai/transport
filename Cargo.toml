@@ -74,7 +74,7 @@ flate2 = { version = "1", optional = true }
 # is now a thin re-export.
 # Pinned by rev: an unpinned entry would resolve to relayfold's default branch, and a consumer that also names
 # relayfold must use this exact rev or the graph holds two relayfolds. b50b9e1 is relayfold on wirefold/apeiron.
-relayfold = { git = "https://github.com/Ptyktos/relayfold", rev = "4b10281c85e66a47e39e178a2e7c818f4d2c6439" }
+relayfold = { git = "https://github.com/Ptyktos/relayfold", rev = "afed0355a5b51777b085473a29720d35ecdf671d" }
 pkarr = { version = "8.0.1", optional = true }
 
 # The unit tests of modules that are always compiled (`edge_verify`, `edge_proxy`) drive async code with

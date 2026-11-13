@@ -22,7 +22,7 @@
     tas-nix.url = "git+https://github.com/Ptyktos/caretaker?dir=nix&ref=claude/confident-hamilton-u5lcc4-pins-init&rev=247943bcaf1e537885aa4dd9aeb363c670888e10&shallow=1";
 
     relayfold = {
-      url = "git+https://github.com/Ptyktos/relayfold?rev=4b10281c85e66a47e39e178a2e7c818f4d2c6439&shallow=1";
+      url = "git+https://github.com/Ptyktos/relayfold?rev=afed0355a5b51777b085473a29720d35ecdf671d&shallow=1";
       flake = false;
     };
     apeiron = {
@@ -30,7 +30,7 @@
       flake = false;
     };
     wirefold = {
-      url = "git+https://github.com/webfold-ai/wirefold?rev=e4fde11d9e7258ab017d0427024d7c272daa26f2&shallow=1";
+      url = "git+https://github.com/webfold-ai/wirefold?rev=98df8bfb8051fb24ca43ce3ddc446641684ef8f9&shallow=1";
       flake = false;
     };
   };
