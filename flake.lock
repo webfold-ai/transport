@@ -1,0 +1,162 @@
+{
+  "nodes": {
+    "advisory-db": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1793979272,
+        "narHash": "sha256-oUcBtPbtS7PlEMuSrgTAN4wv49cXYbwKbQqhH2pah5w=",
+        "ref": "refs/heads/main",
+        "rev": "309392b18f6b17022f82c701f300433126901068",
+        "shallow": true,
+        "type": "git",
+        "url": "https://github.com/rustsec/advisory-db"
+      },
+      "original": {
+        "shallow": true,
+        "type": "git",
+        "url": "https://github.com/rustsec/advisory-db"
+      }
+    },
+    "apeiron": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1794472249,
+        "narHash": "sha256-WRmj3EWhJ91yIIpd91Xr/x2ScsG+tbEh0H4nnsg6viE=",
+        "ref": "refs/heads/main",
+        "rev": "1c3d4a1da565cde409f6f3cb343086aa6853eb9c",
+        "shallow": true,
+        "type": "git",
+        "url": "https://github.com/webfold-ai/apeiron"
+      },
+      "original": {
+        "rev": "1c3d4a1da565cde409f6f3cb343086aa6853eb9c",
+        "shallow": true,
+        "type": "git",
+        "url": "https://github.com/webfold-ai/apeiron"
+      }
+    },
+    "crane": {
+      "locked": {
+        "lastModified": 1787326676,
+        "narHash": "sha256-lWhBbBvC05/xwivKBBiM2YNizpmgqCgyOIzomvRuwxs=",
+        "ref": "refs/tags/v0.24.0",
+        "rev": "32daa78aa882b7a43c508d1d5a5ad18a7968d731",
+        "revCount": 891,
+        "type": "git",
+        "url": "https://github.com/ipetkov/crane"
+      },
+      "original": {
+        "ref": "refs/tags/v0.24.0",
+        "type": "git",
+        "url": "https://github.com/ipetkov/crane"
+      }
+    },
+    "nixpkgs": {
+      "locked": {
+        "lastModified": 1793865203,
+        "narHash": "sha256-4D+5oPvxkOa6tTCWXi4jwRfmWhDXGRSrX4+eOTItLh0=",
+        "rev": "c56a87d8e41ce69bd2af57eb35dcc117a9dfca33",
+        "type": "tarball",
+        "url": "https://releases.nixos.org/nixos/26.05/nixos-26.05.13627.c56a87d8e41c/nixexprs.tar.xz"
+      },
+      "original": {
+        "type": "tarball",
+        "url": "https://channels.nixos.org/nixos-26.05/nixexprs.tar.xz"
+      }
+    },
+    "relayfold": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1794544679,
+        "narHash": "sha256-JPmvybeiW39CN7zW6CAy0GSLjaN7D9lE/e3kBtaK0uA=",
+        "ref": "refs/heads/main",
+        "rev": "69084250929ca64f526ee86007e0a7f3ef402c32",
+        "shallow": true,
+        "type": "git",
+        "url": "https://github.com/Ptyktos/relayfold"
+      },
+      "original": {
+        "rev": "69084250929ca64f526ee86007e0a7f3ef402c32",
+        "shallow": true,
+        "type": "git",
+        "url": "https://github.com/Ptyktos/relayfold"
+      }
+    },
+    "root": {
+      "inputs": {
+        "apeiron": "apeiron",
+        "relayfold": "relayfold",
+        "tas-nix": "tas-nix",
+        "wirefold": "wirefold"
+      }
+    },
+    "rust-overlay": {
+      "inputs": {
+        "nixpkgs": [
+          "tas-nix",
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1794127728,
+        "narHash": "sha256-QhZ104DwHvvMxWxmI13zdppISE27UmdqhRI2VwBg/yU=",
+        "ref": "refs/heads/master",
+        "rev": "51c6dc40d18552701f7c5c62e3f7a5fc899f7132",
+        "shallow": true,
+        "type": "git",
+        "url": "https://github.com/oxalica/rust-overlay"
+      },
+      "original": {
+        "shallow": true,
+        "type": "git",
+        "url": "https://github.com/oxalica/rust-overlay"
+      }
+    },
+    "tas-nix": {
+      "inputs": {
+        "advisory-db": "advisory-db",
+        "crane": "crane",
+        "nixpkgs": "nixpkgs",
+        "rust-overlay": "rust-overlay"
+      },
+      "locked": {
+        "dir": "nix",
+        "lastModified": 1794529679,
+        "narHash": "sha256-fLqG7WXOrdX7RwDvTVCO68nandNwZYKtCmxuLx/cHUA=",
+        "ref": "claude/confident-hamilton-u5lcc4-pins-init",
+        "rev": "247943bcaf1e537885aa4dd9aeb363c670888e10",
+        "shallow": true,
+        "type": "git",
+        "url": "https://github.com/Ptyktos/caretaker"
+      },
+      "original": {
+        "dir": "nix",
+        "ref": "claude/confident-hamilton-u5lcc4-pins-init",
+        "rev": "247943bcaf1e537885aa4dd9aeb363c670888e10",
+        "shallow": true,
+        "type": "git",
+        "url": "https://github.com/Ptyktos/caretaker"
+      }
+    },
+    "wirefold": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1794541123,
+        "narHash": "sha256-fUjibaGYOadK5wSEJ1FAQR4G0gfskZdpWG8J2BfOCIc=",
+        "ref": "refs/heads/main",
+        "rev": "ed1ffdf4d34a86ab60e128ea14d2475e57650946",
+        "shallow": true,
+        "type": "git",
+        "url": "https://github.com/webfold-ai/wirefold"
+      },
+      "original": {
+        "rev": "ed1ffdf4d34a86ab60e128ea14d2475e57650946",
+        "shallow": true,
+        "type": "git",
+        "url": "https://github.com/webfold-ai/wirefold"
+      }
+    }
+  },
+  "root": "root",
+  "version": 7
+}

@@ -1,0 +1,74 @@
+# One replica, on purpose. Each instance keeps its own records and `RelayClient::publish` returns as
+# soon as ONE relay accepts, so two replicas behind one Service would each hold part of the data. To
+# run more than one, list each by its own address in PKARR_RELAYS (clients resolve across all of them
+# and keep the highest sequence number), and have publishers write to every one.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: meshd
+spec:
+  serviceName: meshd
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: meshd
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: meshd
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      terminationGracePeriodSeconds: 15
+      containers:
+        - name: meshd
+          image: meshd
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - configMapRef:
+                name: meshd
+          ports:
+            - { name: relay, containerPort: 6881, protocol: TCP }
+            - { name: dns-udp, containerPort: 5353, protocol: UDP }
+            - { name: dns-tcp, containerPort: 5353, protocol: TCP }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities:
+              drop: ["ALL"]
+          # GET /health: the relay is up and the store is readable. Probing over HTTP means the
+          # probe does not depend on where the image keeps the binary.
+          startupProbe:
+            httpGet: { path: /health, port: relay }
+            periodSeconds: 2
+            failureThreshold: 30
+          readinessProbe:
+            httpGet: { path: /health, port: relay }
+            periodSeconds: 5
+            timeoutSeconds: 3
+          livenessProbe:
+            httpGet: { path: /health, port: relay }
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            requests: { cpu: 25m, memory: 32Mi }
+            limits: { memory: 256Mi }
+          volumeMounts:
+            - { name: data, mountPath: /var/lib/meshd }
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 1Gi

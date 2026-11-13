@@ -1,0 +1,22 @@
+# Reads are open by design and `RelayClient` cannot send credentials, so who may reach meshd IS the
+# access control. Only pods labelled `mesh.ptyktos.dev/client: "true"` in this namespace may connect,
+# and meshd makes no outbound connections at all.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: meshd
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: meshd
+  policyTypes: ["Ingress", "Egress"]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              mesh.ptyktos.dev/client: "true"
+      ports:
+        - { protocol: TCP, port: 6881 }
+        - { protocol: UDP, port: 5353 }
+        - { protocol: TCP, port: 5353 }
+  egress: []

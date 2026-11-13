@@ -46,7 +46,7 @@ bind-edge-dns = ["native"]
 # bedrock's ops.rs) is what `federation`'s 5 cfg sites in dialkey.rs were waiting on.
 
 [dependencies]
-tokio = { version = "1", features = ["net", "io-util", "time", "rt", "rt-multi-thread", "macros", "sync"], optional = true }
+tokio = { version = "1", features = ["net", "io-util", "time", "rt", "rt-multi-thread", "macros", "sync", "signal"], optional = true }
 # aws-lc-rs is rustls' default provider (and what its `fips` feature builds on). `ring` is no longer
 # enabled: every provider this crate installs or builds is aws-lc-rs.
 rustls = { version = "0.23", optional = true }
@@ -74,7 +74,7 @@ flate2 = { version = "1", optional = true }
 # is now a thin re-export.
 # Pinned by rev: an unpinned entry would resolve to relayfold's default branch, and a consumer that also names
 # relayfold must use this exact rev or the graph holds two relayfolds. b50b9e1 is relayfold on wirefold/apeiron.
-relayfold = { git = "https://github.com/Ptyktos/relayfold", rev = "97da63666768d695fd9b009f3ccb6eaa0359c374" }
+relayfold = { git = "https://github.com/Ptyktos/relayfold", rev = "69084250929ca64f526ee86007e0a7f3ef402c32" }
 pkarr = { version = "8.0.1", optional = true }
 
 # The unit tests of modules that are always compiled (`edge_verify`, `edge_proxy`) drive async code with
@@ -84,6 +84,11 @@ pkarr = { version = "8.0.1", optional = true }
 tokio = { version = "1", features = ["rt", "macros"] }
 # Real certificates for the SNI-resolver and handshake tests (keys_match rejects fabricated pairs).
 rcgen = "0.13"
+
+[[bin]]
+name = "meshd"
+path = "src/bin/meshd.rs"
+required-features = ["native"]
 
 [[bin]]
 name = "syncfold"

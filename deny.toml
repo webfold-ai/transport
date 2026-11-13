@@ -1,0 +1,64 @@
+# transport's cargo-deny policy: the shared default (ptyktos/caretaker, nix/lib/deny.default.toml) plus
+# the two reviewed exceptions below. It REPLACES the default, so it carries a copy of it; the audit gate
+# reads the advisory ignores from here too (one list, in one reviewed file). `all-features = true`, so
+# the checks also cover optional features that `meshd` does not build.
+#
+# Exceptions (each has a reason and a condition for removing it):
+#
+#   licenses: OpenSSL for `aws-lc-fips-sys` only. It is pulled in by the opt-in `fips` feature
+#     (`aws-lc-rs/fips`), whose bundled AWS-LC FIPS module carries the OpenSSL licence. Neither the
+#     default build nor `meshd` enables it. Remove if the fips feature is dropped.
+#
+#   advisories: RUSTSEC-2026-0253, `lru` 0.16.4 `LruCache::pop()` is unsound (potential use after
+#     free). It comes from `mainline` 8.0.0 via `pkarr`, behind the opt-in `federation` feature, which
+#     `meshd` does not build and nothing in this crate calls. There is no compatible fix (it is an
+#     older major than the current `lru`). Remove when `pkarr`/`mainline` move to a fixed `lru`.
+
+[graph]
+all-features = true
+
+[advisories]
+yanked = "deny"
+ignore = ["RUSTSEC-2026-0253"]
+
+[licenses]
+version = 2
+allow = [
+    "Apache-2.0",
+    "MIT",
+    "MIT-0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-DFS-2016",
+    "Unicode-3.0",
+    "MPL-2.0",
+    "Zlib",
+    "CC0-1.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "CDLA-Permissive-2.0",
+    "AGPL-3.0-or-later",
+]
+exceptions = [
+    { crate = "aws-lc-fips-sys", allow = ["OpenSSL"] },
+]
+confidence-threshold = 0.93
+# Workspace crates with `publish = false` need no licence field to pass.
+private = { ignore = true }
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+highlight = "all"
+deny = [
+    { crate = "native-tls", reason = "use rustls instead" },
+    { crate = "openssl", reason = "use rustls instead" },
+    { crate = "openssl-sys", reason = "use rustls instead" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

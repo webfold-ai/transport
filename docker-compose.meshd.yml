@@ -1,0 +1,46 @@
+# meshd on its own:
+#
+#   GH_TOKEN=... docker compose -f docker-compose.meshd.yml up -d --build
+#
+# Services that should use it set  PKARR_RELAYS=http://meshd:6881  (see transport::pkarr::RelayClient::from_env)
+# and resolve each other as DNS under MESHD_ZONE, e.g. _billing._tcp.<key>.mesh.internal.
+#
+# Ports are bound to loopback. Reads are open by design and RelayClient cannot send credentials, so
+# who may publish is decided by MESHD_ALLOW_KEYS_FILE and by where these ports are reachable: put
+# them on a private interface (change the host side below), never on a public one.
+name: tas-mesh
+
+services:
+  meshd:
+    build:
+      context: .
+      secrets: [gh_token]
+    image: meshd:local
+    restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    ports:
+      - "127.0.0.1:6881:6881"
+      - "127.0.0.1:5353:5353/udp"
+      - "127.0.0.1:5353:5353/tcp"
+    volumes:
+      - meshd-data:/var/lib/meshd
+      # To close publishing to a set of keys, mount a file of z-base-32 keys (one per line) and set
+      # MESHD_ALLOW_KEYS_FILE below:
+      # - ./allowed-keys.txt:/etc/meshd/allowed-keys.txt:ro
+    environment:
+      MESHD_ZONE: mesh.internal
+      # MESHD_ALLOW_KEYS_FILE: /etc/meshd/allowed-keys.txt
+      # MESHD_MAX_AGE_SECS: "86400"   # unset keeps a record until it is replaced
+      # MESHD_MAX_KEYS: "100000"
+    logging:
+      driver: json-file
+      options: { max-size: "20m", max-file: "5" }
+
+secrets:
+  gh_token:
+    environment: GH_TOKEN
+
+volumes:
+  meshd-data:
