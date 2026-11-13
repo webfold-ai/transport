@@ -67,16 +67,16 @@
     "relayfold": {
       "flake": false,
       "locked": {
-        "lastModified": 1794545361,
-        "narHash": "sha256-iUo40K7IP/nTZf1/Y8p1R3mf3GaOxB9GM9MTOAqKkjs=",
+        "lastModified": 1794546536,
+        "narHash": "sha256-Q2dnAoFJQcfBxsC9fwTQYJlYtQW+p2oFWmuDkSL988c=",
         "ref": "refs/heads/main",
-        "rev": "4b10281c85e66a47e39e178a2e7c818f4d2c6439",
+        "rev": "afed0355a5b51777b085473a29720d35ecdf671d",
         "shallow": true,
         "type": "git",
         "url": "https://github.com/Ptyktos/relayfold"
       },
       "original": {
-        "rev": "4b10281c85e66a47e39e178a2e7c818f4d2c6439",
+        "rev": "afed0355a5b51777b085473a29720d35ecdf671d",
         "shallow": true,
         "type": "git",
         "url": "https://github.com/Ptyktos/relayfold"
@@ -141,16 +141,16 @@
     "wirefold": {
       "flake": false,
       "locked": {
-        "lastModified": 1794544881,
-        "narHash": "sha256-6NSijAn8TqYqNBGB5uXqZttBibnQe5X4v7pX8uroo50=",
+        "lastModified": 1794546295,
+        "narHash": "sha256-XPHJLlKGkFCh1jKiEZBu0fI8Z3HqVnYpf1BundwyKxU=",
         "ref": "refs/heads/main",
-        "rev": "e4fde11d9e7258ab017d0427024d7c272daa26f2",
+        "rev": "98df8bfb8051fb24ca43ce3ddc446641684ef8f9",
         "shallow": true,
         "type": "git",
         "url": "https://github.com/webfold-ai/wirefold"
       },
       "original": {
-        "rev": "e4fde11d9e7258ab017d0427024d7c272daa26f2",
+        "rev": "98df8bfb8051fb24ca43ce3ddc446641684ef8f9",
         "shallow": true,
         "type": "git",
         "url": "https://github.com/webfold-ai/wirefold"
