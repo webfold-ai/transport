@@ -302,6 +302,30 @@ fn the_store_is_bounded_but_an_existing_key_can_always_update() {
 }
 
 #[test]
+fn a_store_above_the_configured_limit_is_refused_at_startup_not_served_oversized() {
+    let dir = std::env::temp_dir().join(format!("meshd-limit-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    {
+        let (store, _) = RelayStore::open(&dir, Limits::default()).unwrap();
+        for k in ["a", "b", "c"] {
+            let key = native_keypair(k).public_key();
+            let rec = build_packet(k, IP, &[billing(1)], 1)
+                .unwrap()
+                .to_relay_bytes();
+            store.put(&key, &rec, 0).unwrap();
+        }
+    }
+    let lowered = Limits {
+        max_keys: 2,
+        ..Limits::default()
+    };
+    let err = RelayStore::open(&dir, lowered).err().expect("refused");
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData, "{err}");
+    assert!(RelayStore::open(&dir, Limits::default()).is_ok());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn records_expire_when_a_max_age_is_set_and_never_when_it_is_not() {
     let rec = |seq| {
         build_packet("e", IP, &[billing(1)], seq)
@@ -476,6 +500,12 @@ fn negative_answers_carry_the_soa_and_say_which_kind() {
         nodata.answers.is_empty() && soa(&nodata),
         "the name exists, the type does not"
     );
+
+    // `_tcp.<key>` has nothing at it but is the parent of a published service: an empty
+    // non-terminal is NODATA, or a resolver caching NXDOMAIN for the subtree hides the service.
+    let ent = ask(&zone, &format!("_tcp.{key}.mesh.internal"), RecordType::Srv);
+    assert_eq!(ent.flags.response_code, ResponseCode::NoError);
+    assert!(ent.answers.is_empty() && soa(&ent));
 
     for name in [
         format!("{}.mesh.internal", z32("never-published")),

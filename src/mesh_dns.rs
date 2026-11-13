@@ -167,14 +167,37 @@ impl MeshZone {
         let records = packet.records();
         let here: Vec<&Record> = records.iter().filter(|r| r.name == owner).collect();
         if here.is_empty() {
-            return negative(reply, ResponseCode::NxDomain);
+            // An empty non-terminal (`_tcp.<key>` above `_billing._tcp.<key>`) exists: NODATA, not
+            // NXDOMAIN, or a resolver caching the NXDOMAIN for the subtree hides the real service.
+            let ol = owner.labels();
+            let ancestor = records.iter().any(|r| {
+                let rl = r.name.labels();
+                rl.len() > ol.len()
+                    && rl[rl.len() - ol.len()..]
+                        .iter()
+                        .zip(ol)
+                        .all(|(a, b)| a.eq_ignore_ascii_case(b))
+            });
+            return if ancestor {
+                reply.authorities.push(self.soa.clone());
+            } else {
+                negative(reply, ResponseCode::NxDomain)
+            };
         }
         let wanted = |t: RecordType| q.qtype == RecordType::Unknown(255) || q.qtype == t;
         for r in here.iter().filter(|r| wanted(r.data.record_type())) {
             reply.answers.push(self.qualify(r));
             // An SRV is useless without the address of its target; supply it.
             if let RData::Srv { target, .. } = &r.data {
-                for extra in records.iter().filter(|x| x.name == *target) {
+                // Only addresses under the key that signed this packet: a publisher may name another
+                // key's service as its target, but must not vouch for that key's addresses.
+                let own = |n: &Name| {
+                    n.labels()
+                        .last()
+                        .zip(prefix.last())
+                        .is_some_and(|(a, b)| a.eq_ignore_ascii_case(b))
+                };
+                for extra in records.iter().filter(|x| x.name == *target && own(&x.name)) {
                     if matches!(extra.data, RData::A(_) | RData::Aaaa(_)) {
                         reply.additionals.push(self.qualify(extra));
                     }

@@ -72,11 +72,22 @@ fn allow_list(path: &str) -> Result<HashSet<[u8; 32]>, String> {
 async fn healthcheck() -> bool {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let bind = env("MESHD_HTTP_BIND").unwrap_or_else(|| "0.0.0.0:6881".into());
-    let port = bind.rsplit(':').next().unwrap_or("6881");
+    // Probe the address meshd really listens on; only a wildcard bind is probed on loopback.
+    let target = match bind.parse::<std::net::SocketAddr>() {
+        Ok(mut a) => {
+            if a.ip().is_unspecified() {
+                a.set_ip(if a.is_ipv4() {
+                    std::net::Ipv4Addr::LOCALHOST.into()
+                } else {
+                    std::net::Ipv6Addr::LOCALHOST.into()
+                });
+            }
+            a.to_string()
+        }
+        Err(_) => format!("127.0.0.1:{}", bind.rsplit(':').next().unwrap_or("6881")),
+    };
     let attempt = async {
-        let mut s = tokio::net::TcpStream::connect(format!("127.0.0.1:{port}"))
-            .await
-            .ok()?;
+        let mut s = tokio::net::TcpStream::connect(target).await.ok()?;
         s.write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n")
             .await
             .ok()?;

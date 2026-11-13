@@ -160,6 +160,17 @@ impl RelayStore {
                 None => report.skipped += 1,
             }
         }
+        if map.len() > limits.max_keys {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "{} holds {} records, above the configured limit of {}; raise the limit or remove records",
+                    dir.display(),
+                    map.len(),
+                    limits.max_keys
+                ),
+            ));
+        }
         Ok((
             RelayStore {
                 limits,

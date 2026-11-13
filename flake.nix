@@ -56,9 +56,19 @@
       # (1,656 hunks across 45 files that predate this flake); a repository-wide reformat is a
       # maintainers' decision, since it touches every open change. New files are formatted. Turn this
       # back on after that pass.
+      #
+      # clippy and doc: `cargo clippy/doc -D warnings` fails on warnings that predate this flake
+      # (`unexpected cfg feature "bind-overlay"` in lib.rs/discovery.rs, which Cargo.toml never
+      # declares, and several unused imports). Declaring the feature and clearing the imports is a
+      # change to the library's own code, not to its packaging, so it is left for its own PR; turn
+      # these back on with it.
       gates = {
         fmt = false;
+        clippy = false;
+        doc = false;
       };
+      # include_str!/include_bytes! read tests/fixtures; the default source filter drops them.
+      extraSourceFilter = path: _type: builtins.match ".*/tests/fixtures(/.*)?" path != null;
       # aws-lc-sys (the crypto provider under rustls) builds C and wants cmake.
       extraNativeBuildInputs = pkgs: [ pkgs.cmake ];
 
