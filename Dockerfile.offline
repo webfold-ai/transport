@@ -1,0 +1,23 @@
+# syntax=docker/dockerfile:1.7
+# meshd built from `cargo vendor` output: no network and no token at build time.
+#   cargo vendor vendor > .cargo/config.toml   # once, where the private git dependencies are reachable
+#   docker build -f Dockerfile.offline -t meshd:local .
+ARG RUST_VERSION=1.97
+
+FROM rust:${RUST_VERSION}-bookworm AS build
+RUN apt-get update && apt-get install -y --no-install-recommends cmake && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+COPY . .
+RUN cargo build --release --offline --locked --bin meshd \
+ && install -D target/release/meshd /out/meshd \
+ && install -d -m 0750 /out/data
+
+FROM gcr.io/distroless/cc-debian12:nonroot AS runtime
+COPY --from=build /out/meshd /usr/local/bin/meshd
+COPY --from=build --chown=65532:65532 /out/data /var/lib/meshd
+ENV MESHD_HTTP_BIND=0.0.0.0:6881 MESHD_DNS_BIND=0.0.0.0:5353 MESHD_DATA_DIR=/var/lib/meshd MESHD_ZONE=mesh.internal
+EXPOSE 6881/tcp 5353/udp 5353/tcp
+VOLUME ["/var/lib/meshd"]
+USER nonroot
+HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 CMD ["/usr/local/bin/meshd", "--healthcheck"]
+ENTRYPOINT ["/usr/local/bin/meshd"]
