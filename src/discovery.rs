@@ -14,12 +14,12 @@
 //! - **self** = the directory itself (the merged view — the medium turned on itself)
 
 use super::{PeerAddr, PeerId};
-use apeiron::map::hashtrinity::Table;
 use apeiron::map::hashtrinity::crypto::to_hex;
+use apeiron::map::hashtrinity::Table;
 use std::time::Duration;
 
 #[cfg(feature = "bind-overlay")]
-use iroh::{EndpointAddr, EndpointId, address_lookup::memory::MemoryLookup};
+use iroh::{address_lookup::memory::MemoryLookup, EndpointAddr, EndpointId};
 #[cfg(feature = "bind-overlay")]
 use std::sync::{Arc, RwLock};
 
@@ -59,6 +59,8 @@ impl std::fmt::Display for ComputeKind {
 }
 
 impl ComputeKind {
+    // Infallible (unknown strings map to a variant), so it is not a `FromStr` impl.
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Self {
         match s {
             "cpu" => ComputeKind::Cpu,
@@ -243,15 +245,27 @@ impl BootstrapDirectory {
     pub fn remove(&self, peer_id: PeerId) -> Option<EndpointAddr> {
         let endpoint_id = EndpointId::from_bytes(&peer_id).ok()?;
         self.lookup.remove_endpoint_info(endpoint_id);
-        self.peers.write().expect("poisoned").remove(&Self::key_for(peer_id))
+        self.peers
+            .write()
+            .expect("poisoned")
+            .remove(&Self::key_for(peer_id))
     }
 
     pub fn get(&self, peer_id: PeerId) -> Option<EndpointAddr> {
-        self.peers.read().expect("poisoned").get(&Self::key_for(peer_id)).cloned()
+        self.peers
+            .read()
+            .expect("poisoned")
+            .get(&Self::key_for(peer_id))
+            .cloned()
     }
 
     pub fn all(&self) -> Vec<EndpointAddr> {
-        self.peers.read().expect("poisoned").iter().map(|(_, endpoint)| endpoint.clone()).collect()
+        self.peers
+            .read()
+            .expect("poisoned")
+            .iter()
+            .map(|(_, endpoint)| endpoint.clone())
+            .collect()
     }
 
     pub fn seed_lookup(&self, endpoint: impl Into<EndpointAddr>) {
@@ -318,19 +332,29 @@ impl PeerDirectory {
     #[must_use]
     pub fn all_peers(&self) -> Vec<&PeerCapability> {
         let cutoff = std::time::Instant::now() - self.stale_ttl;
-        self.peers.iter().filter(|(_, c)| c.last_seen >= cutoff).map(|(_, c)| c).collect()
+        self.peers
+            .iter()
+            .filter(|(_, c)| c.last_seen >= cutoff)
+            .map(|(_, c)| c)
+            .collect()
     }
 
     /// Peers that have the specified capability string (e.g. "GBM", "CountLM").
     #[must_use]
     pub fn capable_of(&self, capability: &str) -> Vec<&PeerCapability> {
-        self.all_peers().into_iter().filter(|c| c.capabilities.iter().any(|cap| cap == capability)).collect()
+        self.all_peers()
+            .into_iter()
+            .filter(|c| c.capabilities.iter().any(|cap| cap == capability))
+            .collect()
     }
 
     /// Peers that have a specific model loaded.
     #[must_use]
     pub fn with_model(&self, model_id: &str) -> Vec<&PeerCapability> {
-        self.all_peers().into_iter().filter(|c| c.models_loaded.iter().any(|m| m == model_id)).collect()
+        self.all_peers()
+            .into_iter()
+            .filter(|c| c.models_loaded.iter().any(|m| m == model_id))
+            .collect()
     }
 
     /// Merge an inbound capability from any discovery source — freshest last_seen wins.
@@ -399,22 +423,47 @@ pub fn parse_capability_attributes(
     attrs: &std::collections::HashMap<String, String>,
 ) -> Option<PeerCapability> {
     let label = attrs.get("label").cloned().unwrap_or_default();
-    let total_ram = attrs.get("total_ram").and_then(|v| v.parse().ok()).unwrap_or(0);
-    let free_ram = attrs.get("free_ram").and_then(|v| v.parse().ok()).unwrap_or(0);
-    let total_vram = attrs.get("total_vram").and_then(|v| v.parse().ok()).unwrap_or(0);
-    let free_vram = attrs.get("free_vram").and_then(|v| v.parse().ok()).unwrap_or(0);
+    let total_ram = attrs
+        .get("total_ram")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let free_ram = attrs
+        .get("free_ram")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let total_vram = attrs
+        .get("total_vram")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let free_vram = attrs
+        .get("free_vram")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
     let compute_kind = attrs
         .get("compute")
         .map(|v| ComputeKind::from_str(v))
         .unwrap_or(ComputeKind::Unknown);
-    let load = attrs.get("load").and_then(|v| v.parse().ok()).unwrap_or(0.0);
+    let load = attrs
+        .get("load")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0.0);
     let models_loaded = attrs
         .get("models")
-        .map(|v| v.split(',').filter(|s| !s.is_empty()).map(|s| s.to_string()).collect())
+        .map(|v| {
+            v.split(',')
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .collect()
+        })
         .unwrap_or_default();
     let capabilities = attrs
         .get("caps")
-        .map(|v| v.split(',').filter(|s| !s.is_empty()).map(|s| s.to_string()).collect())
+        .map(|v| {
+            v.split(',')
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .collect()
+        })
         .unwrap_or_default();
     Some(PeerCapability {
         peer_id,
@@ -471,8 +520,11 @@ mod tests {
             source: DiscoverySource::Direct,
             last_seen: std::time::Instant::now(),
         };
-        let attrs: std::collections::HashMap<String, String> = capability_attributes(&cap).into_iter().collect();
-        let parsed = parse_capability_attributes(peer_id, cap.addr.clone(), DiscoverySource::Direct, &attrs).unwrap();
+        let attrs: std::collections::HashMap<String, String> =
+            capability_attributes(&cap).into_iter().collect();
+        let parsed =
+            parse_capability_attributes(peer_id, cap.addr.clone(), DiscoverySource::Direct, &attrs)
+                .unwrap();
         assert_eq!(parsed.label, cap.label);
         assert_eq!(parsed.total_vram, cap.total_vram);
         assert_eq!(parsed.free_vram, cap.free_vram);
@@ -488,8 +540,10 @@ mod tests {
             peer_id,
             addr: None,
             label: "old".into(),
-            total_ram: 0, free_ram: 0,
-            total_vram: 0, free_vram: 0,
+            total_ram: 0,
+            free_ram: 0,
+            total_vram: 0,
+            free_vram: 0,
             compute_kind: ComputeKind::Cpu,
             models_loaded: vec![],
             capabilities: vec![],
@@ -498,9 +552,13 @@ mod tests {
             last_seen: std::time::Instant::now() - Duration::from_secs(60),
         };
         let new = PeerCapability {
-            peer_id, addr: None, label: "new".into(),
-            total_ram: 0, free_ram: 0,
-            total_vram: 0, free_vram: 0,
+            peer_id,
+            addr: None,
+            label: "new".into(),
+            total_ram: 0,
+            free_ram: 0,
+            total_vram: 0,
+            free_vram: 0,
             compute_kind: ComputeKind::Cpu,
             models_loaded: vec!["gbm-v1".into()],
             capabilities: vec!["GBM".into()],
@@ -522,9 +580,13 @@ mod tests {
     fn directory_does_not_merge_older_entry() {
         let peer_id = [1u8; 32];
         let now = PeerCapability {
-            peer_id, addr: None, label: "now".into(),
-            total_ram: 0, free_ram: 0,
-            total_vram: 0, free_vram: 0,
+            peer_id,
+            addr: None,
+            label: "now".into(),
+            total_ram: 0,
+            free_ram: 0,
+            total_vram: 0,
+            free_vram: 0,
             compute_kind: ComputeKind::Cpu,
             models_loaded: vec!["gbm-v1".into()],
             capabilities: vec!["GBM".into()],
@@ -533,9 +595,13 @@ mod tests {
             last_seen: std::time::Instant::now(),
         };
         let older = PeerCapability {
-            peer_id, addr: None, label: "older".into(),
-            total_ram: 0, free_ram: 0,
-            total_vram: 0, free_vram: 0,
+            peer_id,
+            addr: None,
+            label: "older".into(),
+            total_ram: 0,
+            free_ram: 0,
+            total_vram: 0,
+            free_vram: 0,
             compute_kind: ComputeKind::Cpu,
             models_loaded: vec![],
             capabilities: vec![],
@@ -554,23 +620,33 @@ mod tests {
     fn capable_of_filters_by_capability_string() {
         let mut dir = PeerDirectory::new();
         dir.add_peer(PeerCapability {
-            peer_id: [1u8; 32], addr: None, label: "a".into(),
-            total_ram: 0, free_ram: 0,
-            total_vram: 0, free_vram: 0,
+            peer_id: [1u8; 32],
+            addr: None,
+            label: "a".into(),
+            total_ram: 0,
+            free_ram: 0,
+            total_vram: 0,
+            free_vram: 0,
             compute_kind: ComputeKind::Cpu,
             models_loaded: vec![],
             capabilities: vec!["GBM".into()],
-            load: 0.0, source: DiscoverySource::Direct,
+            load: 0.0,
+            source: DiscoverySource::Direct,
             last_seen: std::time::Instant::now(),
         });
         dir.add_peer(PeerCapability {
-            peer_id: [2u8; 32], addr: None, label: "b".into(),
-            total_ram: 0, free_ram: 0,
-            total_vram: 0, free_vram: 0,
+            peer_id: [2u8; 32],
+            addr: None,
+            label: "b".into(),
+            total_ram: 0,
+            free_ram: 0,
+            total_vram: 0,
+            free_vram: 0,
             compute_kind: ComputeKind::Cpu,
             models_loaded: vec![],
             capabilities: vec!["CountLM".into()],
-            load: 0.0, source: DiscoverySource::Direct,
+            load: 0.0,
+            source: DiscoverySource::Direct,
             last_seen: std::time::Instant::now(),
         });
         assert_eq!(dir.capable_of("GBM").len(), 1);
@@ -587,7 +663,10 @@ mod tests {
         let endpoint_id = identity.public();
         let endpoint = EndpointAddr::from_parts(
             endpoint_id,
-            [TransportAddr::Ip(std::net::SocketAddr::from(([127, 0, 0, 1], 9337)))]
+            [TransportAddr::Ip(std::net::SocketAddr::from((
+                [127, 0, 0, 1],
+                9337,
+            )))],
         );
 
         let bootstrap = BootstrapDirectory::new();
@@ -595,9 +674,14 @@ mod tests {
 
         let lookup = bootstrap.lookup();
         assert!(lookup.get_endpoint_info(endpoint_id).is_some());
-        assert_eq!(bootstrap.get(*endpoint_id.as_bytes()), Some(endpoint.clone()));
+        assert_eq!(
+            bootstrap.get(*endpoint_id.as_bytes()),
+            Some(endpoint.clone())
+        );
 
-        let removed = bootstrap.remove(*endpoint_id.as_bytes()).expect("removed endpoint");
+        let removed = bootstrap
+            .remove(*endpoint_id.as_bytes())
+            .expect("removed endpoint");
         assert_eq!(removed, endpoint);
         assert!(lookup.get_endpoint_info(endpoint_id).is_none());
     }

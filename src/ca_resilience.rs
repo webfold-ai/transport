@@ -41,7 +41,11 @@ use crate::BoxFuture;
 pub type Clock = Arc<dyn Fn() -> i64 + Send + Sync>;
 
 fn system_clock() -> Clock {
-    Arc::new(|| std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX)))
+    Arc::new(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+    })
 }
 
 // ── Alerts ────────────────────────────────────────────────────────────────────────────────
@@ -112,11 +116,23 @@ pub struct AlertLog {
 impl AlertLog {
     pub fn raise(&self, alert: CaAlert) {
         match alert.kind {
-            AlertKind::CaRecovered | AlertKind::StandingChanged => tracing::warn!(kind = alert.kind.as_str(), ca = %alert.ca, detail = %alert.detail, "CA alert"),
-            _ => tracing::error!(kind = alert.kind.as_str(), ca = %alert.ca, detail = %alert.detail, "CA alert"),
+            AlertKind::CaRecovered | AlertKind::StandingChanged => {
+                tracing::warn!(kind = alert.kind.as_str(), ca = %alert.ca, detail = %alert.detail, "CA alert")
+            }
+            _ => {
+                tracing::error!(kind = alert.kind.as_str(), ca = %alert.ca, detail = %alert.detail, "CA alert")
+            }
         }
-        *self.counts.lock().unwrap_or_else(std::sync::PoisonError::into_inner).entry(alert.kind).or_default() += 1;
-        let mut ring = self.ring.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        *self
+            .counts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(alert.kind)
+            .or_default() += 1;
+        let mut ring = self
+            .ring
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if ring.len() == ALERT_RING {
             ring.pop_front();
         }
@@ -126,13 +142,23 @@ impl AlertLog {
     /// The most recent alerts, oldest first.
     #[must_use]
     pub fn recent(&self) -> Vec<CaAlert> {
-        self.ring.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter().cloned().collect()
+        self.ring
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .cloned()
+            .collect()
     }
 
     /// How many alerts of `kind` have been raised since start.
     #[must_use]
     pub fn count(&self, kind: AlertKind) -> u64 {
-        self.counts.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(&kind).copied().unwrap_or(0)
+        self.counts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&kind)
+            .copied()
+            .unwrap_or(0)
     }
 }
 
@@ -159,7 +185,10 @@ impl Journal {
     /// Keep events in memory only (tests).
     #[must_use]
     pub fn memory() -> Self {
-        Journal { path: None, memory: Mutex::new(Vec::new()) }
+        Journal {
+            path: None,
+            memory: Mutex::new(Vec::new()),
+        }
     }
 
     /// Append to `path` (the directory must exist).
@@ -169,7 +198,10 @@ impl Journal {
     pub fn open(path: impl Into<PathBuf>) -> std::io::Result<Self> {
         let path = path.into();
         drop(Self::file(&path)?);
-        Ok(Journal { path: Some(path), memory: Mutex::new(Vec::new()) })
+        Ok(Journal {
+            path: Some(path),
+            memory: Mutex::new(Vec::new()),
+        })
     }
 
     fn file(path: &Path) -> std::io::Result<std::fs::File> {
@@ -184,16 +216,28 @@ impl Journal {
     }
 
     pub fn append(&self, at: i64, event: &str, ca: &str, detail: &str) {
-        let ev = JournalEvent { at, event: event.to_string(), ca: ca.to_string(), detail: detail.chars().take(500).collect() };
+        let ev = JournalEvent {
+            at,
+            event: event.to_string(),
+            ca: ca.to_string(),
+            detail: detail.chars().take(500).collect(),
+        };
         match &self.path {
-            None => self.memory.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(ev),
+            None => self
+                .memory
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(ev),
             Some(path) => {
                 use std::io::Write;
                 if std::fs::metadata(path).is_ok_and(|m| m.len() > JOURNAL_ROTATE_BYTES) {
                     let _ = std::fs::rename(path, path.with_extension("jsonl.1"));
                 }
                 let line = serde_json::to_string(&ev).unwrap_or_default();
-                let written = Self::file(path).and_then(|mut f| f.write_all(format!("{line}\n").as_bytes()).and_then(|()| f.sync_data()));
+                let written = Self::file(path).and_then(|mut f| {
+                    f.write_all(format!("{line}\n").as_bytes())
+                        .and_then(|()| f.sync_data())
+                });
                 if let Err(e) = written {
                     tracing::error!(error = %e, "could not write the CA journal");
                 }
@@ -205,8 +249,16 @@ impl Journal {
     #[must_use]
     pub fn recent(&self, n: usize) -> Vec<JournalEvent> {
         let all: Vec<JournalEvent> = match &self.path {
-            None => self.memory.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone(),
-            Some(p) => std::fs::read_to_string(p).unwrap_or_default().lines().filter_map(|l| serde_json::from_str(l).ok()).collect(),
+            None => self
+                .memory
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
+            Some(p) => std::fs::read_to_string(p)
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|l| serde_json::from_str(l).ok())
+                .collect(),
         };
         let skip = all.len().saturating_sub(n);
         all.into_iter().skip(skip).collect()
@@ -226,7 +278,10 @@ pub struct AccountBook {
 impl AccountBook {
     #[must_use]
     pub fn memory() -> Self {
-        AccountBook { path: None, map: Mutex::new(HashMap::new()) }
+        AccountBook {
+            path: None,
+            map: Mutex::new(HashMap::new()),
+        }
     }
 
     /// Load (or start) the book at `path`.
@@ -237,21 +292,33 @@ impl AccountBook {
     pub fn open(path: impl Into<PathBuf>) -> Result<Self, String> {
         let path = path.into();
         let map = match std::fs::read_to_string(&path) {
-            Ok(text) => serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?,
+            Ok(text) => {
+                serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
             Err(e) => return Err(format!("{}: {e}", path.display())),
         };
-        Ok(AccountBook { path: Some(path), map: Mutex::new(map) })
+        Ok(AccountBook {
+            path: Some(path),
+            map: Mutex::new(map),
+        })
     }
 
     #[must_use]
     pub fn get(&self, ca: &str) -> Option<String> {
-        self.map.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(ca).cloned()
+        self.map
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(ca)
+            .cloned()
     }
 
     #[must_use]
     pub fn all(&self) -> HashMap<String, String> {
-        self.map.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+        self.map
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// Record the account the CA gave us. `Ok(true)` if that is new information.
@@ -261,17 +328,24 @@ impl AccountBook {
     pub fn learn(&self, entry: &CaEntry, uri: &str) -> Result<bool, String> {
         if let Some(pinned) = &entry.account_uri {
             if pinned != uri {
-                return Err(format!("CA '{}' registered us as {uri}, but the policy pins {pinned}", entry.name));
+                return Err(format!(
+                    "CA '{}' registered us as {uri}, but the policy pins {pinned}",
+                    entry.name
+                ));
             }
         }
-        let mut map = self.map.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut map = self
+            .map
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if map.get(&entry.name).is_some_and(|u| u == uri) {
             return Ok(false);
         }
         map.insert(entry.name.clone(), uri.to_string());
         if let Some(path) = &self.path {
             let body = serde_json::to_vec_pretty(&*map).map_err(|e| e.to_string())?;
-            crate::certkey::write_private_atomic(path, &body).map_err(|e| format!("{}: {e}", path.display()))?;
+            crate::certkey::write_private_atomic(path, &body)
+                .map_err(|e| format!("{}: {e}", path.display()))?;
         }
         Ok(true)
     }
@@ -302,7 +376,11 @@ pub struct Ledger {
 impl Ledger {
     #[must_use]
     pub fn memory() -> Self {
-        Ledger { path: None, map: Mutex::new((HashMap::new(), VecDeque::new())), serials: Mutex::new(VecDeque::new()) }
+        Ledger {
+            path: None,
+            map: Mutex::new((HashMap::new(), VecDeque::new())),
+            serials: Mutex::new(VecDeque::new()),
+        }
     }
 
     /// Load (or start) the ledger at `path`. Unreadable lines are skipped: the ledger is a hint
@@ -315,7 +393,10 @@ impl Ledger {
         let mut state = (HashMap::new(), VecDeque::new());
         let mut serials = VecDeque::new();
         if let Ok(text) = std::fs::read_to_string(&path) {
-            for line in text.lines().filter_map(|l| serde_json::from_str::<LedgerLine>(l).ok()) {
+            for line in text
+                .lines()
+                .filter_map(|l| serde_json::from_str::<LedgerLine>(l).ok())
+            {
                 if !line.serial.is_empty() {
                     serials.push_back(line.serial.clone());
                 }
@@ -326,7 +407,11 @@ impl Ledger {
             serials.pop_front();
         }
         drop(Journal::file(&path)?);
-        Ok(Ledger { path: Some(path), map: Mutex::new(state), serials: Mutex::new(serials) })
+        Ok(Ledger {
+            path: Some(path),
+            map: Mutex::new(state),
+            serials: Mutex::new(serials),
+        })
     }
 
     fn insert(state: &mut (HashMap<String, String>, VecDeque<String>), cert: String, ca: String) {
@@ -341,17 +426,38 @@ impl Ledger {
     }
 
     fn id(material: &CertMaterial) -> Option<String> {
-        crate::x509::leaf_der(&material.chain_pem).map(|d| crate::x509::fingerprint_hex(&d)).or_else(|| Some(crate::x509::fingerprint_hex(material.chain_pem.as_bytes())))
+        crate::x509::leaf_der(&material.chain_pem)
+            .map(|d| crate::x509::fingerprint_hex(&d))
+            .or_else(|| Some(crate::x509::fingerprint_hex(material.chain_pem.as_bytes())))
     }
 
     pub fn record(&self, material: &CertMaterial, ca: &str, at: i64) {
-        let Some(cert) = Self::id(material) else { return };
+        let Some(cert) = Self::id(material) else {
+            return;
+        };
         let serial = crate::x509::leaf_der(&material.chain_pem)
-            .and_then(|d| crate::x509::parse(&d).map(|c| c.serial.iter().map(|b| format!("{b:02x}")).collect::<String>()))
+            .and_then(|d| {
+                crate::x509::parse(&d).map(|c| {
+                    c.serial
+                        .iter()
+                        .map(|b| format!("{b:02x}"))
+                        .collect::<String>()
+                })
+            })
             .unwrap_or_default();
-        Self::insert(&mut self.map.lock().unwrap_or_else(std::sync::PoisonError::into_inner), cert.clone(), ca.to_string());
+        Self::insert(
+            &mut self
+                .map
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            cert.clone(),
+            ca.to_string(),
+        );
         if !serial.is_empty() {
-            let mut s = self.serials.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut s = self
+                .serials
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             s.push_back(serial.clone());
             while s.len() > LEDGER_MAX {
                 s.pop_front();
@@ -359,8 +465,16 @@ impl Ledger {
         }
         if let Some(path) = &self.path {
             use std::io::Write;
-            let line = serde_json::to_string(&LedgerLine { cert, ca: ca.to_string(), at, serial }).unwrap_or_default();
-            if let Err(e) = Journal::file(path).and_then(|mut f| f.write_all(format!("{line}\n").as_bytes())) {
+            let line = serde_json::to_string(&LedgerLine {
+                cert,
+                ca: ca.to_string(),
+                at,
+                serial,
+            })
+            .unwrap_or_default();
+            if let Err(e) =
+                Journal::file(path).and_then(|mut f| f.write_all(format!("{line}\n").as_bytes()))
+            {
                 tracing::warn!(error = %e, "could not append to the CA ledger");
             }
         }
@@ -369,13 +483,23 @@ impl Ledger {
     /// Serial numbers (hex) of every certificate recorded, most recent last.
     #[must_use]
     pub fn serials(&self) -> Vec<String> {
-        self.serials.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter().cloned().collect()
+        self.serials
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .cloned()
+            .collect()
     }
 
     #[must_use]
     pub fn lookup(&self, material: &CertMaterial) -> Option<String> {
         let id = Self::id(material)?;
-        self.map.lock().unwrap_or_else(std::sync::PoisonError::into_inner).0.get(&id).cloned()
+        self.map
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .0
+            .get(&id)
+            .cloned()
     }
 }
 
@@ -444,12 +568,22 @@ impl CaConnector for AcmeCaConnector {
     fn connect<'a>(&'a self, ca: &'a CaEntry) -> BoxFuture<'a, Result<Connected, AcmeError>> {
         Box::pin(async move {
             let local = |m: String| AcmeError::Local(format!("CA '{}': {m}", ca.name));
-            let key_file = ca.account_key_file.as_deref().ok_or_else(|| local("the policy entry has no account_key_file".into()))?;
-            let account = crate::acme::load_or_create_account_key_with(Path::new(key_file), self.options.keygen.as_ref())?;
+            let key_file = ca
+                .account_key_file
+                .as_deref()
+                .ok_or_else(|| local("the policy entry has no account_key_file".into()))?;
+            let account = crate::acme::load_or_create_account_key_with(
+                Path::new(key_file),
+                self.options.keygen.as_ref(),
+            )?;
             let eab = match &ca.eab {
                 Some(e) => {
-                    let key = std::fs::read_to_string(&e.hmac_key_file).map_err(|err| local(format!("{}: {err}", e.hmac_key_file)))?;
-                    Some(crate::acme::ExternalAccountBinding::from_base64url(e.kid.clone(), &key)?)
+                    let key = std::fs::read_to_string(&e.hmac_key_file)
+                        .map_err(|err| local(format!("{}: {err}", e.hmac_key_file)))?;
+                    Some(crate::acme::ExternalAccountBinding::from_base64url(
+                        e.kid.clone(),
+                        &key,
+                    )?)
                 }
                 None => None,
             };
@@ -458,9 +592,18 @@ impl CaConnector for AcmeCaConnector {
                 options.profile = ca.profile.clone();
             }
             let contact = ca.contact.as_deref().or(self.default_contact.as_deref());
-            let client = crate::acme::AcmeClient::connect(&ca.directory_url, account, contact, eab, options).await?;
+            let client =
+                crate::acme::AcmeClient::connect(&ca.directory_url, account, contact, eab, options)
+                    .await?;
             let account_url = client.account_url();
-            Ok(Connected { issuer: Arc::new(crate::acme_renew::AcmeIssuer::new(client, self.dns01.clone(), self.http01.clone())), account_url })
+            Ok(Connected {
+                issuer: Arc::new(crate::acme_renew::AcmeIssuer::new(
+                    client,
+                    self.dns01.clone(),
+                    self.http01.clone(),
+                )),
+                account_url,
+            })
         })
     }
 }
@@ -513,7 +656,11 @@ impl StatePaths {
 impl MultiCaIssuer {
     /// # Errors
     /// A state file exists and cannot be used.
-    pub fn new(policy: CaPolicy, connector: Arc<dyn CaConnector>, state: &StatePaths) -> Result<Self, String> {
+    pub fn new(
+        policy: CaPolicy,
+        connector: Arc<dyn CaConnector>,
+        state: &StatePaths,
+    ) -> Result<Self, String> {
         Self::with_clock(policy, connector, state, system_clock())
     }
 
@@ -521,7 +668,12 @@ impl MultiCaIssuer {
     ///
     /// # Errors
     /// A state file exists and cannot be used.
-    pub fn with_clock(policy: CaPolicy, connector: Arc<dyn CaConnector>, state: &StatePaths, clock: Clock) -> Result<Self, String> {
+    pub fn with_clock(
+        policy: CaPolicy,
+        connector: Arc<dyn CaConnector>,
+        state: &StatePaths,
+        clock: Clock,
+    ) -> Result<Self, String> {
         let journal = match &state.journal {
             Some(p) => Journal::open(p).map_err(|e| format!("{}: {e}", p.display()))?,
             None => Journal::memory(),
@@ -562,14 +714,27 @@ impl MultiCaIssuer {
 
     #[must_use]
     pub fn policy(&self) -> Arc<CaPolicy> {
-        self.inner.policy.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+        self.inner
+            .policy
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// Replace the policy (a reloaded file). Takes effect for the next order.
     pub fn set_policy(&self, policy: CaPolicy) {
         let now = (self.inner.clock)();
-        self.inner.journal.append(now, "policy_reloaded", "", &format!("{} CAs", policy.cas.len()));
-        *self.inner.policy.write().unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(policy);
+        self.inner.journal.append(
+            now,
+            "policy_reloaded",
+            "",
+            &format!("{} CAs", policy.cas.len()),
+        );
+        *self
+            .inner
+            .policy
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(policy);
     }
 
     #[must_use]
@@ -598,12 +763,23 @@ impl MultiCaIssuer {
     }
 
     fn standings(&self) -> Standings {
-        self.inner.standings.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+        self.inner
+            .standings
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     fn raise(&self, kind: AlertKind, ca: &str, detail: &str) {
-        self.inner.journal.append(self.now(), kind.as_str(), ca, detail);
-        self.inner.alerts.raise(CaAlert { at: self.now(), kind, ca: ca.to_string(), detail: detail.to_string() });
+        self.inner
+            .journal
+            .append(self.now(), kind.as_str(), ca, detail);
+        self.inner.alerts.raise(CaAlert {
+            at: self.now(),
+            kind,
+            ca: ca.to_string(),
+            detail: detail.to_string(),
+        });
     }
 
     fn save_health(&self, h: &HealthFile) {
@@ -638,7 +814,11 @@ impl MultiCaIssuer {
                 TrustVerdict::Distrusted { .. } => Some(CaStatus::Distrusted),
             };
             let streak = {
-                let mut s = self.inner.trust_streak.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut s = self
+                    .inner
+                    .trust_streak
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 let e = s.entry(t.ca.clone()).or_insert((desired, 0));
                 if e.0 == desired {
                     e.1 = e.1.saturating_add(1);
@@ -650,7 +830,11 @@ impl MultiCaIssuer {
             if streak < policy.trust.confirmations {
                 continue;
             }
-            let mut standings = self.inner.standings.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut standings = self
+                .inner
+                .standings
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let before = standings.get(&t.ca).copied();
             match desired {
                 Some(s) => {
@@ -663,7 +847,15 @@ impl MultiCaIssuer {
             if standings.get(&t.ca).copied() != before {
                 drop(standings);
                 changed.push(t.ca.clone());
-                self.raise(AlertKind::StandingChanged, &t.ca, &format!("root-program verdict {} -> effective standing {:?}", t.combined.label(), desired.map(CaStatus::as_str)));
+                self.raise(
+                    AlertKind::StandingChanged,
+                    &t.ca,
+                    &format!(
+                        "root-program verdict {} -> effective standing {:?}",
+                        t.combined.label(),
+                        desired.map(CaStatus::as_str)
+                    ),
+                );
             }
         }
         changed
@@ -671,7 +863,11 @@ impl MultiCaIssuer {
 
     /// Force a CA's standing (an operator's `distrusted` override that does not wait for the file).
     pub fn set_standing(&self, ca: &str, status: Option<CaStatus>) {
-        let mut s = self.inner.standings.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut s = self
+            .inner
+            .standings
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         match status {
             Some(st) => s.insert(ca.to_string(), st),
             None => s.remove(ca),
@@ -687,7 +883,11 @@ impl MultiCaIssuer {
     /// The CAA the zones should publish now.
     #[must_use]
     pub fn caa_plan(&self, validation_methods: &[String]) -> CaaPlan {
-        self.policy().caa_plan(&self.standings(), &self.inner.accounts.all(), validation_methods)
+        self.policy().caa_plan(
+            &self.standings(),
+            &self.inner.accounts.all(),
+            validation_methods,
+        )
     }
 
     /// Findings about the policy as it stands now, including the effect of root-program signals.
@@ -699,7 +899,11 @@ impl MultiCaIssuer {
     /// Names of the CAs that may issue now, in preference order.
     #[must_use]
     pub fn eligible_names(&self) -> Vec<String> {
-        self.policy().eligible(&self.standings()).into_iter().map(|c| c.name.clone()).collect()
+        self.policy()
+            .eligible(&self.standings())
+            .into_iter()
+            .map(|c| c.name.clone())
+            .collect()
     }
 
     /// One row per CA for status pages and metrics.
@@ -707,7 +911,12 @@ impl MultiCaIssuer {
     pub fn views(&self) -> Vec<CaView> {
         let policy = self.policy();
         let standings = self.standings();
-        let health = self.inner.health.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+        let health = self
+            .inner
+            .health
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
         policy
             .cas
             .iter()
@@ -720,7 +929,10 @@ impl MultiCaIssuer {
                     benched_until: h.benched_until,
                     consecutive_failures: h.consecutive,
                     last_error: h.last_error,
-                    account_url: c.account_uri.clone().or_else(|| self.inner.accounts.get(&c.name)),
+                    account_url: c
+                        .account_uri
+                        .clone()
+                        .or_else(|| self.inner.accounts.get(&c.name)),
                     issued: h.issued,
                     failures: h.failures,
                 }
@@ -741,11 +953,19 @@ impl MultiCaIssuer {
         }
         let der = crate::x509::leaf_der(&material.chain_pem)?;
         let cert = crate::x509::parse(&der)?;
-        let issuer: Vec<String> = [cert.issuer_cn(), cert.issuer_org()].into_iter().flatten().map(|s| s.to_ascii_lowercase()).collect();
+        let issuer: Vec<String> = [cert.issuer_cn(), cert.issuer_org()]
+            .into_iter()
+            .flatten()
+            .map(|s| s.to_ascii_lowercase())
+            .collect();
         self.policy()
             .cas
             .iter()
-            .find(|c| c.issuer_names.iter().any(|n| issuer.iter().any(|i| i.contains(&n.to_ascii_lowercase()))))
+            .find(|c| {
+                c.issuer_names
+                    .iter()
+                    .any(|n| issuer.iter().any(|i| i.contains(&n.to_ascii_lowercase())))
+            })
             .map(|c| c.name.clone())
     }
 
@@ -754,7 +974,9 @@ impl MultiCaIssuer {
     async fn backend(&self, ca: &CaEntry, for_issuance: bool) -> Result<Arc<Connected>, AcmeError> {
         if for_issuance {
             // The gate: never talk to a CA to order from it unless it is on the list and may issue.
-            self.policy().admit(&ca.directory_url, &self.standings()).map_err(|e| AcmeError::Local(e.to_string()))?;
+            self.policy()
+                .admit(&ca.directory_url, &self.standings())
+                .map_err(|e| AcmeError::Local(e.to_string()))?;
         }
         let key = (ca.name.clone(), ca.directory_url.clone());
         let mut connected = self.inner.connected.lock().await;
@@ -764,7 +986,11 @@ impl MultiCaIssuer {
         let c = Arc::new(self.inner.connector.connect(ca).await?);
         if let Some(url) = &c.account_url {
             match self.inner.accounts.learn(ca, url) {
-                Ok(true) => self.inner.journal.append(self.now(), "account_registered", &ca.name, url),
+                Ok(true) => {
+                    self.inner
+                        .journal
+                        .append(self.now(), "account_registered", &ca.name, url)
+                }
                 Ok(false) => {}
                 Err(e) => {
                     self.raise(AlertKind::AccountMismatch, &ca.name, &e);
@@ -797,10 +1023,19 @@ impl MultiCaIssuer {
     /// the rest (soonest to return first).
     fn candidates(&self, now: i64) -> Vec<CaEntry> {
         let policy = self.policy();
-        let eligible: Vec<CaEntry> = policy.eligible(&self.standings()).into_iter().cloned().collect();
-        let health = self.inner.health.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let eligible: Vec<CaEntry> = policy
+            .eligible(&self.standings())
+            .into_iter()
+            .cloned()
+            .collect();
+        let health = self
+            .inner
+            .health
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let benched_until = |c: &CaEntry| health.cas.get(&c.name).map_or(0, |h| h.benched_until);
-        let (mut ready, mut benched): (Vec<CaEntry>, Vec<CaEntry>) = eligible.into_iter().partition(|c| benched_until(c) <= now);
+        let (mut ready, mut benched): (Vec<CaEntry>, Vec<CaEntry>) =
+            eligible.into_iter().partition(|c| benched_until(c) <= now);
         benched.sort_by_key(|c| benched_until(c));
         ready.extend(benched);
         ready
@@ -809,30 +1044,50 @@ impl MultiCaIssuer {
     fn record_success(&self, ca: &str, material: &CertMaterial, now: i64) {
         self.inner.ledger.record(material, ca, now);
         let (recovered, snapshot) = {
-            let mut h = self.inner.health.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut h = self
+                .inner
+                .health
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let e = h.cas.entry(ca.to_string()).or_default();
             let recovered = e.benched_until > 0 || e.bench_level > 0;
-            *e = CaHealth { issued: e.issued + 1, failures: e.failures, last_ok: now, ..CaHealth::default() };
+            *e = CaHealth {
+                issued: e.issued + 1,
+                failures: e.failures,
+                last_ok: now,
+                ..CaHealth::default()
+            };
             (recovered, h.clone())
         };
         self.save_health(&snapshot);
         self.inner.journal.append(now, "issued", ca, "");
         if recovered {
-            self.raise(AlertKind::CaRecovered, ca, "issued a certificate after being benched");
+            self.raise(
+                AlertKind::CaRecovered,
+                ca,
+                "issued a certificate after being benched",
+            );
         }
     }
 
     fn record_failure(&self, ca: &str, err: &AcmeError, now: i64) {
         let failover = self.policy().failover.clone();
         let (benched, snapshot) = {
-            let mut h = self.inner.health.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut h = self
+                .inner
+                .health
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let e = h.cas.entry(ca.to_string()).or_default();
             e.consecutive = e.consecutive.saturating_add(1);
             e.failures += 1;
             e.last_error = Some(err.to_string().chars().take(300).collect());
             let mut benched = None;
             if e.consecutive >= failover.fail_threshold {
-                let secs = failover.bench_secs.saturating_mul(1i64 << e.bench_level.min(20)).min(failover.bench_max_secs);
+                let secs = failover
+                    .bench_secs
+                    .saturating_mul(1i64 << e.bench_level.min(20))
+                    .min(failover.bench_max_secs);
                 e.benched_until = now.saturating_add(secs);
                 e.bench_level = e.bench_level.saturating_add(1);
                 // One more failure after the bench re-benches (longer); a success clears all of it.
@@ -842,40 +1097,68 @@ impl MultiCaIssuer {
             (benched, h.clone())
         };
         self.save_health(&snapshot);
-        self.inner.journal.append(now, "failure", ca, &format!("{:?}: {err}", err.class()));
+        self.inner
+            .journal
+            .append(now, "failure", ca, &format!("{:?}: {err}", err.class()));
         if let Some(secs) = benched {
-            self.raise(AlertKind::CaBenched, ca, &format!("failing; tried last for {secs}s ({err})"));
+            self.raise(
+                AlertKind::CaBenched,
+                ca,
+                &format!("failing; tried last for {secs}s ({err})"),
+            );
         }
     }
 
     /// Whether another order may fall back to an alternative CA today.
     fn failover_budget(&self, now: i64) -> bool {
         let max = self.policy().failover.max_failovers_per_day as usize;
-        let mut h = self.inner.health.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut h = self
+            .inner
+            .health
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         h.failovers.retain(|t| now - *t < 24 * 3600);
         h.failovers.len() < max
     }
 
     fn note_failover(&self, now: i64) {
         let snapshot = {
-            let mut h = self.inner.health.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut h = self
+                .inner
+                .health
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             h.failovers.push(now);
             h.clone()
         };
         self.save_health(&snapshot);
     }
 
-    async fn order(&self, cert_name: &str, previous: Option<&CertMaterial>) -> Result<CertMaterial, AcmeError> {
+    async fn order(
+        &self,
+        cert_name: &str,
+        previous: Option<&CertMaterial>,
+    ) -> Result<CertMaterial, AcmeError> {
         let now = self.now();
         let candidates = self.candidates(now);
         if candidates.is_empty() {
-            let mut last = self.inner.last_no_ca_alert.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut last = self
+                .inner
+                .last_no_ca_alert
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if now.saturating_sub(*last) > 3600 {
                 *last = now;
                 drop(last);
-                self.raise(AlertKind::NoEligibleCa, "", "no CA on the allow-list may issue (all are retiring or distrusted)");
+                self.raise(
+                    AlertKind::NoEligibleCa,
+                    "",
+                    "no CA on the allow-list may issue (all are retiring or distrusted)",
+                );
             }
-            return Err(AcmeError::Local("no CA on the allow-list is eligible to issue; make one active or standby".into()));
+            return Err(AcmeError::Local(
+                "no CA on the allow-list is eligible to issue; make one active or standby".into(),
+            ));
         }
         let previous_ca = previous.and_then(|p| self.attribute(p));
         let mut first_error: Option<AcmeError> = None;
@@ -891,7 +1174,14 @@ impl MultiCaIssuer {
                 self.raise(
                     AlertKind::Failover,
                     &ca.name,
-                    &format!("ordering {cert_name} from '{}' after '{}' failed ({})", ca.name, previous_try.as_deref().unwrap_or("?"), first_error.as_ref().map_or_else(String::new, ToString::to_string)),
+                    &format!(
+                        "ordering {cert_name} from '{}' after '{}' failed ({})",
+                        ca.name,
+                        previous_try.as_deref().unwrap_or("?"),
+                        first_error
+                            .as_ref()
+                            .map_or_else(String::new, ToString::to_string)
+                    ),
                 );
             }
             // `replaces` names a certificate by the issuing CA's ARI id, so only that CA gets it.
@@ -911,7 +1201,9 @@ impl MultiCaIssuer {
                 }
                 Err(e) => match e.class() {
                     // Waiting is the answer to a rate limit, and our own failure is ours at every CA.
-                    FailureClass::RateLimited | FailureClass::Local => return Err(first_error.unwrap_or(e)),
+                    FailureClass::RateLimited | FailureClass::Local => {
+                        return Err(first_error.unwrap_or(e))
+                    }
                     FailureClass::CaSide | FailureClass::Refused => {
                         self.record_failure(&ca.name, &e, self.now());
                         previous_try = Some(ca.name.clone());
@@ -929,11 +1221,18 @@ impl CertIssuer for MultiCaIssuer {
         Box::pin(self.order(cert_name, None))
     }
 
-    fn issue_replacing<'a>(&'a self, cert_name: &'a str, previous: &'a CertMaterial) -> BoxFuture<'a, Result<CertMaterial, AcmeError>> {
+    fn issue_replacing<'a>(
+        &'a self,
+        cert_name: &'a str,
+        previous: &'a CertMaterial,
+    ) -> BoxFuture<'a, Result<CertMaterial, AcmeError>> {
         Box::pin(self.order(cert_name, Some(previous)))
     }
 
-    fn renewal_window<'a>(&'a self, material: &'a CertMaterial) -> BoxFuture<'a, Option<RenewalWindow>> {
+    fn renewal_window<'a>(
+        &'a self,
+        material: &'a CertMaterial,
+    ) -> BoxFuture<'a, Option<RenewalWindow>> {
         Box::pin(async move {
             let ca = self.attribute(material)?;
             let entry = self.policy().get(&ca)?.clone();
@@ -944,8 +1243,14 @@ impl CertIssuer for MultiCaIssuer {
 
     fn revoke<'a>(&'a self, material: &'a CertMaterial) -> BoxFuture<'a, Result<(), AcmeError>> {
         Box::pin(async move {
-            let ca = self.attribute(material).ok_or_else(|| AcmeError::Local("cannot tell which CA issued this certificate, so cannot revoke it".into()))?;
-            let entry = self.policy().get(&ca).cloned().ok_or_else(|| AcmeError::Local(format!("CA '{ca}' is no longer on the allow-list")))?;
+            let ca = self.attribute(material).ok_or_else(|| {
+                AcmeError::Local(
+                    "cannot tell which CA issued this certificate, so cannot revoke it".into(),
+                )
+            })?;
+            let entry = self.policy().get(&ca).cloned().ok_or_else(|| {
+                AcmeError::Local(format!("CA '{ca}' is no longer on the allow-list"))
+            })?;
             // Revocation talks to the issuing CA whatever its standing: a distrusted CA's
             // certificates are exactly what we most want revoked.
             let backend = self.backend(&entry, false).await?;
@@ -985,7 +1290,14 @@ mod tests {
 
     impl ScriptedCa {
         fn new(name: &str) -> Arc<Self> {
-            Arc::new(ScriptedCa { name: name.into(), script: Mutex::default(), orders: Mutex::default(), revoked: Mutex::default(), issued_counter: AtomicUsize::new(0), always: Mutex::new(None) })
+            Arc::new(ScriptedCa {
+                name: name.into(),
+                script: Mutex::default(),
+                orders: Mutex::default(),
+                revoked: Mutex::default(),
+                issued_counter: AtomicUsize::new(0),
+                always: Mutex::new(None),
+            })
         }
         fn fail_with(&self, f: fn() -> AcmeError) {
             *self.always.lock().unwrap() = Some(f);
@@ -1002,13 +1314,19 @@ mod tests {
             let ca_key = rcgen::KeyPair::generate().unwrap();
             let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
             ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-            ca_params.distinguished_name.push(rcgen::DnType::CommonName, format!("{} CA", self.name));
+            ca_params
+                .distinguished_name
+                .push(rcgen::DnType::CommonName, format!("{} CA", self.name));
             let ca = ca_params.self_signed(&ca_key).unwrap();
             let key = rcgen::KeyPair::generate().unwrap();
-            let mut params = rcgen::CertificateParams::new(vec!["x.example.test".to_string()]).unwrap();
+            let mut params =
+                rcgen::CertificateParams::new(vec!["x.example.test".to_string()]).unwrap();
             params.serial_number = Some(rcgen::SerialNumber::from_slice(&n.to_be_bytes()));
             let cert = params.signed_by(&key, &ca, &ca_key).unwrap();
-            CertMaterial { chain_pem: cert.pem(), key_pem: crate::acme::pem_wrap("PRIVATE KEY", &pkcs8_of(&key)) }
+            CertMaterial {
+                chain_pem: cert.pem(),
+                key_pem: crate::acme::pem_wrap("PRIVATE KEY", &pkcs8_of(&key)),
+            }
         }
     }
 
@@ -1017,9 +1335,15 @@ mod tests {
     }
 
     impl CertIssuer for ScriptedCa {
-        fn issue<'a>(&'a self, cert_name: &'a str) -> BoxFuture<'a, Result<CertMaterial, AcmeError>> {
+        fn issue<'a>(
+            &'a self,
+            cert_name: &'a str,
+        ) -> BoxFuture<'a, Result<CertMaterial, AcmeError>> {
             Box::pin(async move {
-                self.orders.lock().unwrap().push((cert_name.to_string(), false));
+                self.orders
+                    .lock()
+                    .unwrap()
+                    .push((cert_name.to_string(), false));
                 if let Some(f) = *self.always.lock().unwrap() {
                     return Err(f());
                 }
@@ -1029,7 +1353,11 @@ mod tests {
                 }
             })
         }
-        fn issue_replacing<'a>(&'a self, cert_name: &'a str, _p: &'a CertMaterial) -> BoxFuture<'a, Result<CertMaterial, AcmeError>> {
+        fn issue_replacing<'a>(
+            &'a self,
+            cert_name: &'a str,
+            _p: &'a CertMaterial,
+        ) -> BoxFuture<'a, Result<CertMaterial, AcmeError>> {
             Box::pin(async move {
                 let r = self.issue(cert_name).await;
                 if let Some(last) = self.orders.lock().unwrap().last_mut() {
@@ -1058,11 +1386,26 @@ mod tests {
             Box::pin(async move {
                 self.connects.fetch_add(1, SeqCst);
                 if self.down.lock().unwrap().contains(&ca.name) {
-                    return Err(AcmeError::Http(crate::http_types::Error::Http("connection refused".into())));
+                    return Err(AcmeError::Http(crate::http_types::Error::Http(
+                        "connection refused".into(),
+                    )));
                 }
-                let scripted = self.cas.get(&ca.name).cloned().ok_or_else(|| AcmeError::Local("unknown".into()))?;
-                let account = self.account_override.lock().unwrap().get(&ca.name).cloned().unwrap_or_else(|| format!("https://{}.example.test/acct/1", ca.name));
-                Ok(Connected { issuer: scripted, account_url: Some(account) })
+                let scripted = self
+                    .cas
+                    .get(&ca.name)
+                    .cloned()
+                    .ok_or_else(|| AcmeError::Local("unknown".into()))?;
+                let account = self
+                    .account_override
+                    .lock()
+                    .unwrap()
+                    .get(&ca.name)
+                    .cloned()
+                    .unwrap_or_else(|| format!("https://{}.example.test/acct/1", ca.name));
+                Ok(Connected {
+                    issuer: scripted,
+                    account_url: Some(account),
+                })
             })
         }
     }
@@ -1080,22 +1423,50 @@ mod tests {
         let mut cas = HashMap::new();
         cas.insert("a".to_string(), a.clone());
         cas.insert("b".to_string(), b.clone());
-        let connector = Arc::new(Connector { cas, down: Mutex::default(), connects: AtomicUsize::new(0), account_override: Mutex::default() });
+        let connector = Arc::new(Connector {
+            cas,
+            down: Mutex::default(),
+            connects: AtomicUsize::new(0),
+            account_override: Mutex::default(),
+        });
         let now = Arc::new(AtomicI64::new(T0));
         let n = now.clone();
-        let issuer = Arc::new(MultiCaIssuer::with_clock(policy, connector.clone(), &StatePaths::default(), Arc::new(move || n.load(SeqCst))).unwrap());
-        Fixture { issuer, a, b, connector, now }
+        let issuer = Arc::new(
+            MultiCaIssuer::with_clock(
+                policy,
+                connector.clone(),
+                &StatePaths::default(),
+                Arc::new(move || n.load(SeqCst)),
+            )
+            .unwrap(),
+        );
+        Fixture {
+            issuer,
+            a,
+            b,
+            connector,
+            now,
+        }
     }
 
     fn fixture() -> Fixture {
-        fixture_with(policy(vec![entry("a", CaStatus::Active, "a.test"), entry("b", CaStatus::Standby, "b.test")]))
+        fixture_with(policy(vec![
+            entry("a", CaStatus::Active, "a.test"),
+            entry("b", CaStatus::Standby, "b.test"),
+        ]))
     }
 
     fn server_error() -> AcmeError {
-        AcmeError::Rejected { status: 503, detail: "overloaded".into() }
+        AcmeError::Rejected {
+            status: 503,
+            detail: "overloaded".into(),
+        }
     }
     fn rate_limited() -> AcmeError {
-        AcmeError::RateLimited { retry_after_secs: Some(3600), detail: "too many".into() }
+        AcmeError::RateLimited {
+            retry_after_secs: Some(3600),
+            detail: "too many".into(),
+        }
     }
     fn local() -> AcmeError {
         AcmeError::Local("rng".into())
@@ -1108,25 +1479,55 @@ mod tests {
         assert_eq!((f.a.orders(), f.b.orders()), (1, 0));
         assert_eq!(f.issuer.ca_name(&m).as_deref(), Some("a"));
         // With no ledger entry at all the issuer name in the certificate still says who issued it.
-        let fresh = Fixture { issuer: Arc::new(MultiCaIssuer::new(f.issuer.policy().as_ref().clone(), f.connector.clone(), &StatePaths::default()).unwrap()), ..f };
-        assert_eq!(fresh.issuer.ca_name(&m).as_deref(), Some("a"), "attributed by issuer name");
+        let fresh = Fixture {
+            issuer: Arc::new(
+                MultiCaIssuer::new(
+                    f.issuer.policy().as_ref().clone(),
+                    f.connector.clone(),
+                    &StatePaths::default(),
+                )
+                .unwrap(),
+            ),
+            ..f
+        };
+        assert_eq!(
+            fresh.issuer.ca_name(&m).as_deref(),
+            Some("a"),
+            "attributed by issuer name"
+        );
         assert_eq!(fresh.issuer.migration(&m), Migration::None);
     }
 
     #[tokio::test]
-    async fn a_ca_side_failure_falls_back_to_the_standby_for_that_order_with_an_alert_and_a_journal_entry() {
+    async fn a_ca_side_failure_falls_back_to_the_standby_for_that_order_with_an_alert_and_a_journal_entry(
+    ) {
         let f = fixture();
         f.a.fail_with(server_error);
-        let m = f.issuer.issue("x.example.test").await.expect("the standby issued it");
+        let m = f
+            .issuer
+            .issue("x.example.test")
+            .await
+            .expect("the standby issued it");
         assert_eq!((f.a.orders(), f.b.orders()), (1, 1));
         assert_eq!(f.issuer.ca_name(&m).as_deref(), Some("b"));
         let alerts = f.issuer.alerts();
         assert_eq!(alerts.count(AlertKind::Failover), 1);
         let a = alerts.recent();
-        assert!(a.iter().any(|x| x.kind == AlertKind::Failover && x.ca == "b" && x.detail.contains("'a' failed")), "{a:?}");
+        assert!(
+            a.iter().any(|x| x.kind == AlertKind::Failover
+                && x.ca == "b"
+                && x.detail.contains("'a' failed")),
+            "{a:?}"
+        );
         let j = f.issuer.journal().recent(10);
-        assert!(j.iter().any(|e| e.event == "failover" && e.ca == "b"), "{j:?}");
-        assert!(j.iter().any(|e| e.event == "failure" && e.ca == "a"), "{j:?}");
+        assert!(
+            j.iter().any(|e| e.event == "failover" && e.ca == "b"),
+            "{j:?}"
+        );
+        assert!(
+            j.iter().any(|e| e.event == "failure" && e.ca == "a"),
+            "{j:?}"
+        );
     }
 
     #[tokio::test]
@@ -1135,7 +1536,11 @@ mod tests {
         f.a.fail_with(rate_limited);
         let e = f.issuer.issue("x.example.test").await.unwrap_err();
         assert!(matches!(e, AcmeError::RateLimited { .. }));
-        assert_eq!((f.a.orders(), f.b.orders()), (1, 0), "a rate limit is waited out, not routed around");
+        assert_eq!(
+            (f.a.orders(), f.b.orders()),
+            (1, 0),
+            "a rate limit is waited out, not routed around"
+        );
         f.a.fail_with(local);
         let e = f.issuer.issue("x.example.test").await.unwrap_err();
         assert!(matches!(e, AcmeError::Local(_)));
@@ -1143,7 +1548,11 @@ mod tests {
         // Neither counts against the CA.
         let v = f.issuer.views();
         assert_eq!(v[0].consecutive_failures, 0);
-        assert_eq!(f.issuer.alerts().count(AlertKind::Failover) + f.issuer.alerts().count(AlertKind::CaBenched), 0);
+        assert_eq!(
+            f.issuer.alerts().count(AlertKind::Failover)
+                + f.issuer.alerts().count(AlertKind::CaBenched),
+            0
+        );
     }
 
     #[tokio::test]
@@ -1160,7 +1569,11 @@ mod tests {
         // Benched: the standby is now tried FIRST, and the primary is not touched.
         f.issuer.issue("x.example.test").await.unwrap();
         assert_eq!((f.a.orders(), f.b.orders()), (3, 4));
-        assert_eq!(f.issuer.alerts().count(AlertKind::Failover), 3, "the fourth order did not need a fall back");
+        assert_eq!(
+            f.issuer.alerts().count(AlertKind::Failover),
+            3,
+            "the fourth order did not need a fall back"
+        );
     }
 
     #[tokio::test]
@@ -1174,7 +1587,11 @@ mod tests {
         f.now.store(T0 + 3601, SeqCst);
         f.issuer.issue("x.example.test").await.unwrap();
         assert_eq!(f.a.orders(), 4);
-        assert_eq!(f.issuer.views()[0].benched_until, T0 + 3601 + 7200, "second bench is twice as long");
+        assert_eq!(
+            f.issuer.views()[0].benched_until,
+            T0 + 3601 + 7200,
+            "second bench is twice as long"
+        );
         // Heal and wait it out: the primary issues again and the bench level resets.
         f.a.heal();
         f.now.store(T0 + 3601 + 7201, SeqCst);
@@ -1186,12 +1603,19 @@ mod tests {
             f.issuer.issue("x.example.test").await.unwrap();
         }
         let v = f.issuer.views();
-        assert_eq!(v[0].benched_until, T0 + 3601 + 7201 + 3600, "a recovered CA starts again from the shortest bench");
+        assert_eq!(
+            v[0].benched_until,
+            T0 + 3601 + 7201 + 3600,
+            "a recovered CA starts again from the shortest bench"
+        );
     }
 
     #[tokio::test]
     async fn the_bench_is_capped() {
-        let mut p = policy(vec![entry("a", CaStatus::Active, "a.test"), entry("b", CaStatus::Standby, "b.test")]);
+        let mut p = policy(vec![
+            entry("a", CaStatus::Active, "a.test"),
+            entry("b", CaStatus::Standby, "b.test"),
+        ]);
         p.failover.bench_secs = 100;
         p.failover.bench_max_secs = 250;
         let f = fixture_with(p);
@@ -1215,17 +1639,31 @@ mod tests {
 
     #[tokio::test]
     async fn fall_back_is_bounded_per_day_and_the_bound_is_alerted() {
-        let mut p = policy(vec![entry("a", CaStatus::Active, "a.test"), entry("b", CaStatus::Standby, "b.test")]);
+        let mut p = policy(vec![
+            entry("a", CaStatus::Active, "a.test"),
+            entry("b", CaStatus::Standby, "b.test"),
+        ]);
         p.failover.max_failovers_per_day = 2;
         p.failover.fail_threshold = 1000; // never bench in this test
         let f = fixture_with(p);
         f.a.fail_with(server_error);
         assert!(f.issuer.issue("x.example.test").await.is_ok());
         assert!(f.issuer.issue("x.example.test").await.is_ok());
-        let e = f.issuer.issue("x.example.test").await.expect_err("the third fall back in a day is refused");
-        assert_eq!(e.class(), FailureClass::CaSide, "the primary's error is what is returned: {e}");
+        let e = f
+            .issuer
+            .issue("x.example.test")
+            .await
+            .expect_err("the third fall back in a day is refused");
+        assert_eq!(
+            e.class(),
+            FailureClass::CaSide,
+            "the primary's error is what is returned: {e}"
+        );
         assert_eq!(f.b.orders(), 2, "the standby was not asked a third time");
-        assert_eq!(f.issuer.alerts().count(AlertKind::FailoverBudgetExhausted), 1);
+        assert_eq!(
+            f.issuer.alerts().count(AlertKind::FailoverBudgetExhausted),
+            1
+        );
         // A day later the budget is back.
         f.now.store(T0 + 24 * 3600 + 1, SeqCst);
         assert!(f.issuer.issue("x.example.test").await.is_ok());
@@ -1235,7 +1673,10 @@ mod tests {
     async fn each_ca_is_tried_once_per_order_and_the_first_error_is_returned() {
         let f = fixture();
         f.a.fail_with(server_error);
-        f.b.fail_with(|| AcmeError::Rejected { status: 403, detail: "no".into() });
+        f.b.fail_with(|| AcmeError::Rejected {
+            status: 403,
+            detail: "no".into(),
+        });
         let e = f.issuer.issue("x.example.test").await.unwrap_err();
         assert_eq!((f.a.orders(), f.b.orders()), (1, 1));
         assert!(matches!(e, AcmeError::Rejected { status: 503, .. }), "{e}");
@@ -1245,11 +1686,21 @@ mod tests {
     async fn replaces_goes_only_to_the_ca_that_issued_the_certificate() {
         let f = fixture();
         let first = f.issuer.issue("x.example.test").await.unwrap(); // from a
-        f.issuer.issue_replacing("x.example.test", &first).await.unwrap();
-        assert_eq!(f.a.orders.lock().unwrap().iter().filter(|o| o.1).count(), 1, "a renewal at the issuing CA names the old certificate");
+        f.issuer
+            .issue_replacing("x.example.test", &first)
+            .await
+            .unwrap();
+        assert_eq!(
+            f.a.orders.lock().unwrap().iter().filter(|o| o.1).count(),
+            1,
+            "a renewal at the issuing CA names the old certificate"
+        );
         // The primary fails: the standby gets a plain order, not a `replaces` for a certificate it never issued.
         f.a.fail_with(server_error);
-        f.issuer.issue_replacing("x.example.test", &first).await.unwrap();
+        f.issuer
+            .issue_replacing("x.example.test", &first)
+            .await
+            .unwrap();
         assert_eq!(f.b.orders.lock().unwrap().iter().filter(|o| o.1).count(), 0);
         assert_eq!(f.b.orders(), 1);
     }
@@ -1267,7 +1718,10 @@ mod tests {
         p.cas[1].status = CaStatus::Retiring;
         f.issuer.set_policy(p);
         let e = f.issuer.issue("x.example.test").await.unwrap_err();
-        assert!(matches!(&e, AcmeError::Local(m) if m.contains("no CA on the allow-list is eligible")), "{e}");
+        assert!(
+            matches!(&e, AcmeError::Local(m) if m.contains("no CA on the allow-list is eligible")),
+            "{e}"
+        );
         assert_eq!(f.connector.connects.load(SeqCst), before);
         assert_eq!(f.issuer.alerts().count(AlertKind::NoEligibleCa), 1);
     }
@@ -1282,7 +1736,11 @@ mod tests {
         f.issuer.set_policy(p);
         assert_eq!(f.issuer.migration(&m), Migration::Distrusted);
         // New orders go to b; the revocation of the old certificate goes to a, which is no longer eligible.
-        let replaced = f.issuer.issue_replacing("x.example.test", &m).await.unwrap();
+        let replaced = f
+            .issuer
+            .issue_replacing("x.example.test", &m)
+            .await
+            .unwrap();
         assert_eq!(f.issuer.ca_name(&replaced).as_deref(), Some("b"));
         f.issuer.revoke(&m).await.unwrap();
         assert_eq!(f.a.revoked.lock().unwrap().len(), 1);
@@ -1293,32 +1751,67 @@ mod tests {
         f.issuer.set_policy(p);
         assert_eq!(f.issuer.migration(&m), Migration::Retiring);
         // A certificate nobody can attribute is not migrated, and cannot be revoked blind.
-        let stranger = CertMaterial { chain_pem: "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n".into(), key_pem: String::new() };
+        let stranger = CertMaterial {
+            chain_pem: "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n".into(),
+            key_pem: String::new(),
+        };
         assert_eq!(f.issuer.migration(&stranger), Migration::None);
         assert!(f.issuer.revoke(&stranger).await.is_err());
     }
 
     fn verdict(ca: &str, v: TrustVerdict) -> CaTrust {
-        CaTrust { ca: ca.into(), mozilla: v.clone(), chrome: v.clone(), combined: v }
+        CaTrust {
+            ca: ca.into(),
+            mozilla: v.clone(),
+            chrome: v.clone(),
+            combined: v,
+        }
     }
 
     #[tokio::test]
-    async fn a_confirmed_distrust_verdict_switches_the_fleet_to_the_standby_and_an_unknown_one_does_nothing() {
+    async fn a_confirmed_distrust_verdict_switches_the_fleet_to_the_standby_and_an_unknown_one_does_nothing(
+    ) {
         let f = fixture();
-        let distrusted = || vec![verdict("a", TrustVerdict::Distrusted { reason: "root removed".into() })];
+        let distrusted = || {
+            vec![verdict(
+                "a",
+                TrustVerdict::Distrusted {
+                    reason: "root removed".into(),
+                },
+            )]
+        };
         // One evaluation is not enough (confirmations = 2).
         assert!(f.issuer.apply_trust(&distrusted()).is_empty());
         assert_eq!(f.issuer.effective("a"), CaStatus::Active);
         // A failed fetch in between changes nothing and does not reset the streak.
-        assert!(f.issuer.apply_trust(&[verdict("a", TrustVerdict::Unknown { reason: "fetch failed".into() })]).is_empty());
+        assert!(f
+            .issuer
+            .apply_trust(&[verdict(
+                "a",
+                TrustVerdict::Unknown {
+                    reason: "fetch failed".into()
+                }
+            )])
+            .is_empty());
         assert_eq!(f.issuer.apply_trust(&distrusted()), ["a"]);
         assert_eq!(f.issuer.effective("a"), CaStatus::Distrusted);
         let m = f.issuer.issue("x.example.test").await.unwrap();
-        assert_eq!(f.issuer.ca_name(&m).as_deref(), Some("b"), "new certificates come from the standby");
+        assert_eq!(
+            f.issuer.ca_name(&m).as_deref(),
+            Some("b"),
+            "new certificates come from the standby"
+        );
         assert_eq!(f.issuer.alerts().count(AlertKind::StandingChanged), 1);
         // The CAA plan drops a.
         let plan = f.issuer.caa_plan(&[]);
-        assert_eq!(plan.records.issue.iter().map(|i| i.domain.as_str()).collect::<Vec<_>>(), ["b.test"]);
+        assert_eq!(
+            plan.records
+                .issue
+                .iter()
+                .map(|i| i.domain.as_str())
+                .collect::<Vec<_>>(),
+            ["b.test"]
+        );
         // Trusted again (twice) clears the escalation.
         let trusted = || vec![verdict("a", TrustVerdict::Trusted)];
         assert!(f.issuer.apply_trust(&trusted()).is_empty());
@@ -1327,9 +1820,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_pending_distrust_makes_the_ca_retiring_so_it_stops_being_chosen_and_its_certificates_move() {
+    async fn a_pending_distrust_makes_the_ca_retiring_so_it_stops_being_chosen_and_its_certificates_move(
+    ) {
         let f = fixture();
-        let pending = || vec![verdict("a", TrustVerdict::DistrustPending { after: T0 + 30 * 86400 })];
+        let pending = || {
+            vec![verdict(
+                "a",
+                TrustVerdict::DistrustPending {
+                    after: T0 + 30 * 86400,
+                },
+            )]
+        };
         f.issuer.apply_trust(&pending());
         f.issuer.apply_trust(&pending());
         assert_eq!(f.issuer.effective("a"), CaStatus::Retiring);
@@ -1348,16 +1849,31 @@ mod tests {
         assert_eq!(accounts["b"], "https://b.example.test/acct/1");
         let plan = f.issuer.caa_plan(&["dns-01".to_string()]);
         assert!(plan.unbound.is_empty());
-        assert_eq!(plan.records.issue.len(), 2, "both CAs are authorised in DNS before either is needed");
+        assert_eq!(
+            plan.records.issue.len(),
+            2,
+            "both CAs are authorised in DNS before either is needed"
+        );
 
         // A pinned account that the CA does not hand back is refused, with an alert.
-        let mut p = policy(vec![entry("a", CaStatus::Active, "a.test"), entry("b", CaStatus::Standby, "b.test")]);
+        let mut p = policy(vec![
+            entry("a", CaStatus::Active, "a.test"),
+            entry("b", CaStatus::Standby, "b.test"),
+        ]);
         p.cas[0].account_uri = Some("https://a.example.test/acct/PINNED".into());
         let g = fixture_with(p);
         let e = g.issuer.issue("x.example.test").await.unwrap();
-        assert_eq!(g.issuer.ca_name(&e).as_deref(), Some("b"), "the CA that handed out the wrong account was skipped");
+        assert_eq!(
+            g.issuer.ca_name(&e).as_deref(),
+            Some("b"),
+            "the CA that handed out the wrong account was skipped"
+        );
         assert_eq!(g.issuer.alerts().count(AlertKind::AccountMismatch), 1);
-        assert_eq!(g.a.orders(), 0, "no order was placed at an account we did not pin");
+        assert_eq!(
+            g.a.orders(),
+            0,
+            "no order was placed at an account we did not pin"
+        );
     }
 
     #[tokio::test]
@@ -1368,7 +1884,11 @@ mod tests {
         assert_eq!(failed.len(), 1);
         assert_eq!(failed[0].0, "b");
         let plan = f.issuer.caa_plan(&[]);
-        assert_eq!(plan.unbound, ["b"], "no account yet: left out of CAA rather than published unbound");
+        assert_eq!(
+            plan.unbound,
+            ["b"],
+            "no account yet: left out of CAA rather than published unbound"
+        );
         f.connector.down.lock().unwrap().clear();
         f.a.fail_with(server_error);
         let m = f.issuer.issue("x.example.test").await.unwrap();
@@ -1378,11 +1898,23 @@ mod tests {
 
     #[tokio::test]
     async fn health_ledger_and_accounts_survive_a_restart() {
-        let dir = std::env::temp_dir().join(format!("ca-state-{}", crate::entropy::random_hex(6).unwrap()));
+        let dir = std::env::temp_dir().join(format!(
+            "ca-state-{}",
+            crate::entropy::random_hex(6).unwrap()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         let state = StatePaths::in_dir(&dir);
         let build = |connector: Arc<Connector>, now: Arc<AtomicI64>| {
-            MultiCaIssuer::with_clock(policy(vec![entry("a", CaStatus::Active, "a.test"), entry("b", CaStatus::Standby, "b.test")]), connector, &state, Arc::new(move || now.load(SeqCst))).unwrap()
+            MultiCaIssuer::with_clock(
+                policy(vec![
+                    entry("a", CaStatus::Active, "a.test"),
+                    entry("b", CaStatus::Standby, "b.test"),
+                ]),
+                connector,
+                &state,
+                Arc::new(move || now.load(SeqCst)),
+            )
+            .unwrap()
         };
         let f = fixture();
         let issuer = build(f.connector.clone(), f.now.clone());
@@ -1398,38 +1930,65 @@ mod tests {
 
         // "Restart": a new issuer over the same files remembers the bench, the account book and who issued what.
         let restarted = build(f.connector.clone(), f.now.clone());
-        assert_eq!(restarted.views()[0].benched_until, T0 + 3600, "the bench survives");
+        assert_eq!(
+            restarted.views()[0].benched_until,
+            T0 + 3600,
+            "the bench survives"
+        );
         assert_eq!(restarted.ca_name(&m).as_deref(), Some("b"));
         assert_eq!(restarted.accounts().len(), 2);
-        assert!(!restarted.issued_serials().is_empty(), "the serials of what was issued survive too (the CT monitor needs them)");
+        assert!(
+            !restarted.issued_serials().is_empty(),
+            "the serials of what was issued survive too (the CT monitor needs them)"
+        );
         let before = f.b.orders();
         restarted.issue("x.example.test").await.unwrap();
-        assert_eq!(f.a.orders(), 3, "the benched primary is not retried after a restart");
+        assert_eq!(
+            f.a.orders(),
+            3,
+            "the benched primary is not retried after a restart"
+        );
         assert_eq!(f.b.orders(), before + 1);
-        let files: Vec<String> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        let files: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
         assert!(files.iter().all(|f| !f.ends_with(".tmp")), "{files:?}");
         // A damaged account book is refused, not replaced.
         std::fs::write(dir.join("ca-accounts.json"), "{broken").unwrap();
-        assert!(MultiCaIssuer::new(f.issuer.policy().as_ref().clone(), f.connector.clone(), &state).is_err());
+        assert!(MultiCaIssuer::new(
+            f.issuer.policy().as_ref().clone(),
+            f.connector.clone(),
+            &state
+        )
+        .is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn the_journal_rotates_and_returns_the_most_recent_events() {
-        let dir = std::env::temp_dir().join(format!("ca-journal-{}", crate::entropy::random_hex(6).unwrap()));
+        let dir = std::env::temp_dir().join(format!(
+            "ca-journal-{}",
+            crate::entropy::random_hex(6).unwrap()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         let j = Journal::open(dir.join("j.jsonl")).unwrap();
         for i in 0..5 {
             j.append(i, "e", "a", &format!("n{i}"));
         }
         let recent = j.recent(2);
-        assert_eq!(recent.iter().map(|e| e.detail.as_str()).collect::<Vec<_>>(), ["n3", "n4"]);
+        assert_eq!(
+            recent.iter().map(|e| e.detail.as_str()).collect::<Vec<_>>(),
+            ["n3", "n4"]
+        );
         let big = "x".repeat(400);
         for i in 0..6000 {
             j.append(i, "e", "a", &big);
         }
         assert!(dir.join("j.jsonl.1").exists(), "rotated at 2 MiB");
-        assert!(std::fs::metadata(dir.join("j.jsonl")).unwrap().len() <= JOURNAL_ROTATE_BYTES + 1000);
+        assert!(
+            std::fs::metadata(dir.join("j.jsonl")).unwrap().len() <= JOURNAL_ROTATE_BYTES + 1000
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

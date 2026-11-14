@@ -5,10 +5,10 @@
 // Ported from bedrock's `native_lib::http_types` (originally `include!`d into `native_lib.rs`,
 // sharing its flat scope); here it's a real module with its own imports.
 
+use apeiron::map::hashtrinity::{CoordMap, PHI};
 use std::io;
 use std::str::FromStr;
 use std::sync::Arc;
-use apeiron::map::hashtrinity::{CoordMap, PHI};
 
 // -- Error ---------------------------------------------------------------
 
@@ -392,7 +392,9 @@ pub mod header {
                 raw.split(',')
                     .map(strip_params)
                     .filter(|s| !s.is_empty())
-                    .map(|s| QualityItem { item: MediaType(s.to_string()) })
+                    .map(|s| QualityItem {
+                        item: MediaType(s.to_string()),
+                    })
                     .collect(),
             )
         }
@@ -431,7 +433,9 @@ pub mod header {
                 raw.split(',')
                     .map(strip_params)
                     .filter(|s| !s.is_empty())
-                    .map(|s| QualityItem { item: Encoding(s.to_string()) })
+                    .map(|s| QualityItem {
+                        item: Encoding(s.to_string()),
+                    })
                     .collect(),
             )
         }
@@ -617,7 +621,7 @@ pub fn parse_uri(s: &str) -> Result<Uri> {
     };
 
     let (authority, path) = if scheme.is_some() {
-        match rest.find(|c| c == '/' || c == '?') {
+        match rest.find(['/', '?']) {
             Some(i) => {
                 let path = if rest[i..].starts_with('?') {
                     format!("/{}", &rest[i..])
@@ -759,25 +763,34 @@ impl std::fmt::Debug for Extensions {
 
 impl Extensions {
     pub fn new() -> Self {
-        Extensions { map: apeiron::map::hashtrinity::Table::new() }
+        Extensions {
+            map: apeiron::map::hashtrinity::Table::new(),
+        }
     }
 
     /// Insert a value, returning whatever was previously stored for this exact type `T`.
     pub fn insert<T: Clone + Send + Sync + 'static>(&mut self, val: T) -> Option<T> {
         let key = type_id_coord(std::any::TypeId::of::<T>());
-        let prev = self.map.remove(&key).and_then(|b| (*b).as_any().downcast_ref::<T>().cloned());
+        let prev = self
+            .map
+            .remove(&key)
+            .and_then(|b| (*b).as_any().downcast_ref::<T>().cloned());
         self.map.put(key, Box::new(val));
         prev
     }
 
     pub fn get<T: 'static>(&self) -> Option<&T> {
         let key = type_id_coord(std::any::TypeId::of::<T>());
-        self.map.get(&key).and_then(|b| (**b).as_any().downcast_ref::<T>())
+        self.map
+            .get(&key)
+            .and_then(|b| (**b).as_any().downcast_ref::<T>())
     }
 
     pub fn remove<T: Clone + 'static>(&mut self) -> Option<T> {
         let key = type_id_coord(std::any::TypeId::of::<T>());
-        self.map.remove(&key).and_then(|b| (*b).as_any().downcast_ref::<T>().cloned())
+        self.map
+            .remove(&key)
+            .and_then(|b| (*b).as_any().downcast_ref::<T>().cloned())
     }
 }
 
@@ -833,7 +846,10 @@ impl Request {
             .and_then(|v| v.split(',').next())
             .map(|s| s.trim().to_string())
             .or_else(|| peer_addr.clone());
-        ConnectionInfo { peer_addr, realip_remote_addr }
+        ConnectionInfo {
+            peer_addr,
+            realip_remote_addr,
+        }
     }
 }
 
@@ -1003,4 +1019,3 @@ impl Response {
         self.body.clone()
     }
 }
-

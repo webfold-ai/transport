@@ -34,7 +34,10 @@ mod imp {
     use aws_lc_rs::agreement::{self, PrivateKey, UnparsedPublicKey, X25519};
     use aws_lc_rs::digest::{self, SHA256};
     use aws_lc_rs::hmac;
-    use aws_lc_rs::signature::{Ed25519KeyPair, KeyPair, UnparsedPublicKey as SigPublicKey, ECDSA_P256_SHA256_FIXED, ED25519};
+    use aws_lc_rs::signature::{
+        Ed25519KeyPair, KeyPair, UnparsedPublicKey as SigPublicKey, ECDSA_P256_SHA256_FIXED,
+        ED25519,
+    };
 
     fn ed25519_pair(seed: &[u8; 32]) -> Ed25519KeyPair {
         // A 32-byte seed is always a valid Ed25519 private key.
@@ -104,10 +107,19 @@ mod imp {
 
     /// ChaCha20-Poly1305 seal (RFC 8439): ciphertext and detached 16-byte tag.
     #[must_use]
-    pub fn chacha20poly1305_encrypt(key: &[u8; 32], nonce: &[u8; 12], pt: &[u8], aad: &[u8]) -> (Vec<u8>, [u8; 16]) {
+    pub fn chacha20poly1305_encrypt(
+        key: &[u8; 32],
+        nonce: &[u8; 12],
+        pt: &[u8],
+        aad: &[u8],
+    ) -> (Vec<u8>, [u8; 16]) {
         let mut buf = pt.to_vec();
         let tag = chacha_key(key)
-            .seal_in_place_separate_tag(Nonce::assume_unique_for_key(*nonce), Aad::from(aad), &mut buf)
+            .seal_in_place_separate_tag(
+                Nonce::assume_unique_for_key(*nonce),
+                Aad::from(aad),
+                &mut buf,
+            )
             .expect("ChaCha20-Poly1305 seal");
         let mut t = [0u8; 16];
         t.copy_from_slice(tag.as_ref());
@@ -116,11 +128,23 @@ mod imp {
 
     /// ChaCha20-Poly1305 open: verifies the tag first, `None` on any tampering.
     #[must_use]
-    pub fn chacha20poly1305_decrypt(key: &[u8; 32], nonce: &[u8; 12], ct: &[u8], tag: &[u8; 16], aad: &[u8]) -> Option<Vec<u8>> {
+    pub fn chacha20poly1305_decrypt(
+        key: &[u8; 32],
+        nonce: &[u8; 12],
+        ct: &[u8],
+        tag: &[u8; 16],
+        aad: &[u8],
+    ) -> Option<Vec<u8>> {
         let mut buf = Vec::with_capacity(ct.len() + 16);
         buf.extend_from_slice(ct);
         buf.extend_from_slice(tag);
-        let plain = chacha_key(key).open_in_place(Nonce::assume_unique_for_key(*nonce), Aad::from(aad), &mut buf).ok()?;
+        let plain = chacha_key(key)
+            .open_in_place(
+                Nonce::assume_unique_for_key(*nonce),
+                Aad::from(aad),
+                &mut buf,
+            )
+            .ok()?;
         Some(plain.to_vec())
     }
 
@@ -147,7 +171,9 @@ mod imp {
         let mut sec1 = [0u8; 65];
         sec1[0] = 0x04;
         sec1[1..].copy_from_slice(pubkey);
-        SigPublicKey::new(&ECDSA_P256_SHA256_FIXED, sec1).verify(msg, sig).is_ok()
+        SigPublicKey::new(&ECDSA_P256_SHA256_FIXED, sec1)
+            .verify(msg, sig)
+            .is_ok()
     }
 
     /// The QUIC nonce: `iv` XOR the packet number, big-endian, right-aligned (RFC 9001 §5.3).
@@ -161,7 +187,13 @@ mod imp {
 
     /// Seal one QUIC packet: ciphertext followed by the 16-byte tag, `header` as AAD.
     #[must_use]
-    pub fn quic_seal(key: &[u8; 32], iv: &[u8; 12], pn: u64, header: &[u8], payload: &[u8]) -> Vec<u8> {
+    pub fn quic_seal(
+        key: &[u8; 32],
+        iv: &[u8; 12],
+        pn: u64,
+        header: &[u8],
+        payload: &[u8],
+    ) -> Vec<u8> {
         let mut buf = payload.to_vec();
         chacha_key(key)
             .seal_in_place_append_tag(quic_nonce(iv, pn), Aad::from(header), &mut buf)
@@ -171,9 +203,18 @@ mod imp {
 
     /// Open one QUIC packet; `None` on a short input or any tag failure.
     #[must_use]
-    pub fn quic_open(key: &[u8; 32], iv: &[u8; 12], pn: u64, header: &[u8], sealed: &[u8]) -> Option<Vec<u8>> {
+    pub fn quic_open(
+        key: &[u8; 32],
+        iv: &[u8; 12],
+        pn: u64,
+        header: &[u8],
+        sealed: &[u8],
+    ) -> Option<Vec<u8>> {
         let mut buf = sealed.to_vec();
-        let n = chacha_key(key).open_in_place(quic_nonce(iv, pn), Aad::from(header), &mut buf).ok()?.len();
+        let n = chacha_key(key)
+            .open_in_place(quic_nonce(iv, pn), Aad::from(header), &mut buf)
+            .ok()?
+            .len();
         buf.truncate(n);
         Some(buf)
     }
@@ -222,11 +263,22 @@ mod imp {
         out.iter().any(|b| *b != 0).then_some(out)
     }
     #[must_use]
-    pub fn chacha20poly1305_encrypt(key: &[u8; 32], nonce: &[u8; 12], pt: &[u8], aad: &[u8]) -> (Vec<u8>, [u8; 16]) {
+    pub fn chacha20poly1305_encrypt(
+        key: &[u8; 32],
+        nonce: &[u8; 12],
+        pt: &[u8],
+        aad: &[u8],
+    ) -> (Vec<u8>, [u8; 16]) {
         ht::chacha_poly::chacha20poly1305_encrypt(key, nonce, pt, aad)
     }
     #[must_use]
-    pub fn chacha20poly1305_decrypt(key: &[u8; 32], nonce: &[u8; 12], ct: &[u8], tag: &[u8; 16], aad: &[u8]) -> Option<Vec<u8>> {
+    pub fn chacha20poly1305_decrypt(
+        key: &[u8; 32],
+        nonce: &[u8; 12],
+        ct: &[u8],
+        tag: &[u8; 16],
+        aad: &[u8],
+    ) -> Option<Vec<u8>> {
         ht::chacha_poly::chacha20poly1305_decrypt(key, nonce, ct, tag, aad)
     }
     #[must_use]
@@ -242,11 +294,23 @@ mod imp {
         ht::ecdsa_p256_verify(pubkey, &ht::sha256(msg), sig)
     }
     #[must_use]
-    pub fn quic_seal(key: &[u8; 32], iv: &[u8; 12], pn: u64, header: &[u8], payload: &[u8]) -> Vec<u8> {
+    pub fn quic_seal(
+        key: &[u8; 32],
+        iv: &[u8; 12],
+        pn: u64,
+        header: &[u8],
+        payload: &[u8],
+    ) -> Vec<u8> {
         ht::quic::quic_seal(key, iv, pn, header, payload)
     }
     #[must_use]
-    pub fn quic_open(key: &[u8; 32], iv: &[u8; 12], pn: u64, header: &[u8], sealed: &[u8]) -> Option<Vec<u8>> {
+    pub fn quic_open(
+        key: &[u8; 32],
+        iv: &[u8; 12],
+        pn: u64,
+        header: &[u8],
+        sealed: &[u8],
+    ) -> Option<Vec<u8>> {
         ht::quic::quic_open(key, iv, pn, header, sealed)
     }
     #[must_use]
@@ -277,7 +341,9 @@ mod tests {
     }
 
     fn unhex(s: &str) -> Vec<u8> {
-        (0..s.len() / 2).map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap()).collect()
+        (0..s.len() / 2)
+            .map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap())
+            .collect()
     }
 
     // ── RFC known-answer tests (independent of either backend) ────────────────────────────
@@ -316,23 +382,36 @@ mod tests {
     #[test]
     fn rfc7748_x25519_vector() {
         // RFC 7748 §5.2, first vector.
-        let k: [u8; 32] = unhex("a546e36bf0527c9d3b16154b82465edd62144c0ac1fc5a18506a2244ba449ac4").try_into().unwrap();
-        let u: [u8; 32] = unhex("e6db6867583030db3594c1a424b15f7c726624ec26b3353b10a903a6d0ab1c4c").try_into().unwrap();
-        let want: [u8; 32] = unhex("c3da55379de9c6908e94ea4df28d084f32eccf03491c71f754b4075577a28552").try_into().unwrap();
+        let k: [u8; 32] = unhex("a546e36bf0527c9d3b16154b82465edd62144c0ac1fc5a18506a2244ba449ac4")
+            .try_into()
+            .unwrap();
+        let u: [u8; 32] = unhex("e6db6867583030db3594c1a424b15f7c726624ec26b3353b10a903a6d0ab1c4c")
+            .try_into()
+            .unwrap();
+        let want: [u8; 32] =
+            unhex("c3da55379de9c6908e94ea4df28d084f32eccf03491c71f754b4075577a28552")
+                .try_into()
+                .unwrap();
         assert_eq!(x25519_shared(&k, &u), Some(want));
     }
 
     #[test]
     fn rfc8439_chacha20_poly1305_aead_vector() {
         // RFC 8439 §2.8.2.
-        let key: [u8; 32] = unhex("808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f").try_into().unwrap();
+        let key: [u8; 32] =
+            unhex("808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f")
+                .try_into()
+                .unwrap();
         let nonce: [u8; 12] = unhex("070000004041424344454647").try_into().unwrap();
         let aad = unhex("50515253c0c1c2c3c4c5c6c7");
         let pt = b"Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the future, sunscreen would be it.";
         let (ct, tag) = chacha20poly1305_encrypt(&key, &nonce, pt, &aad);
         assert_eq!(&ct[..16], &unhex("d31a8d34648e60db7b86afbc53ef7ec2")[..]);
         assert_eq!(tag.to_vec(), unhex("1ae10b594f09e26a7e902ecbd0600691"));
-        assert_eq!(chacha20poly1305_decrypt(&key, &nonce, &ct, &tag, &aad).as_deref(), Some(&pt[..]));
+        assert_eq!(
+            chacha20poly1305_decrypt(&key, &nonce, &ct, &tag, &aad).as_deref(),
+            Some(&pt[..])
+        );
     }
 
     // ── differential: aws-lc-rs must equal hashtrinity byte for byte ──────────────────────
@@ -344,10 +423,17 @@ mod tests {
             let msg = ht::rand_bytes(len);
             assert_eq!(ed25519_pubkey(&seed), ht::ed25519_pubkey(&seed));
             let sig = ed25519_sign(&seed, &msg);
-            assert_eq!(sig, ht::ed25519_sign(&seed, &msg), "deterministic signatures must agree (len {len})");
+            assert_eq!(
+                sig,
+                ht::ed25519_sign(&seed, &msg),
+                "deterministic signatures must agree (len {len})"
+            );
             let pk = ed25519_pubkey(&seed);
             assert!(ed25519_verify(&pk, &msg, &sig));
-            assert!(ht::ed25519_verify(&pk, &msg, &sig), "hashtrinity accepts aws-lc signatures");
+            assert!(
+                ht::ed25519_verify(&pk, &msg, &sig),
+                "hashtrinity accepts aws-lc signatures"
+            );
         }
     }
 
@@ -359,7 +445,9 @@ mod tests {
         assert!(!ed25519_verify(&pk, b"other", &sig));
         assert!(!ed25519_verify(&ed25519_pubkey(&rnd::<32>()), b"msg", &sig));
         // Malleability: S + L is the same point equation but a non-canonical S; must be refused.
-        let l: [u8; 32] = unhex("edd3f55c1a631258d69cf7a2def9de1400000000000000000000000000000010").try_into().unwrap();
+        let l: [u8; 32] = unhex("edd3f55c1a631258d69cf7a2def9de1400000000000000000000000000000010")
+            .try_into()
+            .unwrap();
         let mut s_plus_l = sig;
         let mut carry = 0u16;
         for i in 0..32 {
@@ -367,7 +455,10 @@ mod tests {
             s_plus_l[32 + i] = (v & 0xff) as u8;
             carry = v >> 8;
         }
-        assert!(!ed25519_verify(&pk, b"msg", &s_plus_l), "non-canonical S must not verify");
+        assert!(
+            !ed25519_verify(&pk, b"msg", &s_plus_l),
+            "non-canonical S must not verify"
+        );
     }
 
     #[test]
@@ -381,7 +472,10 @@ mod tests {
             let pb = x25519_pubkey(&b);
             assert_eq!(x25519_shared(&a, &pb), Some(ht::x25519(&a, &pb)));
             // Both sides of a DH agree.
-            assert_eq!(x25519_shared(&a, &x25519_pubkey(&b)), x25519_shared(&b, &x25519_pubkey(&a)));
+            assert_eq!(
+                x25519_shared(&a, &x25519_pubkey(&b)),
+                x25519_shared(&b, &x25519_pubkey(&a))
+            );
         }
     }
 
@@ -391,8 +485,16 @@ mod tests {
         let zero = [0u8; 32];
         let mut one = [0u8; 32];
         one[0] = 1;
-        assert_eq!(x25519_shared(&secret, &zero), None, "the identity point yields an all-zero secret");
-        assert_eq!(x25519_shared(&secret, &one), None, "the order-1/order-4 point is refused too");
+        assert_eq!(
+            x25519_shared(&secret, &zero),
+            None,
+            "the identity point yields an all-zero secret"
+        );
+        assert_eq!(
+            x25519_shared(&secret, &one),
+            None,
+            "the order-1/order-4 point is refused too"
+        );
     }
 
     #[test]
@@ -403,10 +505,17 @@ mod tests {
             let pt = ht::rand_bytes(len);
             let aad = ht::rand_bytes(len % 37);
             let (ct, tag) = chacha20poly1305_encrypt(&key, &nonce, &pt, &aad);
-            let (ht_ct, ht_tag) = ht::chacha_poly::chacha20poly1305_encrypt(&key, &nonce, &pt, &aad);
+            let (ht_ct, ht_tag) =
+                ht::chacha_poly::chacha20poly1305_encrypt(&key, &nonce, &pt, &aad);
             assert_eq!((&ct, tag), (&ht_ct, ht_tag), "len {len}");
-            assert_eq!(chacha20poly1305_decrypt(&key, &nonce, &ht_ct, &ht_tag, &aad).as_deref(), Some(&pt[..]));
-            assert_eq!(ht::chacha_poly::chacha20poly1305_decrypt(&key, &nonce, &ct, &tag, &aad).as_deref(), Some(&pt[..]));
+            assert_eq!(
+                chacha20poly1305_decrypt(&key, &nonce, &ht_ct, &ht_tag, &aad).as_deref(),
+                Some(&pt[..])
+            );
+            assert_eq!(
+                ht::chacha_poly::chacha20poly1305_decrypt(&key, &nonce, &ct, &tag, &aad).as_deref(),
+                Some(&pt[..])
+            );
 
             // Any single-bit change in ciphertext, tag, aad or nonce must fail.
             if !ct.is_empty() {
@@ -428,7 +537,10 @@ mod tests {
 
     #[test]
     fn sha256_and_hmac_match_hashtrinity_and_published_vectors() {
-        assert_eq!(sha256(b"abc"), unhex("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad").as_slice());
+        assert_eq!(
+            sha256(b"abc"),
+            unhex("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad").as_slice()
+        );
         assert_eq!(
             hmac_sha256(b"Jefe", b"what do ya want for nothing?").to_vec(),
             unhex("5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843")
@@ -438,7 +550,11 @@ mod tests {
             assert_eq!(sha256(&msg), ht::sha256(&msg), "sha256 len {len}");
             for klen in [0usize, 1, 32, 64, 65, 200] {
                 let key = ht::rand_bytes(klen);
-                assert_eq!(hmac_sha256(&key, &msg), ht::hmac_sha256(&key, &msg), "hmac key {klen} msg {len}");
+                assert_eq!(
+                    hmac_sha256(&key, &msg),
+                    ht::hmac_sha256(&key, &msg),
+                    "hmac key {klen} msg {len}"
+                );
             }
         }
     }
@@ -447,25 +563,43 @@ mod tests {
     fn ecdsa_p256_verify_matches_hashtrinity_on_its_signatures() {
         for _ in 0..8 {
             let secret = rnd::<32>();
-            let Some(pk) = (secret != [0u8; 32]).then(|| ht::p256_pubkey(&secret)) else { continue };
+            let Some(pk) = (secret != [0u8; 32]).then(|| ht::p256_pubkey(&secret)) else {
+                continue;
+            };
             let msg = ht::rand_bytes(100);
             let sig = ht::ecdsa_p256_sign(&secret, &ht::sha256(&msg));
             if sig == [0u8; 64] {
                 continue;
             }
-            assert!(ht::ecdsa_p256_verify(&pk, &ht::sha256(&msg), &sig), "hashtrinity signs");
-            assert!(ecdsa_p256_sha256_verify(&pk, &msg, &sig), "aws-lc verifies the same signature");
+            assert!(
+                ht::ecdsa_p256_verify(&pk, &ht::sha256(&msg), &sig),
+                "hashtrinity signs"
+            );
+            assert!(
+                ecdsa_p256_sha256_verify(&pk, &msg, &sig),
+                "aws-lc verifies the same signature"
+            );
             let mut other = msg.clone();
             other.push(0);
-            assert!(!ecdsa_p256_sha256_verify(&pk, &other, &sig), "a different message must not verify");
+            assert!(
+                !ecdsa_p256_sha256_verify(&pk, &other, &sig),
+                "a different message must not verify"
+            );
             let mut bad = sig;
             bad[63] ^= 1;
-            assert!(!ecdsa_p256_sha256_verify(&pk, &msg, &bad), "a flipped signature must not verify");
+            assert!(
+                !ecdsa_p256_sha256_verify(&pk, &msg, &bad),
+                "a flipped signature must not verify"
+            );
         }
         // Off-curve public point: both implementations refuse it.
         let off_curve = [1u8; 64];
         assert!(!ecdsa_p256_sha256_verify(&off_curve, b"m", &[1u8; 64]));
-        assert!(!ht::ecdsa_p256_verify(&off_curve, &ht::sha256(b"m"), &[1u8; 64]));
+        assert!(!ht::ecdsa_p256_verify(
+            &off_curve,
+            &ht::sha256(b"m"),
+            &[1u8; 64]
+        ));
     }
 
     #[test]
@@ -477,14 +611,30 @@ mod tests {
                 let header = ht::rand_bytes(len % 29 + 1);
                 let payload = ht::rand_bytes(len);
                 let sealed = quic_seal(&key, &iv, pn, &header, &payload);
-                assert_eq!(sealed, ht::quic::quic_seal(&key, &iv, pn, &header, &payload), "len {len} pn {pn}");
-                assert_eq!(quic_open(&key, &iv, pn, &header, &sealed).as_deref(), Some(&payload[..]));
-                assert_eq!(ht::quic::quic_open(&key, &iv, pn, &header, &sealed).as_deref(), Some(&payload[..]));
-                assert!(quic_open(&key, &iv, pn ^ 1, &header, &sealed).is_none(), "wrong packet number");
+                assert_eq!(
+                    sealed,
+                    ht::quic::quic_seal(&key, &iv, pn, &header, &payload),
+                    "len {len} pn {pn}"
+                );
+                assert_eq!(
+                    quic_open(&key, &iv, pn, &header, &sealed).as_deref(),
+                    Some(&payload[..])
+                );
+                assert_eq!(
+                    ht::quic::quic_open(&key, &iv, pn, &header, &sealed).as_deref(),
+                    Some(&payload[..])
+                );
+                assert!(
+                    quic_open(&key, &iv, pn ^ 1, &header, &sealed).is_none(),
+                    "wrong packet number"
+                );
                 if !header.is_empty() {
                     let mut bad_header = header.clone();
                     bad_header[0] ^= 1;
-                    assert!(quic_open(&key, &iv, pn, &bad_header, &sealed).is_none(), "tampered header");
+                    assert!(
+                        quic_open(&key, &iv, pn, &bad_header, &sealed).is_none(),
+                        "tampered header"
+                    );
                 }
             }
         }
@@ -494,12 +644,20 @@ mod tests {
 
     #[test]
     fn quic_header_protection_matches_hashtrinity_and_rfc9001() {
-        let hp: [u8; 32] = unhex("25a282b9e82f06f21f488917a4fc8f1b73573685608597d0efcb076b0ab7a7a4").try_into().unwrap();
-        let sample: [u8; 16] = unhex("5e5cd55c41f69080575d7999c25a5bfb").try_into().unwrap();
+        let hp: [u8; 32] =
+            unhex("25a282b9e82f06f21f488917a4fc8f1b73573685608597d0efcb076b0ab7a7a4")
+                .try_into()
+                .unwrap();
+        let sample: [u8; 16] = unhex("5e5cd55c41f69080575d7999c25a5bfb")
+            .try_into()
+            .unwrap();
         assert_eq!(quic_hp_mask(&hp, &sample).to_vec(), unhex("aefefe7d03"));
         for _ in 0..64 {
             let (hp, sample) = (rnd::<32>(), rnd::<16>());
-            assert_eq!(quic_hp_mask(&hp, &sample), ht::quic::quic_hp_mask(&hp, &sample));
+            assert_eq!(
+                quic_hp_mask(&hp, &sample),
+                ht::quic::quic_hp_mask(&hp, &sample)
+            );
         }
     }
 }

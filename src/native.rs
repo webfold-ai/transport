@@ -39,16 +39,19 @@
 //! `seal_frame`/`open_frame`).
 
 use super::{BiStream, BoxFuture, Connection, PeerId, Transport};
+use crate::prim::{
+    chacha20poly1305_decrypt, chacha20poly1305_encrypt, ed25519_pubkey, ed25519_sign,
+    ed25519_verify, x25519_pubkey, x25519_shared,
+};
 use apeiron::map::hashtrinity::crypto::blake3;
-use crate::prim::{chacha20poly1305_decrypt, chacha20poly1305_encrypt, ed25519_pubkey, ed25519_sign, ed25519_verify, x25519_pubkey, x25519_shared};
 use std::collections::HashMap;
 use std::io;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::net::{TcpListener, TcpStream};
 
 /// The handshake message each side sends first: static identity + a fresh ephemeral X25519
 /// public key + a signature binding the two (proves the sender holds the static secret key).
@@ -69,7 +72,11 @@ impl HandshakeMsg {
     pub(super) fn build(static_secret: &[u8; 32], ephemeral_pubkey: &[u8; 32]) -> Self {
         let static_pubkey = ed25519_pubkey(static_secret);
         let signature = ed25519_sign(static_secret, ephemeral_pubkey);
-        HandshakeMsg { static_pubkey, ephemeral_pubkey: *ephemeral_pubkey, signature }
+        HandshakeMsg {
+            static_pubkey,
+            ephemeral_pubkey: *ephemeral_pubkey,
+            signature,
+        }
     }
 
     pub(super) fn to_bytes(&self) -> [u8; HANDSHAKE_MSG_LEN] {
@@ -87,9 +94,16 @@ impl HandshakeMsg {
         static_pubkey.copy_from_slice(&buf[..32]);
         ephemeral_pubkey.copy_from_slice(&buf[32..64]);
         signature.copy_from_slice(&buf[64..128]);
-        let msg = HandshakeMsg { static_pubkey, ephemeral_pubkey, signature };
+        let msg = HandshakeMsg {
+            static_pubkey,
+            ephemeral_pubkey,
+            signature,
+        };
         if !ed25519_verify(&msg.static_pubkey, &msg.ephemeral_pubkey, &msg.signature) {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "handshake signature verification failed"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "handshake signature verification failed",
+            ));
         }
         Ok(msg)
     }
@@ -99,7 +113,11 @@ impl HandshakeMsg {
 /// binds both sides' static + ephemeral public keys — domain-separated per direction so
 /// client→server and server→client frames never share a nonce space, and per-transcript so a
 /// key can't be replayed against a different pair of peers/sessions.
-pub(super) fn derive_session_keys(shared_secret: &[u8; 32], client: &HandshakeMsg, server: &HandshakeMsg) -> ([u8; 32], [u8; 32]) {
+pub(super) fn derive_session_keys(
+    shared_secret: &[u8; 32],
+    client: &HandshakeMsg,
+    server: &HandshakeMsg,
+) -> ([u8; 32], [u8; 32]) {
     let mut transcript = Vec::with_capacity(32 * 4 + 3);
     transcript.extend_from_slice(shared_secret);
     transcript.extend_from_slice(&client.static_pubkey);
@@ -133,11 +151,24 @@ pub(super) fn resolve_session_keys(
 ) -> io::Result<(PeerId, [u8; 32], [u8; 32])> {
     // A low-order peer point forces an all-zero shared secret (a known contributory-behaviour
     // attack: the "session key" would be computable by anyone). Refuse the handshake.
-    let shared_secret = x25519_shared(ephemeral_secret, &peer_msg.ephemeral_pubkey)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "peer ephemeral key is of low order"))?;
-    let (client_msg, server_msg) = if is_client { (own_msg, peer_msg) } else { (peer_msg, own_msg) };
+    let shared_secret =
+        x25519_shared(ephemeral_secret, &peer_msg.ephemeral_pubkey).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "peer ephemeral key is of low order",
+            )
+        })?;
+    let (client_msg, server_msg) = if is_client {
+        (own_msg, peer_msg)
+    } else {
+        (peer_msg, own_msg)
+    };
     let (c2s_key, s2c_key) = derive_session_keys(&shared_secret, client_msg, server_msg);
-    let (send_key, recv_key) = if is_client { (c2s_key, s2c_key) } else { (s2c_key, c2s_key) };
+    let (send_key, recv_key) = if is_client {
+        (c2s_key, s2c_key)
+    } else {
+        (s2c_key, c2s_key)
+    };
     Ok((peer_msg.static_pubkey, send_key, recv_key))
 }
 
@@ -217,7 +248,10 @@ async fn read_sealed_frame(
     // counter can ever equal it afterwards.
     let prev = last_counter.load(Ordering::SeqCst);
     if counter <= prev {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "replayed or out-of-order frame counter"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "replayed or out-of-order frame counter",
+        ));
     }
 
     let mut len_buf = [0u8; 4];
@@ -226,7 +260,10 @@ async fn read_sealed_frame(
     // The length is not yet authenticated: without a cap, one unauthenticated header makes us
     // allocate up to 4 GiB per connection (any Ed25519 key passes the handshake).
     if ct_len > MAX_FRAME_CIPHERTEXT {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "sealed frame exceeds the maximum size"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "sealed frame exceeds the maximum size",
+        ));
     }
 
     let mut ct = vec![0u8; ct_len];
@@ -236,16 +273,24 @@ async fn read_sealed_frame(
 
     let nonce = nonce_from_counter(counter);
     let plaintext = chacha20poly1305_decrypt(key, &nonce, &ct, &tag, b"bedrock-transport-native")
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "frame authentication failed"))?;
+        .ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "frame authentication failed")
+    })?;
     last_counter.store(counter, Ordering::SeqCst);
 
     if plaintext.len() < 12 {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "sealed frame too short"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "sealed frame too short",
+        ));
     }
     let stream_id = u32::from_le_bytes(plaintext[..4].try_into().unwrap());
     let payload_len = u64::from_le_bytes(plaintext[4..12].try_into().unwrap()) as usize;
     if plaintext.len() != 12 + payload_len {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "sealed frame length mismatch"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "sealed frame length mismatch",
+        ));
     }
     Ok((stream_id, plaintext[12..].to_vec()))
 }
@@ -321,16 +366,23 @@ impl Transport for NativeEndpoint {
         self.peer_id
     }
 
-    fn connect<'a>(&'a self, addr: &'a str, _alpn: &'a [u8]) -> BoxFuture<'a, io::Result<NativeConnection>> {
+    fn connect<'a>(
+        &'a self,
+        addr: &'a str,
+        _alpn: &'a [u8],
+    ) -> BoxFuture<'a, io::Result<NativeConnection>> {
         let addr = addr.to_string();
         let connections = self.connections.clone();
         let secret_key = self.secret_key;
         Box::pin(async move {
             let mut stream = TcpStream::connect(&addr).await?;
             let peer_addr = stream.peer_addr().ok();
-            let (peer_id, send_key, recv_key) = tokio::time::timeout(HANDSHAKE_TIMEOUT, run_handshake(&mut stream, &secret_key, true))
-                .await
-                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "handshake timed out"))??;
+            let (peer_id, send_key, recv_key) = tokio::time::timeout(
+                HANDSHAKE_TIMEOUT,
+                run_handshake(&mut stream, &secret_key, true),
+            )
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "handshake timed out"))??;
             let (read_half, write_half) = stream.into_split();
             let conn = NativeConnection::new(
                 read_half,
@@ -360,7 +412,8 @@ impl Transport for NativeEndpoint {
                 None => {
                     let (tx, rx) = tokio::sync::mpsc::channel::<NativeConnection>(64);
                     tokio::spawn(async move {
-                        let inflight = Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT_HANDSHAKES));
+                        let inflight =
+                            Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT_HANDSHAKES));
                         loop {
                             let permit = match inflight.clone().acquire_owned().await {
                                 Ok(p) => p,
@@ -378,10 +431,23 @@ impl Transport for NativeEndpoint {
                             let tx = tx.clone();
                             tokio::spawn(async move {
                                 let _permit = permit;
-                                let hs = tokio::time::timeout(HANDSHAKE_TIMEOUT, run_handshake(&mut stream, &secret_key, false)).await;
-                                let Ok(Ok((peer_id, send_key, recv_key))) = hs else { return };
+                                let hs = tokio::time::timeout(
+                                    HANDSHAKE_TIMEOUT,
+                                    run_handshake(&mut stream, &secret_key, false),
+                                )
+                                .await;
+                                let Ok(Ok((peer_id, send_key, recv_key))) = hs else {
+                                    return;
+                                };
                                 let (read_half, write_half) = stream.into_split();
-                                let conn = NativeConnection::new(read_half, write_half, peer_id, send_key, recv_key, Some(peer_addr.to_string()));
+                                let conn = NativeConnection::new(
+                                    read_half,
+                                    write_half,
+                                    peer_id,
+                                    send_key,
+                                    recv_key,
+                                    Some(peer_addr.to_string()),
+                                );
                                 let _ = tx.send(conn).await;
                             });
                         }
@@ -470,15 +536,25 @@ impl Connection for NativeConnection {
         let recv_last_counter = self.recv_last_counter.clone();
         Box::pin(async move {
             let stream_id: u32 = 0; // simplified: single stream per open_bi call
-            let send: Box<dyn BiStream> = Box::new(SealedStreamSend { write, stream_id, key: send_key, counter: send_counter });
-            let recv: Box<dyn BiStream> = Box::new(SealedStreamRecv { read, stream_id, key: recv_key, last_counter: recv_last_counter });
+            let send: Box<dyn BiStream> = Box::new(SealedStreamSend {
+                write,
+                stream_id,
+                key: send_key,
+                counter: send_counter,
+            });
+            let recv: Box<dyn BiStream> = Box::new(SealedStreamRecv {
+                read,
+                stream_id,
+                key: recv_key,
+                last_counter: recv_last_counter,
+            });
             Ok((send, recv))
         })
     }
 
-
-
-    fn accept_bi<'a>(&'a self) -> BoxFuture<'a, io::Result<(Box<dyn BiStream>, Box<dyn BiStream>)>> {
+    fn accept_bi<'a>(
+        &'a self,
+    ) -> BoxFuture<'a, io::Result<(Box<dyn BiStream>, Box<dyn BiStream>)>> {
         self.open_bi()
     }
 
@@ -505,11 +581,21 @@ struct SealedStreamSend {
 
 impl BiStream for SealedStreamSend {
     fn read<'a>(&'a mut self, _buf: &'a mut [u8]) -> BoxFuture<'a, io::Result<usize>> {
-        Box::pin(async { Err(io::Error::new(io::ErrorKind::InvalidInput, "cannot read from send stream")) })
+        Box::pin(async {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cannot read from send stream",
+            ))
+        })
     }
 
     fn read_exact<'a>(&'a mut self, _buf: &'a mut [u8]) -> BoxFuture<'a, io::Result<()>> {
-        Box::pin(async { Err(io::Error::new(io::ErrorKind::InvalidInput, "cannot read from send stream")) })
+        Box::pin(async {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cannot read from send stream",
+            ))
+        })
     }
 
     fn write_all<'a>(&'a mut self, data: &'a [u8]) -> BoxFuture<'a, io::Result<()>> {
@@ -557,7 +643,10 @@ impl BiStream for SealedStreamRecv {
             let mut r = read.lock().await;
             let (frame_stream_id, payload) = read_sealed_frame(&mut r, &key, &last_counter).await?;
             if frame_stream_id != stream_id {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "stream id mismatch"));
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "stream id mismatch",
+                ));
             }
             let to_copy = payload.len().min(buf.len());
             buf[..to_copy].copy_from_slice(&payload[..to_copy]);
@@ -574,10 +663,16 @@ impl BiStream for SealedStreamRecv {
             let mut r = read.lock().await;
             let (frame_stream_id, payload) = read_sealed_frame(&mut r, &key, &last_counter).await?;
             if frame_stream_id != stream_id {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "stream id mismatch"));
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "stream id mismatch",
+                ));
             }
             if payload.len() != buf.len() {
-                return Err(io::Error::new(io::ErrorKind::InvalidInput, "frame size mismatch"));
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "frame size mismatch",
+                ));
             }
             buf.copy_from_slice(&payload);
             Ok(())
@@ -585,7 +680,12 @@ impl BiStream for SealedStreamRecv {
     }
 
     fn write_all<'a>(&'a mut self, _data: &'a [u8]) -> BoxFuture<'a, io::Result<()>> {
-        Box::pin(async { Err(io::Error::new(io::ErrorKind::InvalidInput, "cannot write to recv stream")) })
+        Box::pin(async {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cannot write to recv stream",
+            ))
+        })
     }
 
     fn finish<'a>(&'a mut self) -> BoxFuture<'a, io::Result<()>> {
@@ -620,7 +720,10 @@ mod tests {
             let mut got = 0usize;
             let mut buf = [0u8; 16];
             while got < WRITERS * PER_WRITER {
-                let n = recv.read(&mut buf).await.expect("no frame may be rejected as a replay");
+                let n = recv
+                    .read(&mut buf)
+                    .await
+                    .expect("no frame may be rejected as a replay");
                 assert_eq!(n, 16);
                 got += 1;
             }
@@ -644,7 +747,13 @@ mod tests {
         for t in tasks {
             t.await.unwrap();
         }
-        assert_eq!(tokio::time::timeout(std::time::Duration::from_secs(20), reader).await.unwrap().unwrap(), WRITERS * PER_WRITER);
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(20), reader)
+                .await
+                .unwrap()
+                .unwrap(),
+            WRITERS * PER_WRITER
+        );
     }
 
     /// An unauthenticated length prefix must not make the reader allocate gigabytes.
@@ -663,7 +772,9 @@ mod tests {
         let (stream, _) = listener.accept().await.unwrap();
         let (mut r, _w) = stream.into_split();
         let last = AtomicU64::new(0);
-        let err = read_sealed_frame(&mut r, &[1u8; 32], &last).await.unwrap_err();
+        let err = read_sealed_frame(&mut r, &[1u8; 32], &last)
+            .await
+            .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert!(err.to_string().contains("maximum size"), "{err}");
         attacker.abort();
@@ -684,16 +795,26 @@ mod tests {
             }
             v
         };
-        let accepter = tokio::spawn(async move { Transport::accept(&server).await.map(|c| Connection::peer_id(&c)) });
+        let accepter = tokio::spawn(async move {
+            Transport::accept(&server)
+                .await
+                .map(|c| Connection::peer_id(&c))
+        });
 
         let client = NativeEndpoint::bind("127.0.0.1:0").await.unwrap();
         let client_id = Transport::id(&client);
-        let conn = tokio::time::timeout(std::time::Duration::from_secs(5), Transport::connect(&client, &addr, b"t"))
-            .await
-            .expect("honest handshake must not wait behind stalled ones")
-            .unwrap();
+        let conn = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            Transport::connect(&client, &addr, b"t"),
+        )
+        .await
+        .expect("honest handshake must not wait behind stalled ones")
+        .unwrap();
         assert_eq!(Connection::peer_id(&conn), server_id);
-        let seen = tokio::time::timeout(std::time::Duration::from_secs(5), accepter).await.unwrap().unwrap();
+        let seen = tokio::time::timeout(std::time::Duration::from_secs(5), accepter)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(seen, Some(client_id));
     }
 
@@ -767,10 +888,16 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(Transport::id(&legacy), expected, "migrating must not change the wire identity");
+        assert_eq!(
+            Transport::id(&legacy),
+            expected,
+            "migrating must not change the wire identity"
+        );
 
         // dialkey-bound server, anonymous client.
-        let server = NativeEndpoint::bind_with_dialkey("127.0.0.1:0", dialkey).await.unwrap();
+        let server = NativeEndpoint::bind_with_dialkey("127.0.0.1:0", dialkey)
+            .await
+            .unwrap();
         assert_eq!(Transport::id(&server), expected);
         let addr = server.local_addr().unwrap();
         let server_task = tokio::spawn(async move {
@@ -780,7 +907,11 @@ mod tests {
         let client = NativeEndpoint::bind("127.0.0.1:0").await.unwrap();
         let client_id = Transport::id(&client);
         let conn = Transport::connect(&client, &addr, b"test").await.unwrap();
-        assert_eq!(Connection::peer_id(&conn), expected, "client observes the server's dialkey peer_id");
+        assert_eq!(
+            Connection::peer_id(&conn),
+            expected,
+            "client observes the server's dialkey peer_id"
+        );
         assert_eq!(server_task.await.unwrap(), client_id);
 
         // anonymous server, dialkey-bound client.
@@ -790,9 +921,15 @@ mod tests {
             let conn = Transport::accept(&server).await.unwrap();
             Connection::peer_id(&conn)
         });
-        let client = NativeEndpoint::bind_with_dialkey("127.0.0.1:0", dialkey).await.unwrap();
+        let client = NativeEndpoint::bind_with_dialkey("127.0.0.1:0", dialkey)
+            .await
+            .unwrap();
         let _conn = Transport::connect(&client, &addr, b"test").await.unwrap();
-        assert_eq!(server_task.await.unwrap(), expected, "server observes the client's dialkey peer_id");
+        assert_eq!(
+            server_task.await.unwrap(),
+            expected,
+            "server observes the client's dialkey peer_id"
+        );
     }
 
     /// The data actually on the wire must not contain the plaintext — proves the frame is
@@ -803,22 +940,30 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let secret_a = {
             let b = crate::prim::random_bytes(32);
-            let mut s = [0u8; 32]; s.copy_from_slice(&b); s
+            let mut s = [0u8; 32];
+            s.copy_from_slice(&b);
+            s
         };
         let secret_b = {
             let b = crate::prim::random_bytes(32);
-            let mut s = [0u8; 32]; s.copy_from_slice(&b); s
+            let mut s = [0u8; 32];
+            s.copy_from_slice(&b);
+            s
         };
 
         let server_task = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
-            let (_, send_key, recv_key) = run_handshake(&mut stream, &secret_b, false).await.unwrap();
+            let (_, send_key, recv_key) =
+                run_handshake(&mut stream, &secret_b, false).await.unwrap();
             (stream, send_key, recv_key)
         });
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         let mut client_stream = TcpStream::connect(addr).await.unwrap();
-        let (_, client_send_key, _client_recv_key) = run_handshake(&mut client_stream, &secret_a, true).await.unwrap();
+        let (_, client_send_key, _client_recv_key) =
+            run_handshake(&mut client_stream, &secret_a, true)
+                .await
+                .unwrap();
 
         let secret_payload = b"the quick brown fox jumps over the lazy dog - top secret";
         let sealed = seal_frame(&client_send_key, 0, 0, secret_payload);
@@ -848,7 +993,9 @@ mod tests {
 
         let sealed_5 = seal_frame(&key, 5, 0, b"five");
         client_write.write_all(&sealed_5).await.unwrap();
-        let (_, payload) = read_sealed_frame(&mut server_read, &key, &last_counter).await.unwrap();
+        let (_, payload) = read_sealed_frame(&mut server_read, &key, &last_counter)
+            .await
+            .unwrap();
         assert_eq!(payload, b"five");
         assert_eq!(last_counter.load(Ordering::SeqCst), 5);
 
@@ -859,7 +1006,9 @@ mod tests {
     }
 
     fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
-        if needle.is_empty() || haystack.len() < needle.len() { return false; }
+        if needle.is_empty() || haystack.len() < needle.len() {
+            return false;
+        }
         haystack.windows(needle.len()).any(|w| w == needle)
     }
 }

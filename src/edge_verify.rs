@@ -89,9 +89,18 @@ pub async fn sweep_shared(
     let pending = registry.lock().await.pending_validation();
     let mut results = Vec::with_capacity(pending.len());
     for record in pending {
-        let Some(challenge) = record.challenge.as_ref() else { continue };
-        let proven = probe.observe(challenge).await.proves_under(challenge, policy);
-        if let Ok(state) = registry.lock().await.record_probe(&record.fqdn, proven, max_probes) {
+        let Some(challenge) = record.challenge.as_ref() else {
+            continue;
+        };
+        let proven = probe
+            .observe(challenge)
+            .await
+            .proves_under(challenge, policy);
+        if let Ok(state) = registry
+            .lock()
+            .await
+            .record_probe(&record.fqdn, proven, max_probes)
+        {
             results.push((record.fqdn, state));
         }
     }
@@ -164,7 +173,9 @@ mod native_probe {
 
     impl Default for DnsClient {
         fn default() -> Self {
-            DnsClient { timeout: Duration::from_secs(3) }
+            DnsClient {
+                timeout: Duration::from_secs(3),
+            }
         }
     }
 
@@ -177,24 +188,41 @@ mod native_probe {
         /// Ask `server` one question. `None` on timeout, a transport error, an unparseable reply or
         /// one that does not answer this question; otherwise the reply **whatever its rcode** (the
         /// caller decides whether SERVFAIL or REFUSED matters — for a health check it does).
-        pub async fn query(&self, server: SocketAddr, name: &Name, qtype: RecordType, opts: QueryOptions) -> Option<Message> {
+        pub async fn query(
+            &self,
+            server: SocketAddr,
+            name: &Name,
+            qtype: RecordType,
+            opts: QueryOptions,
+        ) -> Option<Message> {
             let id_bytes = crate::prim::random_bytes(2);
             let id = u16::from_be_bytes([*id_bytes.first()?, *id_bytes.get(1)?]);
             let mut query = Message {
                 id,
-                flags: Flags { recursion_desired: opts.recursion_desired, ..Flags::default() },
+                flags: Flags {
+                    recursion_desired: opts.recursion_desired,
+                    ..Flags::default()
+                },
                 questions: vec![Question::new(name.clone(), qtype)],
                 ..Message::default()
             };
             if opts.dnssec_ok {
-                query.additionals.push(Record { name: Name::root(), class: EDNS_UDP_PAYLOAD, ttl: EDNS_DO_TTL, data: RData::Unknown(41, Vec::new()) });
+                query.additionals.push(Record {
+                    name: Name::root(),
+                    class: EDNS_UDP_PAYLOAD,
+                    ttl: EDNS_DO_TTL,
+                    data: RData::Unknown(41, Vec::new()),
+                });
             }
-            let reply = match tokio::time::timeout(self.timeout, udp_exchange(server, &query)).await {
+            let reply = match tokio::time::timeout(self.timeout, udp_exchange(server, &query)).await
+            {
                 Ok(Some(m)) => m,
                 _ => return None,
             };
             let reply = if reply.flags.truncated {
-                tokio::time::timeout(self.timeout, tcp_exchange(server, &query)).await.ok()??
+                tokio::time::timeout(self.timeout, tcp_exchange(server, &query))
+                    .await
+                    .ok()??
             } else {
                 reply
             };
@@ -228,7 +256,10 @@ mod native_probe {
         /// customer domains.
         #[must_use]
         pub fn with_resolvers(resolvers: Vec<SocketAddr>) -> Self {
-            NativeProbe { resolvers, timeout: Duration::from_secs(3) }
+            NativeProbe {
+                resolvers,
+                timeout: Duration::from_secs(3),
+            }
         }
 
         /// Ask each recursor in turn; the first usable (NOERROR / NXDOMAIN) answer wins.
@@ -236,10 +267,16 @@ mod native_probe {
             let qname = Name::from_ascii(name).ok()?;
             let client = DnsClient::new(self.timeout);
             for resolver in &self.resolvers {
-                let opts = QueryOptions { recursion_desired: true, dnssec_ok: false };
+                let opts = QueryOptions {
+                    recursion_desired: true,
+                    dnssec_ok: false,
+                };
                 if let Some(m) = client.query(*resolver, &qname, qtype, opts).await {
                     // Anything but a definitive answer (SERVFAIL, REFUSED...) tries the next recursor.
-                    if matches!(m.flags.response_code, ResponseCode::NoError | ResponseCode::NxDomain) {
+                    if matches!(
+                        m.flags.response_code,
+                        ResponseCode::NoError | ResponseCode::NxDomain
+                    ) {
                         return Some(m);
                     }
                 }
@@ -251,11 +288,17 @@ mod native_probe {
     /// A reply is usable only if it answers THIS question: id, QR bit and echoed question must
     /// match. Anything else is noise or an off-path spoof attempt and is treated as no answer.
     fn answers_question(query: &Message, reply: &Message) -> bool {
-        reply.flags.response && reply.id == query.id && reply.questions.first() == query.questions.first()
+        reply.flags.response
+            && reply.id == query.id
+            && reply.questions.first() == query.questions.first()
     }
 
     async fn udp_exchange(resolver: SocketAddr, query: &Message) -> Option<Message> {
-        let bind = if resolver.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
+        let bind = if resolver.is_ipv4() {
+            "0.0.0.0:0"
+        } else {
+            "[::]:0"
+        };
         // A fresh socket per query: the OS picks a random source port, which is half of the
         // off-path spoofing defence (the random id is the other half).
         let socket = tokio::net::UdpSocket::bind(bind).await.ok()?;
@@ -297,7 +340,9 @@ mod native_probe {
                 if let Some(reply) = self.query(&challenge.txt_name, RecordType::Txt).await {
                     for record in &reply.answers {
                         if let RData::Txt(segments) = &record.data {
-                            observed.txt.push(String::from_utf8_lossy(&segments.concat()).into_owned());
+                            observed
+                                .txt
+                                .push(String::from_utf8_lossy(&segments.concat()).into_owned());
                         }
                     }
                 }
@@ -306,8 +351,12 @@ mod native_probe {
                 // following an address lookup) so we see the aliases, not what they resolve to.
                 let mut current = challenge.fqdn.clone();
                 for _ in 0..MAX_CNAME_HOPS {
-                    let Some(reply) = self.query(&current, RecordType::Cname).await else { break };
-                    let Ok(owner) = Name::from_ascii(&current) else { break };
+                    let Some(reply) = self.query(&current, RecordType::Cname).await else {
+                        break;
+                    };
+                    let Ok(owner) = Name::from_ascii(&current) else {
+                        break;
+                    };
                     let next = reply.answers.iter().find_map(|r| match &r.data {
                         RData::Cname(target) if r.name == owner => Some(target.to_ascii()),
                         _ => None,
@@ -344,8 +393,12 @@ mod native_probe {
             tokio::spawn(async move {
                 let mut buf = vec![0u8; 4096];
                 loop {
-                    let Ok((n, peer)) = udp.recv_from(&mut buf).await else { return };
-                    let Ok(q) = Message::from_bytes(&buf[..n]) else { continue };
+                    let Ok((n, peer)) = udp.recv_from(&mut buf).await else {
+                        return;
+                    };
+                    let Ok(q) = Message::from_bytes(&buf[..n]) else {
+                        continue;
+                    };
                     let mut r = if truncate_udp {
                         let mut r = Message::response(q.id);
                         r.questions = q.questions.clone();
@@ -361,16 +414,26 @@ mod native_probe {
             let a = answer;
             tokio::spawn(async move {
                 loop {
-                    let Ok((mut s, _)) = tcp.accept().await else { return };
+                    let Ok((mut s, _)) = tcp.accept().await else {
+                        return;
+                    };
                     let a = a.clone();
                     tokio::spawn(async move {
                         let mut l = [0u8; 2];
-                        if s.read_exact(&mut l).await.is_err() { return }
+                        if s.read_exact(&mut l).await.is_err() {
+                            return;
+                        }
                         let mut body = vec![0u8; usize::from(u16::from_be_bytes(l))];
-                        if s.read_exact(&mut body).await.is_err() { return }
-                        let Ok(q) = Message::from_bytes(&body) else { return };
+                        if s.read_exact(&mut body).await.is_err() {
+                            return;
+                        }
+                        let Ok(q) = Message::from_bytes(&body) else {
+                            return;
+                        };
                         let r = a(&q).to_bytes();
-                        let _ = s.write_all(&u16::try_from(r.len()).unwrap().to_be_bytes()).await;
+                        let _ = s
+                            .write_all(&u16::try_from(r.len()).unwrap().to_be_bytes())
+                            .await;
                         let _ = s.write_all(&r).await;
                     });
                 }
@@ -386,7 +449,12 @@ mod native_probe {
         }
 
         fn challenge() -> Challenge {
-            Challenge::derive("app.acme.com.au", "acme", "amber-wren-1a2b3c.tascloud.app", b"s")
+            Challenge::derive(
+                "app.acme.com.au",
+                "acme",
+                "amber-wren-1a2b3c.tascloud.app",
+                b"s",
+            )
         }
 
         #[tokio::test]
@@ -396,11 +464,20 @@ mod native_probe {
                 |q| {
                     let name = q.questions[0].name.to_ascii();
                     let rec = |from: &str, to: &str| {
-                        Record::new(Name::from_ascii(from).unwrap(), 60, RData::Cname(Name::from_ascii(to).unwrap()))
+                        Record::new(
+                            Name::from_ascii(from).unwrap(),
+                            60,
+                            RData::Cname(Name::from_ascii(to).unwrap()),
+                        )
                     };
                     match name.as_str() {
-                        "app.acme.com.au." => reply_to(q, vec![rec("app.acme.com.au", "edge.vendor.example")]),
-                        "edge.vendor.example." => reply_to(q, vec![rec("edge.vendor.example", "amber-wren-1a2b3c.tascloud.app")]),
+                        "app.acme.com.au." => {
+                            reply_to(q, vec![rec("app.acme.com.au", "edge.vendor.example")])
+                        }
+                        "edge.vendor.example." => reply_to(
+                            q,
+                            vec![rec("edge.vendor.example", "amber-wren-1a2b3c.tascloud.app")],
+                        ),
                         _ => reply_to(q, vec![]),
                     }
                 },
@@ -408,7 +485,10 @@ mod native_probe {
             )
             .await;
             let observed = NativeProbe::with_resolvers(vec![addr]).observe(&ch).await;
-            assert!(observed.proves(&ch), "chain landed on the target: {observed:?}");
+            assert!(
+                observed.proves(&ch),
+                "chain landed on the target: {observed:?}"
+            );
         }
 
         #[tokio::test]
@@ -419,10 +499,21 @@ mod native_probe {
                 move |q| {
                     if q.questions[0].qtype == RecordType::Txt {
                         let (a, b) = token.split_at(30);
-                        reply_to(q, vec![
-                            Record::new(q.questions[0].name.clone(), 60, RData::Txt(vec![b"v=spf1 ~all".to_vec()])),
-                            Record::new(q.questions[0].name.clone(), 60, RData::Txt(vec![a.as_bytes().to_vec(), b.as_bytes().to_vec()])),
-                        ])
+                        reply_to(
+                            q,
+                            vec![
+                                Record::new(
+                                    q.questions[0].name.clone(),
+                                    60,
+                                    RData::Txt(vec![b"v=spf1 ~all".to_vec()]),
+                                ),
+                                Record::new(
+                                    q.questions[0].name.clone(),
+                                    60,
+                                    RData::Txt(vec![a.as_bytes().to_vec(), b.as_bytes().to_vec()]),
+                                ),
+                            ],
+                        )
                     } else {
                         reply_to(q, vec![])
                     }
@@ -430,7 +521,10 @@ mod native_probe {
                 false,
             )
             .await;
-            assert!(NativeProbe::with_resolvers(vec![addr]).observe(&ch).await.proves(&ch));
+            assert!(NativeProbe::with_resolvers(vec![addr])
+                .observe(&ch)
+                .await
+                .proves(&ch));
         }
 
         #[tokio::test]
@@ -439,12 +533,22 @@ mod native_probe {
             let token = ch.token.clone();
             let addr = serve(
                 move |q| {
-                    reply_to(q, vec![Record::new(q.questions[0].name.clone(), 60, RData::Txt(vec![token.clone().into_bytes()]))])
+                    reply_to(
+                        q,
+                        vec![Record::new(
+                            q.questions[0].name.clone(),
+                            60,
+                            RData::Txt(vec![token.clone().into_bytes()]),
+                        )],
+                    )
                 },
                 true,
             )
             .await;
-            assert!(NativeProbe::with_resolvers(vec![addr]).observe(&ch).await.proves(&ch));
+            assert!(NativeProbe::with_resolvers(vec![addr])
+                .observe(&ch)
+                .await
+                .proves(&ch));
         }
 
         #[tokio::test]
@@ -452,7 +556,16 @@ mod native_probe {
             let ch = challenge();
             let token = ch.token.clone();
             let live = serve(
-                move |q| reply_to(q, vec![Record::new(q.questions[0].name.clone(), 60, RData::Txt(vec![token.clone().into_bytes()]))]),
+                move |q| {
+                    reply_to(
+                        q,
+                        vec![Record::new(
+                            q.questions[0].name.clone(),
+                            60,
+                            RData::Txt(vec![token.clone().into_bytes()]),
+                        )],
+                    )
+                },
                 false,
             )
             .await;
@@ -469,7 +582,10 @@ mod native_probe {
             // DO, and the advertised payload size, all in the answer's TXT strings.
             let addr = serve(
                 |q| {
-                    let opt = q.additionals.iter().find(|r| r.data.record_type() == RecordType::Unknown(41));
+                    let opt = q
+                        .additionals
+                        .iter()
+                        .find(|r| r.data.record_type() == RecordType::Unknown(41));
                     let describe = format!(
                         "rd={} opt={} do={} size={}",
                         q.flags.recursion_desired,
@@ -477,7 +593,14 @@ mod native_probe {
                         opt.is_some_and(|o| o.ttl & 0x8000 != 0),
                         opt.map_or(0, |o| o.class)
                     );
-                    let mut r = reply_to(q, vec![Record::new(q.questions[0].name.clone(), 60, RData::Txt(vec![describe.into_bytes()]))]);
+                    let mut r = reply_to(
+                        q,
+                        vec![Record::new(
+                            q.questions[0].name.clone(),
+                            60,
+                            RData::Txt(vec![describe.into_bytes()]),
+                        )],
+                    );
                     if q.questions[0].name.to_ascii() == "refused.example." {
                         r.answers.clear();
                         r.flags.response_code = ResponseCode::Refused;
@@ -497,15 +620,40 @@ mod native_probe {
                 RData::Txt(s) => String::from_utf8(s.concat()).unwrap(),
                 other => panic!("{other:?}"),
             };
-            let plain = ask("x.example", QueryOptions { recursion_desired: true, dnssec_ok: false }).await.unwrap();
-            assert_eq!(text(&plain), "rd=true opt=false do=false size=0", "no EDNS unless asked");
-            let signed = ask("x.example", QueryOptions { recursion_desired: false, dnssec_ok: true }).await.unwrap();
+            let plain = ask(
+                "x.example",
+                QueryOptions {
+                    recursion_desired: true,
+                    dnssec_ok: false,
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                text(&plain),
+                "rd=true opt=false do=false size=0",
+                "no EDNS unless asked"
+            );
+            let signed = ask(
+                "x.example",
+                QueryOptions {
+                    recursion_desired: false,
+                    dnssec_ok: true,
+                },
+            )
+            .await
+            .unwrap();
             assert_eq!(text(&signed), "rd=false opt=true do=true size=1232");
-            let refused = ask("refused.example", QueryOptions::default()).await.expect("a REFUSED reply is a reply");
+            let refused = ask("refused.example", QueryOptions::default())
+                .await
+                .expect("a REFUSED reply is a reply");
             assert_eq!(refused.flags.response_code, ResponseCode::Refused);
             // ...while the proof-of-control probe still treats it as "try the next resolver".
             let probe = NativeProbe::with_resolvers(vec![addr]);
-            assert!(probe.query("refused.example", RecordType::Txt).await.is_none());
+            assert!(probe
+                .query("refused.example", RecordType::Txt)
+                .await
+                .is_none());
         }
 
         #[tokio::test]
@@ -515,14 +663,27 @@ mod native_probe {
             let addr = serve(
                 move |q| {
                     // Spoof-shaped: right id, but the echoed question is for another name.
-                    let mut r = reply_to(q, vec![Record::new(q.questions[0].name.clone(), 60, RData::Txt(vec![token.clone().into_bytes()]))]);
-                    r.questions = vec![Question::new(Name::from_ascii("other.example").unwrap(), q.questions[0].qtype)];
+                    let mut r = reply_to(
+                        q,
+                        vec![Record::new(
+                            q.questions[0].name.clone(),
+                            60,
+                            RData::Txt(vec![token.clone().into_bytes()]),
+                        )],
+                    );
+                    r.questions = vec![Question::new(
+                        Name::from_ascii("other.example").unwrap(),
+                        q.questions[0].qtype,
+                    )];
                     r
                 },
                 false,
             )
             .await;
-            assert!(!NativeProbe::with_resolvers(vec![addr]).observe(&ch).await.proves(&ch));
+            assert!(!NativeProbe::with_resolvers(vec![addr])
+                .observe(&ch)
+                .await
+                .proves(&ch));
         }
     }
 }
@@ -544,14 +705,23 @@ mod tests {
 
     impl StaticProbe {
         fn new() -> Self {
-            StaticProbe { txt: Table::new(), cname: Table::new() }
+            StaticProbe {
+                txt: Table::new(),
+                cname: Table::new(),
+            }
         }
         fn with_txt(mut self, name: &str, values: Vec<&str>) -> Self {
-            self.txt.put(name.to_string(), values.into_iter().map(String::from).collect());
+            self.txt.put(
+                name.to_string(),
+                values.into_iter().map(String::from).collect(),
+            );
             self
         }
         fn with_cname(mut self, name: &str, targets: Vec<&str>) -> Self {
-            self.cname.put(name.to_string(), targets.into_iter().map(String::from).collect());
+            self.cname.put(
+                name.to_string(),
+                targets.into_iter().map(String::from).collect(),
+            );
             self
         }
     }
@@ -560,7 +730,11 @@ mod tests {
         fn observe<'a>(&'a self, challenge: &'a Challenge) -> BoxFuture<'a, Observed> {
             Box::pin(async move {
                 Observed {
-                    txt: self.txt.get(&challenge.txt_name).cloned().unwrap_or_default(),
+                    txt: self
+                        .txt
+                        .get(&challenge.txt_name)
+                        .cloned()
+                        .unwrap_or_default(),
                     cname: self.cname.get(&challenge.fqdn).cloned().unwrap_or_default(),
                 }
             })
@@ -578,10 +752,18 @@ mod tests {
 
     fn registry_with_pending() -> (EdgeRegistry, Challenge) {
         let mut reg = EdgeRegistry::new(b"secret".to_vec());
-        let apex = crate::edge::APEXES.iter().find(|a| a.zone == "tascloud.app").unwrap();
-        reg.claim_managed_label(apex, "amber-wren-1a2b3c", route()).unwrap();
+        let apex = crate::edge::APEXES
+            .iter()
+            .find(|a| a.zone == "tascloud.app")
+            .unwrap();
+        reg.claim_managed_label(apex, "amber-wren-1a2b3c", route())
+            .unwrap();
         let rec = reg
-            .add_custom("app.example.com.au", "amber-wren-1a2b3c.tascloud.app", route())
+            .add_custom(
+                "app.example.com.au",
+                "amber-wren-1a2b3c.tascloud.app",
+                route(),
+            )
             .unwrap();
         let challenge = rec.challenge.clone().unwrap();
         (reg, challenge)
@@ -604,14 +786,25 @@ mod tests {
         let reg = tokio::sync::Mutex::new(reg);
         let probe = StaticProbe::new().with_cname(&challenge.fqdn, vec![&challenge.cname_target]);
         let results = sweep_shared(&probe, &reg, 5, ProofPolicy::TxtOnly).await;
-        assert_eq!(results[0].1, HostnameState::PendingDns, "a CNAME alone must not prove control by default");
+        assert_eq!(
+            results[0].1,
+            HostnameState::PendingDns,
+            "a CNAME alone must not prove control by default"
+        );
         let results = sweep_shared(&probe, &reg, 5, ProofPolicy::TxtOrCname).await;
-        assert_eq!(results[0].1, HostnameState::PendingCert, "...unless the deployment opts in");
+        assert_eq!(
+            results[0].1,
+            HostnameState::PendingCert,
+            "...unless the deployment opts in"
+        );
 
         let (reg, challenge) = registry_with_pending();
         let reg = tokio::sync::Mutex::new(reg);
         let probe = StaticProbe::new().with_txt(&challenge.txt_name, vec![&challenge.token]);
-        assert_eq!(sweep_shared(&probe, &reg, 5, ProofPolicy::default()).await[0].1, HostnameState::PendingCert);
+        assert_eq!(
+            sweep_shared(&probe, &reg, 5, ProofPolicy::default()).await[0].1,
+            HostnameState::PendingCert
+        );
     }
 
     #[tokio::test]
@@ -628,10 +821,15 @@ mod tests {
         let (mut reg, challenge) = registry_with_pending();
         // Pointing at a DIFFERENT tenant's managed hostname must not prove anything — it is
         // still "a CNAME into our zone", which a naive suffix check would accept.
-        let probe = StaticProbe::new().with_cname(&challenge.fqdn, vec!["someone-else-9f8e7d.tascloud.app"]);
+        let probe = StaticProbe::new()
+            .with_cname(&challenge.fqdn, vec!["someone-else-9f8e7d.tascloud.app"]);
 
         let results = sweep(&probe, &mut reg, 5).await;
-        assert_eq!(results[0].1, HostnameState::PendingDns, "must still be unproven");
+        assert_eq!(
+            results[0].1,
+            HostnameState::PendingDns,
+            "must still be unproven"
+        );
     }
 
     #[tokio::test]
@@ -650,11 +848,17 @@ mod tests {
         let probe = StaticProbe::new();
 
         for _ in 0..2 {
-            assert_eq!(sweep(&probe, &mut reg, 3).await[0].1, HostnameState::PendingDns);
+            assert_eq!(
+                sweep(&probe, &mut reg, 3).await[0].1,
+                HostnameState::PendingDns
+            );
         }
         let last = sweep(&probe, &mut reg, 3).await;
         assert!(matches!(last[0].1, HostnameState::Failed(_)));
-        assert!(sweep(&probe, &mut reg, 3).await.is_empty(), "a failed hostname leaves the sweep");
+        assert!(
+            sweep(&probe, &mut reg, 3).await.is_empty(),
+            "a failed hostname leaves the sweep"
+        );
     }
 
     #[tokio::test]
@@ -670,9 +874,16 @@ mod tests {
         let (mut reg, challenge) = registry_with_pending();
         let probe = StaticProbe::new().with_txt(
             &challenge.txt_name,
-            vec!["v=spf1 include:_spf.google.com ~all", "some-other-vendor=abc123", &challenge.token],
+            vec![
+                "v=spf1 include:_spf.google.com ~all",
+                "some-other-vendor=abc123",
+                &challenge.token,
+            ],
         );
 
-        assert_eq!(sweep(&probe, &mut reg, 5).await[0].1, HostnameState::PendingCert);
+        assert_eq!(
+            sweep(&probe, &mut reg, 5).await[0].1,
+            HostnameState::PendingCert
+        );
     }
 }

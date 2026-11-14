@@ -75,8 +75,12 @@ fn clean_host(raw: &[u8]) -> Option<String> {
     if s.is_empty() || s.len() > 253 || s.contains("..") || s.starts_with('.') || s.ends_with('.') {
         return None;
     }
-    let ok_chars = s.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'.');
-    let ok_labels = s.split('.').all(|l| !l.is_empty() && l.len() <= 63 && !l.starts_with('-') && !l.ends_with('-'));
+    let ok_chars = s
+        .bytes()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'.');
+    let ok_labels = s
+        .split('.')
+        .all(|l| !l.is_empty() && l.len() <= 63 && !l.starts_with('-') && !l.ends_with('-'));
     let is_ipv4_literal = s.bytes().all(|b| b.is_ascii_digit() || b == b'.');
     (ok_chars && ok_labels && !is_ipv4_literal).then_some(s)
 }
@@ -95,12 +99,16 @@ pub fn peek_sni(buf: &[u8]) -> Hello {
             return Hello::Invalid;
         }
     }
-    let Some(header) = buf.get(..5) else { return Hello::NeedMore };
+    let Some(header) = buf.get(..5) else {
+        return Hello::NeedMore;
+    };
     let record_len = usize::from(u16::from_be_bytes([header[3], header[4]]));
     if record_len == 0 || record_len > 16_384 {
         return Hello::Invalid;
     }
-    let Some(record) = buf.get(5..5 + record_len) else { return Hello::NeedMore };
+    let Some(record) = buf.get(5..5 + record_len) else {
+        return Hello::NeedMore;
+    };
 
     // From here the record is complete: any shortfall inside it is malformed, not "read more".
     parse_client_hello(record).map_or(Hello::Invalid, |h| h)
@@ -112,7 +120,9 @@ fn parse_client_hello(record: &[u8]) -> Option<Hello> {
         return None; // not a ClientHello
     }
     let len_bytes = r.take(3)?;
-    let hs_len = (usize::from(len_bytes[0]) << 16) | (usize::from(len_bytes[1]) << 8) | usize::from(len_bytes[2]);
+    let hs_len = (usize::from(len_bytes[0]) << 16)
+        | (usize::from(len_bytes[1]) << 8)
+        | usize::from(len_bytes[2]);
     // The handshake message must fit in this record: fragmentation across records is refused.
     let mut hello = Reader(r.take(hs_len)?);
     if !r.is_empty() {
@@ -173,12 +183,18 @@ mod tests {
 
     /// A genuine ClientHello, produced by the same rustls the edge serves with.
     fn real_hello(host: &str) -> Vec<u8> {
-        let cfg = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::aws_lc_rs::default_provider()))
-            .with_protocol_versions(&[&rustls::version::TLS13])
-            .unwrap()
-            .with_root_certificates(rustls::RootCertStore::empty())
-            .with_no_client_auth();
-        let mut conn = rustls::ClientConnection::new(Arc::new(cfg), ServerName::try_from(host.to_string()).unwrap()).unwrap();
+        let cfg = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        ))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .unwrap()
+        .with_root_certificates(rustls::RootCertStore::empty())
+        .with_no_client_auth();
+        let mut conn = rustls::ClientConnection::new(
+            Arc::new(cfg),
+            ServerName::try_from(host.to_string()).unwrap(),
+        )
+        .unwrap();
         let mut out = Vec::new();
         conn.write_tls(&mut out).unwrap();
         out
@@ -186,8 +202,14 @@ mod tests {
 
     #[test]
     fn a_real_client_hello_yields_its_server_name() {
-        assert_eq!(peek_sni(&real_hello("app.acme.com.au")), Hello::Sni("app.acme.com.au".into()));
-        assert_eq!(peek_sni(&real_hello("amber-wren-1a2b3c.tascloud.app")), Hello::Sni("amber-wren-1a2b3c.tascloud.app".into()));
+        assert_eq!(
+            peek_sni(&real_hello("app.acme.com.au")),
+            Hello::Sni("app.acme.com.au".into())
+        );
+        assert_eq!(
+            peek_sni(&real_hello("amber-wren-1a2b3c.tascloud.app")),
+            Hello::Sni("amber-wren-1a2b3c.tascloud.app".into())
+        );
     }
 
     #[test]
@@ -195,7 +217,10 @@ mod tests {
         let hello = real_hello("app.acme.com.au");
         for cut in 0..hello.len() {
             let v = peek_sni(&hello[..cut]);
-            assert!(matches!(v, Hello::NeedMore), "a prefix of a good hello is only ever 'need more' (cut {cut}): {v:?}");
+            assert!(
+                matches!(v, Hello::NeedMore),
+                "a prefix of a good hello is only ever 'need more' (cut {cut}): {v:?}"
+            );
         }
         assert!(matches!(peek_sni(&hello), Hello::Sni(_)));
     }
@@ -203,11 +228,31 @@ mod tests {
     #[test]
     fn non_tls_and_wrong_record_types_are_invalid_immediately() {
         assert_eq!(peek_sni(b"GET / HTTP/1.1\r\n"), Hello::Invalid);
-        assert_eq!(peek_sni(b"G"), Hello::Invalid, "decided on the first byte, no waiting for five");
-        assert_eq!(peek_sni(&[0x16, 0x02, 0, 0, 5]), Hello::Invalid, "SSLv2-style major version");
-        assert_eq!(peek_sni(&[0x15, 3, 3, 0, 2, 1, 0]), Hello::Invalid, "alert record");
-        assert_eq!(peek_sni(&[0x16, 3, 1, 0, 0]), Hello::Invalid, "empty record");
-        assert_eq!(peek_sni(&[0x16, 3, 1, 0xff, 0xff]), Hello::Invalid, "oversized record length");
+        assert_eq!(
+            peek_sni(b"G"),
+            Hello::Invalid,
+            "decided on the first byte, no waiting for five"
+        );
+        assert_eq!(
+            peek_sni(&[0x16, 0x02, 0, 0, 5]),
+            Hello::Invalid,
+            "SSLv2-style major version"
+        );
+        assert_eq!(
+            peek_sni(&[0x15, 3, 3, 0, 2, 1, 0]),
+            Hello::Invalid,
+            "alert record"
+        );
+        assert_eq!(
+            peek_sni(&[0x16, 3, 1, 0, 0]),
+            Hello::Invalid,
+            "empty record"
+        );
+        assert_eq!(
+            peek_sni(&[0x16, 3, 1, 0xff, 0xff]),
+            Hello::Invalid,
+            "oversized record length"
+        );
         assert_eq!(peek_sni(&[]), Hello::NeedMore);
     }
 
@@ -218,12 +263,15 @@ mod tests {
             for flip in [0x01u8, 0x80, 0xff] {
                 let mut bad = hello.clone();
                 bad[i] ^= flip;
-                match peek_sni(&bad) {
-                    Hello::Sni(h) => assert!(
-                        h == "app.acme.com.au" || h.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'.'),
+                if let Hello::Sni(h) = peek_sni(&bad) {
+                    assert!(
+                        h == "app.acme.com.au"
+                            || h.bytes().all(|b| b.is_ascii_lowercase()
+                                || b.is_ascii_digit()
+                                || b == b'-'
+                                || b == b'.'),
                         "a corrupted hello may only yield a syntactically valid name: {h}"
-                    ),
-                    _ => {}
+                    )
                 }
             }
         }
@@ -263,21 +311,50 @@ mod tests {
 
     #[test]
     fn names_are_lowercased_and_must_be_plain_dns_names() {
-        assert_eq!(peek_sni(&build(&sni_ext(&[(0, "App.ACME.com.au")]))), Hello::Sni("app.acme.com.au".into()));
-        for bad in ["", "1.2.3.4", "a..b", ".a.b", "a.b.", "-a.example.com", "a_b.example.com", "exa mple.com", &"a".repeat(64), &format!("{}.com", "a.".repeat(130))] {
-            assert_eq!(peek_sni(&build(&sni_ext(&[(0, bad)]))), Hello::Invalid, "{bad:?}");
+        assert_eq!(
+            peek_sni(&build(&sni_ext(&[(0, "App.ACME.com.au")]))),
+            Hello::Sni("app.acme.com.au".into())
+        );
+        for bad in [
+            "",
+            "1.2.3.4",
+            "a..b",
+            ".a.b",
+            "a.b.",
+            "-a.example.com",
+            "a_b.example.com",
+            "exa mple.com",
+            &"a".repeat(64),
+            &format!("{}.com", "a.".repeat(130)),
+        ] {
+            assert_eq!(
+                peek_sni(&build(&sni_ext(&[(0, bad)]))),
+                Hello::Invalid,
+                "{bad:?}"
+            );
         }
     }
 
     #[test]
     fn ambiguous_server_name_encodings_are_refused() {
         let two_names = sni_ext(&[(0, "a.example.com"), (0, "b.example.com")]);
-        assert_eq!(peek_sni(&build(&two_names)), Hello::Invalid, "two host_name entries");
+        assert_eq!(
+            peek_sni(&build(&two_names)),
+            Hello::Invalid,
+            "two host_name entries"
+        );
         let mut two_exts = sni_ext(&[(0, "a.example.com")]);
         two_exts.extend(sni_ext(&[(0, "b.example.com")]));
-        assert_eq!(peek_sni(&build(&two_exts)), Hello::Invalid, "duplicate extension");
+        assert_eq!(
+            peek_sni(&build(&two_exts)),
+            Hello::Invalid,
+            "duplicate extension"
+        );
         // Unknown name types are skipped, the host_name still counts.
-        assert_eq!(peek_sni(&build(&sni_ext(&[(7, "ignored"), (0, "a.example.com")]))), Hello::Sni("a.example.com".into()));
+        assert_eq!(
+            peek_sni(&build(&sni_ext(&[(7, "ignored"), (0, "a.example.com")]))),
+            Hello::Sni("a.example.com".into())
+        );
     }
 
     #[test]

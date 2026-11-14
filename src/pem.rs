@@ -17,7 +17,10 @@ pub fn base64_decode(s: &str) -> Option<Vec<u8>> {
         }
     }
     let clean: Vec<u8> = s.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
-    let body = clean.strip_suffix(b"==").or_else(|| clean.strip_suffix(b"=")).unwrap_or(&clean);
+    let body = clean
+        .strip_suffix(b"==")
+        .or_else(|| clean.strip_suffix(b"="))
+        .unwrap_or(&clean);
     if body.len() % 4 == 1 {
         return None;
     }
@@ -77,7 +80,10 @@ mod tests {
     #[test]
     fn pem_blocks_are_returned_in_order_and_a_corrupt_one_poisons_all() {
         let pem = "junk\n-----BEGIN CERTIFICATE-----\nZm9v\n-----END CERTIFICATE-----\n-----BEGIN CERTIFICATE-----\nYmFy\n-----END CERTIFICATE-----\n";
-        assert_eq!(blocks(pem, "CERTIFICATE"), vec![b"foo".to_vec(), b"bar".to_vec()]);
+        assert_eq!(
+            blocks(pem, "CERTIFICATE"),
+            vec![b"foo".to_vec(), b"bar".to_vec()]
+        );
         assert!(blocks(pem, "PRIVATE KEY").is_empty());
         let bad = "-----BEGIN CERTIFICATE-----\n!!!!\n-----END CERTIFICATE-----\n";
         assert!(blocks(bad, "CERTIFICATE").is_empty());

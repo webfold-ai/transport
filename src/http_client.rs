@@ -38,7 +38,10 @@ pub struct RetryPolicy {
 
 impl RetryPolicy {
     pub fn new(max_attempts: usize, backoff: std::time::Duration) -> Self {
-        RetryPolicy { max_attempts: max_attempts.max(1), backoff }
+        RetryPolicy {
+            max_attempts: max_attempts.max(1),
+            backoff,
+        }
     }
 }
 
@@ -62,7 +65,9 @@ struct StoredCookie {
 
 impl StoredCookie {
     fn is_expired(&self) -> bool {
-        self.expires_at.map(|t| std::time::SystemTime::now() > t).unwrap_or(false)
+        self.expires_at
+            .map(|t| std::time::SystemTime::now() > t)
+            .unwrap_or(false)
     }
 }
 
@@ -73,7 +78,9 @@ fn cookie_path_matches(cookie_path: &str, request_path: &str) -> bool {
     if !request_path.starts_with(cookie_path) {
         return false;
     }
-    cookie_path.len() == request_path.len() || cookie_path.ends_with('/') || request_path.as_bytes().get(cookie_path.len()) == Some(&b'/')
+    cookie_path.len() == request_path.len()
+        || cookie_path.ends_with('/')
+        || request_path.as_bytes().get(cookie_path.len()) == Some(&b'/')
 }
 
 /// Parse an RFC 7231 IMF-fixdate (`Set-Cookie`'s `Expires` format, e.g. "Wed, 21 Oct 2015
@@ -178,7 +185,8 @@ fn days_from_civil(y: u64, m: u64, d: u64) -> i64 {
 // `entry().or_default()` fits better than `Table`'s insert/overwrite-only API.
 #[derive(Debug, Default)]
 struct CookieJar {
-    by_domain: apeiron::map::hashtrinity::Table<String, std::collections::HashMap<String, StoredCookie>>,
+    by_domain:
+        apeiron::map::hashtrinity::Table<String, std::collections::HashMap<String, StoredCookie>>,
 }
 
 impl CookieJar {
@@ -188,7 +196,9 @@ impl CookieJar {
     fn store(&mut self, domain: &str, set_cookie: &str) {
         let mut segments = set_cookie.split(';');
         let Some(pair) = segments.next() else { return };
-        let Some((name, value)) = pair.trim().split_once('=') else { return };
+        let Some((name, value)) = pair.trim().split_once('=') else {
+            return;
+        };
         let (name, value) = (name.trim().to_string(), value.trim().to_string());
 
         let mut path = "/".to_string();
@@ -233,11 +243,27 @@ impl CookieJar {
             });
         }
 
-        let mut cookies = self.by_domain.get(&domain.to_string()).cloned().unwrap_or_default();
-        if expires_at.map(|t| t <= std::time::SystemTime::now()).unwrap_or(false) {
+        let mut cookies = self
+            .by_domain
+            .get(&domain.to_string())
+            .cloned()
+            .unwrap_or_default();
+        if expires_at
+            .map(|t| t <= std::time::SystemTime::now())
+            .unwrap_or(false)
+        {
             cookies.remove(&name);
         } else {
-            cookies.insert(name, StoredCookie { value, path, expires_at, secure, http_only });
+            cookies.insert(
+                name,
+                StoredCookie {
+                    value,
+                    path,
+                    expires_at,
+                    secure,
+                    http_only,
+                },
+            );
         }
         self.by_domain.put(domain.to_string(), cookies);
     }
@@ -245,7 +271,12 @@ impl CookieJar {
     /// The `Cookie` header value to send for a request to `domain` at `request_path`, over a
     /// (non-)secure connection — filters out expired cookies, path-mismatched cookies (§5.1.4),
     /// and `Secure`-flagged cookies on a plain HTTP request.
-    fn header_for(&self, domain: &str, request_path: &str, is_secure_request: bool) -> Option<String> {
+    fn header_for(
+        &self,
+        domain: &str,
+        request_path: &str,
+        is_secure_request: bool,
+    ) -> Option<String> {
         let map = self.by_domain.get(&domain.to_string())?;
         let mut pairs: Vec<(&String, &StoredCookie)> = map
             .iter()
@@ -257,7 +288,13 @@ impl CookieJar {
             return None;
         }
         pairs.sort_by_key(|(k, _)| k.as_str());
-        Some(pairs.iter().map(|(k, c)| format!("{k}={}", c.value)).collect::<Vec<_>>().join("; "))
+        Some(
+            pairs
+                .iter()
+                .map(|(k, c)| format!("{k}={}", c.value))
+                .collect::<Vec<_>>()
+                .join("; "),
+        )
     }
 }
 
@@ -294,11 +331,19 @@ pub struct Part {
 
 impl Part {
     pub fn text(value: impl Into<String>) -> Self {
-        Part { filename: None, content_type: None, body: value.into().into_bytes() }
+        Part {
+            filename: None,
+            content_type: None,
+            body: value.into().into_bytes(),
+        }
     }
 
     pub fn bytes(body: Vec<u8>) -> Self {
-        Part { filename: None, content_type: None, body }
+        Part {
+            filename: None,
+            content_type: None,
+            body,
+        }
     }
 
     pub fn file_name(mut self, name: impl Into<String>) -> Self {
@@ -330,7 +375,10 @@ impl Form {
             .unwrap_or(0);
         let a = splitmix64(now);
         let b = splitmix64(a ^ 0x5DEECE66D);
-        Form { parts: Vec::new(), boundary: format!("bedrock-{a:016x}{b:016x}") }
+        Form {
+            parts: Vec::new(),
+            boundary: format!("bedrock-{a:016x}{b:016x}"),
+        }
     }
 
     pub fn part(mut self, name: impl Into<String>, part: Part) -> Self {
@@ -360,7 +408,10 @@ impl Form {
             body.extend_from_slice(b"\r\n");
         }
         body.extend_from_slice(format!("--{}--\r\n", self.boundary).as_bytes());
-        (format!("multipart/form-data; boundary={}", self.boundary), body)
+        (
+            format!("multipart/form-data; boundary={}", self.boundary),
+            body,
+        )
     }
 }
 
@@ -491,13 +542,21 @@ async fn send_with_redirects(
     for _ in 0..=client.inner.max_redirects {
         if let Some(domain) = uri.host() {
             let is_secure = uri.scheme_str() == Some("https");
-            if let Some(cookie_header) = client.inner.cookies.lock().unwrap().header_for(domain, uri.path(), is_secure) {
+            if let Some(cookie_header) =
+                client
+                    .inner
+                    .cookies
+                    .lock()
+                    .unwrap()
+                    .header_for(domain, uri.path(), is_secure)
+            {
                 headers.insert(header::COOKIE, cookie_header);
             }
         }
 
         let (stream, was_pooled) = connect(&uri, &client.inner.resolve_overrides).await?;
-        let mut result = send_request(stream, method.clone(), &uri, headers.clone(), body.clone()).await;
+        let mut result =
+            send_request(stream, method.clone(), &uri, headers.clone(), body.clone()).await;
         if was_pooled && result.is_err() {
             // A pooled connection's first write/read failing is expected, not exceptional —
             // see `connect`'s own doc for the three real ways this happens. Retry exactly once
@@ -520,7 +579,11 @@ async fn send_with_redirects(
         if !client.inner.follow_redirects || !resp.status().is_redirection() {
             return Ok(resp);
         }
-        let Some(location) = resp.headers().get(header::LOCATION).and_then(|v| v.to_str().ok()) else {
+        let Some(location) = resp
+            .headers()
+            .get(header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+        else {
             return Ok(resp);
         };
         let next_uri = resolve_redirect_uri(&uri, location)?;
@@ -534,7 +597,10 @@ async fn send_with_redirects(
         }
         uri = next_uri;
     }
-    Err(Error::Http(format!("too many redirects (> {})", client.inner.max_redirects)))
+    Err(Error::Http(format!(
+        "too many redirects (> {})",
+        client.inner.max_redirects
+    )))
 }
 
 /// Decode a gzipped response body in place, if `Content-Encoding: gzip` is present — only
@@ -555,7 +621,9 @@ fn decode_gzip_body(resp: &mut Response) -> Result<()> {
     }
     use std::io::Read;
     let mut decoded = Vec::new();
-    flate2::read::GzDecoder::new(&resp.body[..]).read_to_end(&mut decoded).map_err(Error::Io)?;
+    flate2::read::GzDecoder::new(&resp.body[..])
+        .read_to_end(&mut decoded)
+        .map_err(Error::Io)?;
     resp.body = decoded;
     Ok(())
 }
@@ -572,7 +640,11 @@ fn resolve_redirect_uri(base: &Uri, location: &str) -> Result<Uri> {
         Some(p) => format!("{host}:{p}"),
         None => host.to_string(),
     };
-    let path = if location.starts_with('/') { location.to_string() } else { format!("/{location}") };
+    let path = if location.starts_with('/') {
+        location.to_string()
+    } else {
+        format!("/{location}")
+    };
     parse_uri(&format!("{scheme}://{authority}{path}"))
 }
 
@@ -583,7 +655,9 @@ pub struct Client {
 
 impl Client {
     pub fn new() -> Self {
-        Client { inner: Arc::new(ClientInner::default()) }
+        Client {
+            inner: Arc::new(ClientInner::default()),
+        }
     }
 
     pub fn builder() -> ClientBuilder {
@@ -674,7 +748,9 @@ impl ClientBuilder {
     }
 
     pub fn build(self) -> Client {
-        Client { inner: Arc::new(self.0) }
+        Client {
+            inner: Arc::new(self.0),
+        }
     }
 }
 
@@ -718,20 +794,28 @@ mod gzip_tests {
             }
 
             let payload: Vec<u8> = if gzip_encode {
-                let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-                encoder.write_all(plain_body).expect("write into gzip encoder");
+                let mut encoder =
+                    flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+                encoder
+                    .write_all(plain_body)
+                    .expect("write into gzip encoder");
                 encoder.finish().expect("finish gzip stream")
             } else {
                 plain_body.to_vec()
             };
 
-            let mut head = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n", payload.len());
+            let mut head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n",
+                payload.len()
+            );
             if gzip_encode {
                 head.push_str("Content-Encoding: gzip\r\n");
             }
             head.push_str("\r\n");
 
-            stream.write_all(head.as_bytes()).expect("write response head");
+            stream
+                .write_all(head.as_bytes())
+                .expect("write response head");
             stream.write_all(&payload).expect("write response body");
             let _ = stream.flush();
         });
@@ -751,7 +835,9 @@ mod gzip_tests {
             let (mut stream, _) = listener.accept().expect("accept");
             let mut buf = [0u8; 1024];
             let _ = stream.read(&mut buf);
-            stream.write_all(b"HTTP/1.1 200 OK\r\nReplay-Nonce: abc123\r\n\r\n").expect("write head");
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nReplay-Nonce: abc123\r\n\r\n")
+                .expect("write head");
             stream.flush().ok();
             // Hold the connection open, as a keep-alive server does.
             std::thread::sleep(std::time::Duration::from_secs(30));
@@ -767,21 +853,33 @@ mod gzip_tests {
         .expect("request succeeds");
         assert!(started.elapsed() < std::time::Duration::from_secs(5));
         assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(resp.headers().get("replay-nonce").and_then(|v| v.to_str().ok()), Some("abc123"));
+        assert_eq!(
+            resp.headers()
+                .get("replay-nonce")
+                .and_then(|v| v.to_str().ok()),
+            Some("abc123")
+        );
         assert!(resp.bytes().await.is_empty());
     }
 
     #[tokio::test]
     async fn gzip_response_is_transparently_decoded() {
-        let plain: &'static [u8] = b"hello from a gzip-encoded response body, decoded transparently";
+        let plain: &'static [u8] =
+            b"hello from a gzip-encoded response body, decoded transparently";
         let addr = spawn_server(plain, true);
 
         let client = Client::builder().gzip(true).build();
-        let resp = client.get(format!("http://{addr}/")).send().await.expect("request succeeds");
+        let resp = client
+            .get(format!("http://{addr}/"))
+            .send()
+            .await
+            .expect("request succeeds");
 
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(
-            resp.headers().get(header::CONTENT_ENCODING).and_then(|v| v.to_str().ok()),
+            resp.headers()
+                .get(header::CONTENT_ENCODING)
+                .and_then(|v| v.to_str().ok()),
             Some("gzip"),
         );
         assert_eq!(resp.bytes().await, plain);
@@ -796,7 +894,11 @@ mod gzip_tests {
         let addr = spawn_server(plain, false);
 
         let client = Client::builder().gzip(true).build();
-        let resp = client.get(format!("http://{addr}/")).send().await.expect("request succeeds");
+        let resp = client
+            .get(format!("http://{addr}/"))
+            .send()
+            .await
+            .expect("request succeeds");
 
         assert_eq!(resp.status(), StatusCode::OK);
         assert!(resp.headers().get(header::CONTENT_ENCODING).is_none());
@@ -809,16 +911,24 @@ mod gzip_tests {
     /// support existed.
     #[tokio::test]
     async fn gzip_opt_out_leaves_body_untouched() {
-        let plain: &'static [u8] = b"this body would decode to plain text, but gzip was never requested";
+        let plain: &'static [u8] =
+            b"this body would decode to plain text, but gzip was never requested";
         let addr = spawn_server(plain, true);
 
         let client = Client::new();
-        let resp = client.get(format!("http://{addr}/")).send().await.expect("request succeeds");
+        let resp = client
+            .get(format!("http://{addr}/"))
+            .send()
+            .await
+            .expect("request succeeds");
 
         assert_eq!(resp.status(), StatusCode::OK);
         let body = resp.bytes().await;
         assert_ne!(body, plain);
-        assert_eq!(&body[..2], &[0x1f, 0x8b], "still gzip-magic-prefixed, i.e. undecoded");
+        assert_eq!(
+            &body[..2],
+            &[0x1f, 0x8b],
+            "still gzip-magic-prefixed, i.e. undecoded"
+        );
     }
 }
-

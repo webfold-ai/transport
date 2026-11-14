@@ -104,3 +104,9 @@ name = "sync_hardening"
 required-features = ["syncfold"]
 
 [workspace]
+
+# `bind-overlay` names code written against the old bedrock `bind` crate; the feature has no
+# dependency behind it here, so it is not declared (declaring it would enable code that cannot
+# compile). Registering the name keeps `-D warnings` from rejecting the gated blocks.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("bind-overlay"))'] }

@@ -121,18 +121,17 @@
       },
       "locked": {
         "dir": "nix",
-        "lastModified": 1794529679,
-        "narHash": "sha256-fLqG7WXOrdX7RwDvTVCO68nandNwZYKtCmxuLx/cHUA=",
-        "ref": "claude/confident-hamilton-u5lcc4-pins-init",
-        "rev": "247943bcaf1e537885aa4dd9aeb363c670888e10",
+        "lastModified": 1794546363,
+        "narHash": "sha256-jQnwCQAHBRwc7LMc5T22t6oXt+uBKzLv35gZEa4LPIE=",
+        "ref": "refs/heads/main",
+        "rev": "b8cda7e4590c8aa6576d834c6363a6266ae5b9d8",
         "shallow": true,
         "type": "git",
         "url": "https://github.com/Ptyktos/caretaker"
       },
       "original": {
         "dir": "nix",
-        "ref": "claude/confident-hamilton-u5lcc4-pins-init",
-        "rev": "247943bcaf1e537885aa4dd9aeb363c670888e10",
+        "rev": "b8cda7e4590c8aa6576d834c6363a6266ae5b9d8",
         "shallow": true,
         "type": "git",
         "url": "https://github.com/Ptyktos/caretaker"

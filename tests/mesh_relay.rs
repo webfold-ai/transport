@@ -415,8 +415,10 @@ fn zone_with(records: &[(&str, u16, u64)]) -> (MeshZone, Arc<RelayStore>) {
 }
 
 fn query(name: &str, qtype: RecordType) -> Vec<u8> {
-    let mut m = Message::default();
-    m.id = 7;
+    let mut m = Message {
+        id: 7,
+        ..Message::default()
+    };
     m.flags = Flags {
         recursion_desired: true,
         ..Flags::default()

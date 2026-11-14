@@ -11,8 +11,8 @@
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
-use apeiron::map::hashtrinity::Table;
 use apeiron::map::hashtrinity::crypto::to_hex;
+use apeiron::map::hashtrinity::Table;
 use iroh::{EndpointAddr, EndpointId};
 
 use super::discovery::{BootstrapDirectory, DiscoverySource, PeerCapability, PeerDirectory};
@@ -21,7 +21,8 @@ use super::PeerId;
 pub type Result<T> = std::result::Result<T, crate::Error>;
 
 fn endpoint_id_for(peer_id: PeerId) -> Result<EndpointId> {
-    EndpointId::from_bytes(&peer_id).map_err(|e| crate::Error::Overlay(format!("invalid peer id: {e}")))
+    EndpointId::from_bytes(&peer_id)
+        .map_err(|e| crate::Error::Overlay(format!("invalid peer id: {e}")))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -105,7 +106,10 @@ impl OverlayControlPlane {
     }
 
     pub fn tenant(&self, tenant_id: impl Into<String>) -> OverlayTenantControl {
-        OverlayTenantControl { tenant_id: tenant_id.into(), plane: self.clone() }
+        OverlayTenantControl {
+            tenant_id: tenant_id.into(),
+            plane: self.clone(),
+        }
     }
 }
 
@@ -163,7 +167,9 @@ impl OverlayTenantControl {
         endpoint: EndpointAddr,
     ) -> Result<OverlayPeerRecord> {
         if capability.peer_id != *endpoint.id.as_bytes() {
-            return Err(crate::Error::Overlay("peer id mismatch between capability and endpoint address".into()));
+            return Err(crate::Error::Overlay(
+                "peer id mismatch between capability and endpoint address".into(),
+            ));
         }
 
         let record = OverlayPeerRecord {
@@ -176,7 +182,9 @@ impl OverlayTenantControl {
         self.plane.update_tenant_state(&self.tenant_id, |state| {
             state.bootstrap.register(endpoint);
             state.directory.merge(capability);
-            state.records.put(to_hex(&record.capability.peer_id), record.clone());
+            state
+                .records
+                .put(to_hex(&record.capability.peer_id), record.clone());
             Ok(())
         })?;
 
@@ -231,7 +239,10 @@ mod tests {
         let id = identity.public();
         EndpointAddr::from_parts(
             id,
-            [TransportAddr::Ip(std::net::SocketAddr::from(([127, 0, 0, 1], port)))]
+            [TransportAddr::Ip(std::net::SocketAddr::from((
+                [127, 0, 0, 1],
+                port,
+            )))],
         )
     }
 
@@ -260,13 +271,21 @@ mod tests {
         let record = tenant.publish_peer(capability, endpoint.clone()).unwrap();
         assert_eq!(record.endpoint.id, endpoint.id);
         assert_eq!(tenant.snapshot().len(), 1);
-        assert!(tenant.bootstrap().lookup().get_endpoint_info(endpoint.id).is_some());
+        assert!(tenant
+            .bootstrap()
+            .lookup()
+            .get_endpoint_info(endpoint.id)
+            .is_some());
         assert_eq!(tenant.known_peers().len(), 1);
 
         let detached = tenant.detach_peer(peer_id).unwrap().expect("record");
         assert_eq!(detached.state, OverlayPeerState::Detached);
         assert!(tenant.snapshot().is_empty());
-        assert!(tenant.bootstrap().lookup().get_endpoint_info(endpoint.id).is_none());
+        assert!(tenant
+            .bootstrap()
+            .lookup()
+            .get_endpoint_info(endpoint.id)
+            .is_none());
     }
 
     #[test]
@@ -297,6 +316,10 @@ mod tests {
 
         assert_eq!(tenant_a.snapshot().len(), 1);
         assert!(tenant_b.snapshot().is_empty());
-        assert!(tenant_b.bootstrap().lookup().get_endpoint_info(endpoint.id).is_none());
+        assert!(tenant_b
+            .bootstrap()
+            .lookup()
+            .get_endpoint_info(endpoint.id)
+            .is_none());
     }
 }

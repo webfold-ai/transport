@@ -105,7 +105,10 @@ impl CaaIssuer {
             v.push_str(&format!("; accounturi={uri}"));
         }
         if !self.validation_methods.is_empty() {
-            v.push_str(&format!("; validationmethods={}", self.validation_methods.join(",")));
+            v.push_str(&format!(
+                "; validationmethods={}",
+                self.validation_methods.join(",")
+            ));
         }
         v
     }
@@ -151,7 +154,10 @@ impl ZoneConfig {
     #[must_use]
     pub fn new(zone: impl Into<String>, nameservers: Vec<String>) -> Self {
         let zone = normalize(&zone.into());
-        let primary = nameservers.first().cloned().unwrap_or_else(|| format!("ns1.{zone}"));
+        let primary = nameservers
+            .first()
+            .cloned()
+            .unwrap_or_else(|| format!("ns1.{zone}"));
         ZoneConfig {
             hostmaster: format!("hostmaster.{zone}"),
             primary_ns: primary,
@@ -251,7 +257,8 @@ impl ZoneAuthority {
     /// Drop every token published for `name` — called once the order validates, so a spent
     /// challenge is not left answering.
     pub fn clear_acme_tokens(&mut self, name: &str) {
-        self.acme.remove(&format!("{ACME_LABEL}.{}", normalize(name)));
+        self.acme
+            .remove(&format!("{ACME_LABEL}.{}", normalize(name)));
     }
 
     /// Remove only this authorization's value; another order may share the name.
@@ -270,7 +277,11 @@ impl ZoneAuthority {
     /// Bind CAA issuance to the ACME account at `uri` for every zone (RFC 8657), once the account
     /// exists. Until it is called, zones publish the plain `issue` records.
     pub fn set_caa_account_uri(&mut self, uri: &str) {
-        let updated: Vec<ZoneConfig> = self.zones.iter().map(|(_, z)| z.clone().with_caa_account_uri(uri)).collect();
+        let updated: Vec<ZoneConfig> = self
+            .zones
+            .iter()
+            .map(|(_, z)| z.clone().with_caa_account_uri(uri))
+            .collect();
         for z in updated {
             self.zones.put(z.zone.clone(), z);
         }
@@ -279,7 +290,11 @@ impl ZoneAuthority {
     /// Replace every zone's CAA policy with `records` (a CA switch, a new standby, a CA removed).
     /// Takes effect on the next query; the TTL on the records is how long resolvers keep the old.
     pub fn set_caa_records(&mut self, records: &CaaRecords) {
-        let updated: Vec<ZoneConfig> = self.zones.iter().map(|(_, z)| z.clone().with_caa_records(records.clone())).collect();
+        let updated: Vec<ZoneConfig> = self
+            .zones
+            .iter()
+            .map(|(_, z)| z.clone().with_caa_records(records.clone()))
+            .collect();
         for z in updated {
             self.zones.put(z.zone.clone(), z);
         }
@@ -384,7 +399,9 @@ impl ZoneAuthority {
                 return Resolution::NxDomain;
             };
             return match qtype {
-                RecordType::Soa => soa_record(zone).map_or(Resolution::NoData, |r| Resolution::Answers(vec![r])),
+                RecordType::Soa => {
+                    soa_record(zone).map_or(Resolution::NoData, |r| Resolution::Answers(vec![r]))
+                }
                 RecordType::Ns => Resolution::Answers(
                     zone.nameservers
                         .iter()
@@ -399,7 +416,11 @@ impl ZoneAuthority {
                             Record::new(
                                 name.clone(),
                                 NS_TTL,
-                                RData::Caa { flags: 0, tag: tag.to_string(), value: value.into_bytes() },
+                                RData::Caa {
+                                    flags: 0,
+                                    tag: tag.to_string(),
+                                    value: value.into_bytes(),
+                                },
                             )
                         })
                         .collect(),
@@ -407,7 +428,9 @@ impl ZoneAuthority {
                 // The apex resolves to the edge too, so `https://tascloud.app` is not a dead
                 // name — but it is NOT a customer hostname and routes to the platform's own
                 // landing service, which is `transport::edge`'s call, not DNS's.
-                RecordType::A | RecordType::Aaaa => Resolution::Answers(self.address_records(&name, qtype)),
+                RecordType::A | RecordType::Aaaa => {
+                    Resolution::Answers(self.address_records(&name, qtype))
+                }
                 _ => Resolution::NoData,
             };
         }
@@ -426,7 +449,13 @@ impl ZoneAuthority {
             return Resolution::Answers(
                 tokens
                     .iter()
-                    .map(|t| Record::new(name.clone(), ACME_TTL, RData::Txt(vec![t.clone().into_bytes()])))
+                    .map(|t| {
+                        Record::new(
+                            name.clone(),
+                            ACME_TTL,
+                            RData::Txt(vec![t.clone().into_bytes()]),
+                        )
+                    })
                     .collect(),
             );
         }
@@ -452,7 +481,9 @@ impl ZoneAuthority {
             return Resolution::NxDomain;
         };
         match qtype {
-            RecordType::A | RecordType::Aaaa => Resolution::Answers(self.address_records(&name, qtype)),
+            RecordType::A | RecordType::Aaaa => {
+                Resolution::Answers(self.address_records(&name, qtype))
+            }
             _ => Resolution::NoData,
         }
     }
@@ -481,7 +512,11 @@ pub struct Dns01Authority(pub std::sync::Arc<tokio::sync::Mutex<ZoneAuthority>>)
 
 #[cfg(feature = "native")]
 impl crate::acme::Dns01Responder for Dns01Authority {
-    fn publish_txt<'a>(&'a self, name: &'a str, value: &'a str) -> crate::BoxFuture<'a, Result<(), crate::acme::AcmeError>> {
+    fn publish_txt<'a>(
+        &'a self,
+        name: &'a str,
+        value: &'a str,
+    ) -> crate::BoxFuture<'a, Result<(), crate::acme::AcmeError>> {
         Box::pin(async move {
             self.0.lock().await.set_acme_token(name, value);
             Ok(())
@@ -489,7 +524,9 @@ impl crate::acme::Dns01Responder for Dns01Authority {
     }
 
     fn remove_txt<'a>(&'a self, name: &'a str, value: &'a str) -> crate::BoxFuture<'a, ()> {
-        Box::pin(async move { self.0.lock().await.clear_acme_token(name, value); })
+        Box::pin(async move {
+            self.0.lock().await.clear_acme_token(name, value);
+        })
     }
 }
 
@@ -578,7 +615,12 @@ pub fn udp_limit(query: &[u8]) -> usize {
     const CEIL: usize = 1232;
     Message::from_bytes(query)
         .ok()
-        .and_then(|m| m.additionals.iter().find(|r| r.data.record_type() == RecordType::Unknown(41)).map(|r| usize::from(r.class)))
+        .and_then(|m| {
+            m.additionals
+                .iter()
+                .find(|r| r.data.record_type() == RecordType::Unknown(41))
+                .map(|r| usize::from(r.class))
+        })
         .map_or(FLOOR, |advertised| advertised.clamp(FLOOR, CEIL))
 }
 
@@ -607,7 +649,10 @@ pub fn fit_for_udp(reply: Vec<u8>, limit: usize) -> Vec<u8> {
 /// # Errors
 /// If the socket cannot be bound.
 #[cfg(feature = "native")]
-pub async fn serve_udp_with(addr: &str, handler: std::sync::Arc<dyn DnsHandler>) -> std::io::Result<()> {
+pub async fn serve_udp_with(
+    addr: &str,
+    handler: std::sync::Arc<dyn DnsHandler>,
+) -> std::io::Result<()> {
     let socket = tokio::net::UdpSocket::bind(addr).await?;
     tracing::info!(target: "bedrock::edge_dns", addr = %addr, "authoritative DNS listening (udp)");
     // 4096 covers any EDNS0-advertised payload; anything larger is not a query we serve.
@@ -638,7 +683,10 @@ pub async fn serve_udp_with(addr: &str, handler: std::sync::Arc<dyn DnsHandler>)
 /// # Errors
 /// If the listener cannot be bound.
 #[cfg(feature = "native")]
-pub async fn serve_tcp_with(addr: &str, handler: std::sync::Arc<dyn DnsHandler>) -> std::io::Result<()> {
+pub async fn serve_tcp_with(
+    addr: &str,
+    handler: std::sync::Arc<dyn DnsHandler>,
+) -> std::io::Result<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     const IDLE: std::time::Duration = std::time::Duration::from_secs(10);
     const MAX_QUERY: usize = 4096;
@@ -654,7 +702,9 @@ pub async fn serve_tcp_with(addr: &str, handler: std::sync::Arc<dyn DnsHandler>)
                 continue;
             }
         };
-        let Ok(permit) = permits.clone().try_acquire_owned() else { continue };
+        let Ok(permit) = permits.clone().try_acquire_owned() else {
+            continue;
+        };
         let handler = handler.clone();
         tokio::spawn(async move {
             let _permit = permit;
@@ -669,11 +719,18 @@ pub async fn serve_tcp_with(addr: &str, handler: std::sync::Arc<dyn DnsHandler>)
                     return;
                 }
                 let mut query = vec![0u8; len];
-                if !matches!(tokio::time::timeout(IDLE, stream.read_exact(&mut query)).await, Ok(Ok(_))) {
+                if !matches!(
+                    tokio::time::timeout(IDLE, stream.read_exact(&mut query)).await,
+                    Ok(Ok(_))
+                ) {
                     return;
                 }
-                let Some(reply) = handler.handle(&query).await else { return };
-                let Ok(reply_len) = u16::try_from(reply.len()) else { return };
+                let Some(reply) = handler.handle(&query).await else {
+                    return;
+                };
+                let Ok(reply_len) = u16::try_from(reply.len()) else {
+                    return;
+                };
                 let mut framed = Vec::with_capacity(2 + reply.len());
                 framed.extend_from_slice(&reply_len.to_be_bytes());
                 framed.extend_from_slice(&reply);
@@ -696,7 +753,14 @@ pub async fn serve_udp(
     authority: std::sync::Arc<tokio::sync::Mutex<ZoneAuthority>>,
     registry: std::sync::Arc<tokio::sync::Mutex<EdgeRegistry>>,
 ) -> std::io::Result<()> {
-    serve_udp_with(addr, std::sync::Arc::new(AuthorityHandler { authority, registry })).await
+    serve_udp_with(
+        addr,
+        std::sync::Arc::new(AuthorityHandler {
+            authority,
+            registry,
+        }),
+    )
+    .await
 }
 
 /// Serve DNS over TCP on `addr` (see [`serve_tcp_with`]) from an authority and its registry.
@@ -709,24 +773,38 @@ pub async fn serve_tcp(
     authority: std::sync::Arc<tokio::sync::Mutex<ZoneAuthority>>,
     registry: std::sync::Arc<tokio::sync::Mutex<EdgeRegistry>>,
 ) -> std::io::Result<()> {
-    serve_tcp_with(addr, std::sync::Arc::new(AuthorityHandler { authority, registry })).await
+    serve_tcp_with(
+        addr,
+        std::sync::Arc::new(AuthorityHandler {
+            authority,
+            registry,
+        }),
+    )
+    .await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::edge::{Route, APEXES};
     use crate::dns::{Flags, Question};
+    use crate::edge::{Route, APEXES};
 
     fn authority() -> ZoneAuthority {
         let zones = APEXES
             .iter()
             .map(|apex| {
-                ZoneConfig::new(apex.zone, vec![format!("ns1.{}", apex.zone), format!("ns2.{}", apex.zone)])
-                    .with_caa_issuers(vec!["letsencrypt.org".to_string()])
+                ZoneConfig::new(
+                    apex.zone,
+                    vec![format!("ns1.{}", apex.zone), format!("ns2.{}", apex.zone)],
+                )
+                .with_caa_issuers(vec!["letsencrypt.org".to_string()])
             })
             .collect();
-        ZoneAuthority::new(zones, vec![Ipv4Addr::new(203, 0, 113, 10)], vec![Ipv6Addr::LOCALHOST])
+        ZoneAuthority::new(
+            zones,
+            vec![Ipv4Addr::new(203, 0, 113, 10)],
+            vec![Ipv6Addr::LOCALHOST],
+        )
     }
 
     fn route(tenant: &str, tunnel: &str) -> Route {
@@ -742,15 +820,23 @@ mod tests {
     fn query_bytes(name: &str, qtype: RecordType) -> Vec<u8> {
         Message {
             id: 0x1234,
-            flags: Flags { recursion_desired: true, ..Flags::default() },
-            questions: vec![Question::new(Name::from_ascii(&format!("{name}.")).unwrap(), qtype)],
+            flags: Flags {
+                recursion_desired: true,
+                ..Flags::default()
+            },
+            questions: vec![Question::new(
+                Name::from_ascii(&format!("{name}.")).unwrap(),
+                qtype,
+            )],
             ..Message::default()
         }
         .to_bytes()
     }
 
     fn ask(auth: &mut ZoneAuthority, reg: &EdgeRegistry, name: &str, qtype: RecordType) -> Message {
-        let bytes = auth.answer(&query_bytes(name, qtype), reg).expect("a reply");
+        let bytes = auth
+            .answer(&query_bytes(name, qtype), reg)
+            .expect("a reply");
         Message::from_bytes(&bytes).expect("reply parses as a DNS message")
     }
 
@@ -759,13 +845,21 @@ mod tests {
         let mut auth = authority();
         let mut reg = EdgeRegistry::new(b"s".to_vec());
         let apex = APEXES.iter().find(|a| a.zone == "tascloud.app").unwrap();
-        let rec = reg.claim_managed(apex, "dk-1", route("acme", "tun-1")).unwrap();
+        let rec = reg
+            .claim_managed(apex, "dk-1", route("acme", "tun-1"))
+            .unwrap();
 
         let reply = ask(&mut auth, &reg, &rec.fqdn, RecordType::A);
         assert_eq!(reply.id, 0x1234, "the response must echo the query id");
         assert_eq!(reply.flags.response_code, ResponseCode::NoError);
-        assert!(reply.flags.authoritative, "we are the authority for this zone");
-        assert!(!reply.flags.recursion_available, "an authoritative server is not an open resolver");
+        assert!(
+            reply.flags.authoritative,
+            "we are the authority for this zone"
+        );
+        assert!(
+            !reply.flags.recursion_available,
+            "an authoritative server is not an open resolver"
+        );
         assert_eq!(reply.answers.len(), 1);
         match &reply.answers[0].data {
             RData::A(a) => assert_eq!(*a, Ipv4Addr::new(203, 0, 113, 10)),
@@ -778,14 +872,22 @@ mod tests {
     fn an_unclaimed_label_is_nxdomain_with_a_soa_not_a_wildcard() {
         let mut auth = authority();
         let reg = EdgeRegistry::new(b"s".to_vec());
-        let reply = ask(&mut auth, &reg, "never-claimed-abc123.tascloud.app", RecordType::A);
+        let reply = ask(
+            &mut auth,
+            &reg,
+            "never-claimed-abc123.tascloud.app",
+            RecordType::A,
+        );
         assert_eq!(
             reply.flags.response_code,
             ResponseCode::NxDomain,
             "a catch-all wildcard would make every typo resolve to the edge"
         );
         assert!(reply.answers.is_empty());
-        let soa = reply.authorities.first().expect("NXDOMAIN must carry a SOA for negative caching");
+        let soa = reply
+            .authorities
+            .first()
+            .expect("NXDOMAIN must carry a SOA for negative caching");
         match &soa.data {
             RData::Soa { minimum, .. } => assert_eq!(*minimum, SOA_MINIMUM_TTL),
             other => panic!("expected SOA in the authority section, got {other:?}"),
@@ -797,7 +899,9 @@ mod tests {
         let mut auth = authority();
         let mut reg = EdgeRegistry::new(b"s".to_vec());
         let apex = APEXES.iter().find(|a| a.zone == "tascloud.app").unwrap();
-        let rec = reg.claim_managed(apex, "dk-1", route("acme", "tun-1")).unwrap();
+        let rec = reg
+            .claim_managed(apex, "dk-1", route("acme", "tun-1"))
+            .unwrap();
 
         let reply = ask(&mut auth, &reg, &rec.fqdn, RecordType::Unknown(15));
         assert_eq!(
@@ -806,7 +910,10 @@ mod tests {
             "the NAME exists — NXDOMAIN here would tell the resolver the whole name is gone"
         );
         assert!(reply.answers.is_empty());
-        assert!(!reply.authorities.is_empty(), "NODATA still carries the SOA");
+        assert!(
+            !reply.authorities.is_empty(),
+            "NODATA still carries the SOA"
+        );
     }
 
     #[test]
@@ -828,8 +935,11 @@ mod tests {
         let mut auth = authority();
         let mut reg = EdgeRegistry::new(b"s".to_vec());
         let apex = APEXES.iter().find(|a| a.zone == "tascloud.app").unwrap();
-        let target = reg.claim_managed(apex, "dk-t", route("acme", "tun-1")).unwrap();
-        reg.add_custom("app.example.com.au", &target.fqdn, route("acme", "tun-1")).unwrap();
+        let target = reg
+            .claim_managed(apex, "dk-t", route("acme", "tun-1"))
+            .unwrap();
+        reg.add_custom("app.example.com.au", &target.fqdn, route("acme", "tun-1"))
+            .unwrap();
         // Their own DNS points at us; we are not authoritative for their domain.
         let reply = ask(&mut auth, &reg, "app.example.com.au", RecordType::A);
         assert_eq!(reply.flags.response_code, ResponseCode::Refused);
@@ -848,7 +958,11 @@ mod tests {
         assert_eq!(ns.answers.len(), 2, "both nameservers must be published");
 
         let caa = ask(&mut auth, &reg, "tascloud.app", RecordType::Caa);
-        assert_eq!(caa.answers.len(), 1, "CAA pins which CA may issue for the zone");
+        assert_eq!(
+            caa.answers.len(),
+            1,
+            "CAA pins which CA may issue for the zone"
+        );
     }
 
     #[test]
@@ -857,7 +971,12 @@ mod tests {
         let reg = EdgeRegistry::new(b"s".to_vec());
         auth.set_acme_token("tascloud.app", "token-one");
 
-        let reply = ask(&mut auth, &reg, "_acme-challenge.tascloud.app", RecordType::Txt);
+        let reply = ask(
+            &mut auth,
+            &reg,
+            "_acme-challenge.tascloud.app",
+            RecordType::Txt,
+        );
         assert_eq!(reply.flags.response_code, ResponseCode::NoError);
         assert_eq!(reply.answers.len(), 1);
         match &reply.answers[0].data {
@@ -866,8 +985,17 @@ mod tests {
         }
 
         auth.clear_acme_tokens("tascloud.app");
-        let gone = ask(&mut auth, &reg, "_acme-challenge.tascloud.app", RecordType::Txt);
-        assert_eq!(gone.flags.response_code, ResponseCode::NxDomain, "a spent challenge stops answering");
+        let gone = ask(
+            &mut auth,
+            &reg,
+            "_acme-challenge.tascloud.app",
+            RecordType::Txt,
+        );
+        assert_eq!(
+            gone.flags.response_code,
+            ResponseCode::NxDomain,
+            "a spent challenge stops answering"
+        );
     }
 
     #[test]
@@ -879,7 +1007,12 @@ mod tests {
         auth.set_acme_token("tascloud.dev", "token-base");
         auth.set_acme_token("tascloud.dev", "token-wildcard");
 
-        let reply = ask(&mut auth, &reg, "_acme-challenge.tascloud.dev", RecordType::Txt);
+        let reply = ask(
+            &mut auth,
+            &reg,
+            "_acme-challenge.tascloud.dev",
+            RecordType::Txt,
+        );
         assert_eq!(reply.answers.len(), 2, "both live tokens must be answered");
     }
 
@@ -888,12 +1021,19 @@ mod tests {
         let mut auth = authority();
         let mut reg = EdgeRegistry::new(b"s".to_vec());
         let apex = APEXES.iter().find(|a| a.zone == "tasmanian.cloud").unwrap();
-        let rec = reg.claim_managed(apex, "dk-1", route("acme", "tun-1")).unwrap();
-        assert_eq!(ask(&mut auth, &reg, &rec.fqdn, RecordType::A).answers.len(), 1);
+        let rec = reg
+            .claim_managed(apex, "dk-1", route("acme", "tun-1"))
+            .unwrap();
+        assert_eq!(
+            ask(&mut auth, &reg, &rec.fqdn, RecordType::A).answers.len(),
+            1
+        );
 
         reg.release("acme", &rec.fqdn).unwrap();
         assert_eq!(
-            ask(&mut auth, &reg, &rec.fqdn, RecordType::A).flags.response_code,
+            ask(&mut auth, &reg, &rec.fqdn, RecordType::A)
+                .flags
+                .response_code,
             ResponseCode::NxDomain,
             "the registry IS the zone — no reload step exists to forget"
         );
@@ -904,7 +1044,9 @@ mod tests {
         let mut auth = authority();
         let mut reg = EdgeRegistry::new(b"s".to_vec());
         let apex = APEXES.iter().find(|a| a.zone == "tasmanian.cloud").unwrap();
-        let rec = reg.claim_managed(apex, "dk-1", route("acme", "tun-1")).unwrap();
+        let rec = reg
+            .claim_managed(apex, "dk-1", route("acme", "tun-1"))
+            .unwrap();
         reg.suspend("acme", &rec.fqdn).unwrap();
         assert_eq!(
             ask(&mut auth, &reg, &rec.fqdn, RecordType::A).answers.len(),
@@ -918,7 +1060,9 @@ mod tests {
         let mut auth = authority();
         let mut reg = EdgeRegistry::new(b"s".to_vec());
         let apex = APEXES.iter().find(|a| a.zone == "tascloud.app").unwrap();
-        let rec = reg.claim_managed(apex, "dk-1", route("acme", "tun-1")).unwrap();
+        let rec = reg
+            .claim_managed(apex, "dk-1", route("acme", "tun-1"))
+            .unwrap();
         let upper = rec.fqdn.to_uppercase();
         assert_eq!(ask(&mut auth, &reg, &upper, RecordType::A).answers.len(), 1);
     }
@@ -938,7 +1082,10 @@ mod tests {
         let mut auth = authority();
         let reg = EdgeRegistry::new(b"s".to_vec());
         let mut msg = Message::response(7);
-        msg.questions.push(Question::new(Name::from_ascii("tascloud.app.").unwrap(), RecordType::A));
+        msg.questions.push(Question::new(
+            Name::from_ascii("tascloud.app.").unwrap(),
+            RecordType::A,
+        ));
         assert!(auth.answer(&msg.to_bytes(), &reg).is_none());
     }
 
@@ -948,8 +1095,14 @@ mod tests {
         let reg = EdgeRegistry::new(b"s".to_vec());
         let msg = Message {
             id: 9,
-            flags: Flags { opcode: 5, ..Flags::default() }, // UPDATE
-            questions: vec![Question::new(Name::from_ascii("tascloud.app.").unwrap(), RecordType::Soa)],
+            flags: Flags {
+                opcode: 5,
+                ..Flags::default()
+            }, // UPDATE
+            questions: vec![Question::new(
+                Name::from_ascii("tascloud.app.").unwrap(),
+                RecordType::Soa,
+            )],
             ..Message::default()
         };
         let bytes = auth.answer(&msg.to_bytes(), &reg).expect("a reply");
@@ -1005,17 +1158,38 @@ mod tests {
         let reg = EdgeRegistry::new(b"s".to_vec());
 
         // `*.tascloud.app` and `tascloud.app` in one order => two values at one name.
-        responder.publish_txt("tascloud.app", "val-a").await.unwrap();
-        responder.publish_txt("tascloud.app", "val-b").await.unwrap();
-        let reply = ask(&mut *auth.lock().await, &reg, "_acme-challenge.tascloud.app", RecordType::Txt);
+        responder
+            .publish_txt("tascloud.app", "val-a")
+            .await
+            .unwrap();
+        responder
+            .publish_txt("tascloud.app", "val-b")
+            .await
+            .unwrap();
+        let reply = ask(
+            &mut *auth.lock().await,
+            &reg,
+            "_acme-challenge.tascloud.app",
+            RecordType::Txt,
+        );
         assert_eq!(reply.answers.len(), 2);
 
         // Removing one authorization's value must not disturb the other's.
         responder.remove_txt("tascloud.app", "val-a").await;
-        let reply = ask(&mut *auth.lock().await, &reg, "_acme-challenge.tascloud.app", RecordType::Txt);
+        let reply = ask(
+            &mut *auth.lock().await,
+            &reg,
+            "_acme-challenge.tascloud.app",
+            RecordType::Txt,
+        );
         assert_eq!(reply.answers.len(), 1);
         responder.remove_txt("tascloud.app", "val-b").await;
-        let reply = ask(&mut *auth.lock().await, &reg, "_acme-challenge.tascloud.app", RecordType::Txt);
+        let reply = ask(
+            &mut *auth.lock().await,
+            &reg,
+            "_acme-challenge.tascloud.app",
+            RecordType::Txt,
+        );
         assert_eq!(reply.flags.response_code, ResponseCode::NxDomain);
     }
 
@@ -1037,21 +1211,35 @@ mod tests {
         }
         let q = query_bytes("_acme-challenge.tascloud.app", RecordType::Txt);
         let full = auth.answer(&q, &reg).unwrap();
-        assert!(full.len() > 1232, "test setup: reply is {} bytes", full.len());
+        assert!(
+            full.len() > 1232,
+            "test setup: reply is {} bytes",
+            full.len()
+        );
 
         assert_eq!(udp_limit(&q), 512, "no EDNS => classic limit");
         let cut = Message::from_bytes(&fit_for_udp(full.clone(), udp_limit(&q))).unwrap();
-        assert!(cut.flags.truncated && cut.answers.is_empty(), "TC set, answers dropped, resolver retries over TCP");
+        assert!(
+            cut.flags.truncated && cut.answers.is_empty(),
+            "TC set, answers dropped, resolver retries over TCP"
+        );
         assert_eq!(cut.id, 0x1234);
         assert_eq!(cut.questions.len(), 1);
 
         // A small reply is left alone.
-        let small = auth.answer(&query_bytes("twnstack.invalid", RecordType::A), &reg).unwrap();
+        let small = auth
+            .answer(&query_bytes("twnstack.invalid", RecordType::A), &reg)
+            .unwrap();
         assert_eq!(fit_for_udp(small.clone(), 512), small);
 
         // EDNS0 OPT advertising 4096 raises the limit, but never above 1232.
         let mut m = Message::from_bytes(&q).unwrap();
-        m.additionals.push(Record { name: Name::root(), class: 4096, ttl: 0, data: RData::Unknown(41, Vec::new()) });
+        m.additionals.push(Record {
+            name: Name::root(),
+            class: 4096,
+            ttl: 0,
+            data: RData::Unknown(41, Vec::new()),
+        });
         assert_eq!(udp_limit(&m.to_bytes()), 1232);
         m.additionals[0].class = 800;
         assert_eq!(udp_limit(&m.to_bytes()), 800);
@@ -1064,14 +1252,26 @@ mod tests {
     async fn tcp_service_answers_framed_queries_and_returns_the_full_untruncated_reply() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let authority = std::sync::Arc::new(tokio::sync::Mutex::new(authority()));
-        let registry = std::sync::Arc::new(tokio::sync::Mutex::new(EdgeRegistry::new(b"s".to_vec())));
+        let registry =
+            std::sync::Arc::new(tokio::sync::Mutex::new(EdgeRegistry::new(b"s".to_vec())));
         for i in 0..20 {
-            authority.lock().await.set_acme_token("tascloud.app", format!("token-{i:02}-{}", "x".repeat(40)));
+            authority
+                .lock()
+                .await
+                .set_acme_token("tascloud.app", format!("token-{i:02}-{}", "x".repeat(40)));
         }
         // Find a free port, then serve on it.
-        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
         let addr = format!("127.0.0.1:{port}");
-        tokio::spawn(serve_tcp(Box::leak(addr.clone().into_boxed_str()), authority, registry));
+        tokio::spawn(serve_tcp(
+            Box::leak(addr.clone().into_boxed_str()),
+            authority,
+            registry,
+        ));
         let mut stream = loop {
             if let Ok(s) = tokio::net::TcpStream::connect(&addr).await {
                 break s;
@@ -1098,7 +1298,13 @@ mod tests {
         let mut bad = tokio::net::TcpStream::connect(&addr).await.unwrap();
         bad.write_all(&[0x00, 0x04, 1, 2, 3, 4]).await.unwrap();
         let mut sink = Vec::new();
-        let n = tokio::time::timeout(std::time::Duration::from_secs(2), bad.read_to_end(&mut sink)).await.unwrap().unwrap();
+        let n = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            bad.read_to_end(&mut sink),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(n, 0, "an unparseable query gets no reply");
     }
 
@@ -1106,39 +1312,96 @@ mod tests {
     fn caa_records_publish_each_ca_with_its_account_and_issuewild_separately() {
         let records = CaaRecords {
             issue: vec![
-                CaaIssuer { domain: "letsencrypt.org".into(), account_uri: Some("https://le/acct/1".into()), validation_methods: vec!["dns-01".into()] },
-                CaaIssuer { domain: "pki.goog".into(), account_uri: Some("https://gts/acct/2".into()), validation_methods: vec![] },
+                CaaIssuer {
+                    domain: "letsencrypt.org".into(),
+                    account_uri: Some("https://le/acct/1".into()),
+                    validation_methods: vec!["dns-01".into()],
+                },
+                CaaIssuer {
+                    domain: "pki.goog".into(),
+                    account_uri: Some("https://gts/acct/2".into()),
+                    validation_methods: vec![],
+                },
             ],
-            issuewild: vec![CaaIssuer { domain: "letsencrypt.org".into(), account_uri: Some("https://le/acct/1".into()), validation_methods: vec!["dns-01".into()] }],
+            issuewild: vec![CaaIssuer {
+                domain: "letsencrypt.org".into(),
+                account_uri: Some("https://le/acct/1".into()),
+                validation_methods: vec!["dns-01".into()],
+            }],
             forbid_wildcard: false,
         }
         .finish();
-        let zone = ZoneConfig::new("tascloud.app", vec!["ns1.tascloud.app".into()]).with_caa_records(records);
+        let zone = ZoneConfig::new("tascloud.app", vec!["ns1.tascloud.app".into()])
+            .with_caa_records(records);
         let values = zone.caa_values();
         assert_eq!(
             values,
             vec![
-                ("issue", "letsencrypt.org; accounturi=https://le/acct/1; validationmethods=dns-01".to_string()),
-                ("issue", "pki.goog; accounturi=https://gts/acct/2".to_string()),
-                ("issuewild", "letsencrypt.org; accounturi=https://le/acct/1; validationmethods=dns-01".to_string()),
+                (
+                    "issue",
+                    "letsencrypt.org; accounturi=https://le/acct/1; validationmethods=dns-01"
+                        .to_string()
+                ),
+                (
+                    "issue",
+                    "pki.goog; accounturi=https://gts/acct/2".to_string()
+                ),
+                (
+                    "issuewild",
+                    "letsencrypt.org; accounturi=https://le/acct/1; validationmethods=dns-01"
+                        .to_string()
+                ),
             ]
         );
         // And they come out of the server as CAA records with the right tags.
         let mut auth = ZoneAuthority::new(vec![zone], vec!["127.0.0.1".parse().unwrap()], vec![]);
         let reg = EdgeRegistry::new(b"s".to_vec());
         let reply = ask(&mut auth, &reg, "tascloud.app", RecordType::Caa);
-        let tags: Vec<String> = reply.answers.iter().map(|r| match &r.data { RData::Caa { tag, .. } => tag.clone(), other => panic!("{other:?}") }).collect();
+        let tags: Vec<String> = reply
+            .answers
+            .iter()
+            .map(|r| match &r.data {
+                RData::Caa { tag, .. } => tag.clone(),
+                other => panic!("{other:?}"),
+            })
+            .collect();
         assert_eq!(tags, ["issue", "issue", "issuewild"]);
         // A live switch: replace the policy on every zone.
-        auth.set_caa_records(&CaaRecords { issue: vec![CaaIssuer { domain: "pki.goog".into(), account_uri: None, validation_methods: vec![] }], ..CaaRecords::default() }.finish());
+        auth.set_caa_records(
+            &CaaRecords {
+                issue: vec![CaaIssuer {
+                    domain: "pki.goog".into(),
+                    account_uri: None,
+                    validation_methods: vec![],
+                }],
+                ..CaaRecords::default()
+            }
+            .finish(),
+        );
         let reply = ask(&mut auth, &reg, "tascloud.app", RecordType::Caa);
-        let values: Vec<String> = reply.answers.iter().map(|r| match &r.data { RData::Caa { tag, value, .. } => format!("{tag} {}", String::from_utf8_lossy(value)), other => panic!("{other:?}") }).collect();
-        assert_eq!(values, ["issue pki.goog", "issuewild ;"], "wildcards are forbidden unless a CA is listed for them");
+        let values: Vec<String> = reply
+            .answers
+            .iter()
+            .map(|r| match &r.data {
+                RData::Caa { tag, value, .. } => {
+                    format!("{tag} {}", String::from_utf8_lossy(value))
+                }
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            values,
+            ["issue pki.goog", "issuewild ;"],
+            "wildcards are forbidden unless a CA is listed for them"
+        );
     }
 
     #[test]
     fn with_no_ca_listed_caa_forbids_issuance_rather_than_permitting_everything() {
         let records = CaaRecords::default().finish();
-        assert_eq!(records.values(), vec![("issue", ";".to_string()), ("issuewild", ";".to_string())]);
+        assert_eq!(
+            records.values(),
+            vec![("issue", ";".to_string()), ("issuewild", ";".to_string())]
+        );
     }
 }

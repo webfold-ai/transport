@@ -13,13 +13,19 @@
 #
 # With nothing private to fetch the secret may be omitted.
 #
+# This Dockerfile is the fallback for a builder without Nix. The primary path is the flake
+# (`nix build .#meshd-oci`): it needs no token at build time (the private git dependencies are flake
+# inputs), carries the SBOM and a reproducibility check, and replaces the old Dockerfile.offline.
+#
 # The runtime image is distroless (glibc, no shell, no package manager), runs as a non-root user,
 # and carries only the one binary. `--healthcheck` is built into meshd so no curl is needed.
 
 ARG RUST_VERSION=1.97
 
 # ---------------------------------------------------------------- build
-FROM rust:${RUST_VERSION}-bookworm AS build
+# Pinned by digest (the multi-arch index of rust:1.97-bookworm); bump the tag and the digest together:
+#   docker buildx imagetools inspect rust:1.97-bookworm
+FROM rust:${RUST_VERSION}-bookworm@sha256:0e2bcaef56d041a486784e54104a81aebe0da44bd03019bd70bc0401e42e4a97 AS build
 
 # aws-lc-sys (the crypto provider under rustls) needs cmake to build.
 RUN apt-get update \
@@ -50,7 +56,8 @@ RUN --mount=type=secret,id=gh_token,required=false \
     install -d -m 0750 /out/data
 
 # ---------------------------------------------------------------- runtime
-FROM gcr.io/distroless/cc-debian12:nonroot AS runtime
+# Pinned by digest (gcr.io/distroless/cc-debian12:nonroot).
+FROM gcr.io/distroless/cc-debian12:nonroot@sha256:9dac0a79194e45a7da0158a9c6da57b217585af0786db3845d1f0ec1a0dd182f AS runtime
 
 LABEL org.opencontainers.image.title="meshd" \
       org.opencontainers.image.description="Internal service discovery: a pkarr relay and an authoritative DNS zone for dialkey-published services." \

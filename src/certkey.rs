@@ -26,7 +26,10 @@ use std::fmt;
 use std::io::Write as _;
 use std::path::Path;
 
-use aws_lc_rs::signature::{EcdsaKeyPair, EcdsaSigningAlgorithm, KeyPair, ECDSA_P256_SHA256_FIXED_SIGNING, ECDSA_P384_SHA384_FIXED_SIGNING};
+use aws_lc_rs::signature::{
+    EcdsaKeyPair, EcdsaSigningAlgorithm, KeyPair, ECDSA_P256_SHA256_FIXED_SIGNING,
+    ECDSA_P384_SHA384_FIXED_SIGNING,
+};
 
 use crate::acme::der;
 
@@ -95,7 +98,9 @@ impl KeyAlg {
 pub enum KeyKind {
     Ec(EcCurve),
     /// RSA with this modulus size in bits.
-    Rsa { bits: u32 },
+    Rsa {
+        bits: u32,
+    },
     Ed25519,
     /// Not PKCS#8, or an algorithm this reader does not know.
     Unknown,
@@ -120,16 +125,28 @@ fn inspect(pkcs8: &[u8]) -> Option<KeyKind> {
     if pkcs8.len() > 16 * 1024 {
         return None;
     }
-    let (0x30, info, rest) = der::read(pkcs8)? else { return None };
+    let (0x30, info, rest) = der::read(pkcs8)? else {
+        return None;
+    };
     if !rest.is_empty() {
         return None;
     }
-    let (0x02, _version, after) = der::read(info)? else { return None };
-    let (0x30, alg, after) = der::read(after)? else { return None };
-    let (0x04, key, _) = der::read(after)? else { return None };
-    let (0x06, oid, params) = der::read(alg)? else { return None };
+    let (0x02, _version, after) = der::read(info)? else {
+        return None;
+    };
+    let (0x30, alg, after) = der::read(after)? else {
+        return None;
+    };
+    let (0x04, key, _) = der::read(after)? else {
+        return None;
+    };
+    let (0x06, oid, params) = der::read(alg)? else {
+        return None;
+    };
     if oid == OID_EC_PUBLIC_KEY {
-        let (0x06, curve, _) = der::read(params)? else { return Some(KeyKind::Ec(EcCurve::Other)) };
+        let (0x06, curve, _) = der::read(params)? else {
+            return Some(KeyKind::Ec(EcCurve::Other));
+        };
         return Some(KeyKind::Ec(match curve {
             c if c == OID_PRIME256V1 => EcCurve::P256,
             c if c == OID_SECP384R1 => EcCurve::P384,
@@ -139,12 +156,24 @@ fn inspect(pkcs8: &[u8]) -> Option<KeyKind> {
     }
     if oid == OID_RSA_ENCRYPTION {
         // RSAPrivateKey ::= SEQUENCE { version INTEGER, modulus INTEGER, ... }
-        let (0x30, rsa, _) = der::read(key)? else { return None };
-        let (0x02, _, after) = der::read(rsa)? else { return None };
-        let (0x02, modulus, _) = der::read(after)? else { return None };
-        let significant = modulus.iter().position(|b| *b != 0).map_or(&[][..], |i| &modulus[i..]);
+        let (0x30, rsa, _) = der::read(key)? else {
+            return None;
+        };
+        let (0x02, _, after) = der::read(rsa)? else {
+            return None;
+        };
+        let (0x02, modulus, _) = der::read(after)? else {
+            return None;
+        };
+        let significant = modulus
+            .iter()
+            .position(|b| *b != 0)
+            .map_or(&[][..], |i| &modulus[i..]);
         let first = *significant.first()?;
-        let bits = u32::try_from(significant.len()).ok()?.checked_mul(8)?.checked_sub(first.leading_zeros())?;
+        let bits = u32::try_from(significant.len())
+            .ok()?
+            .checked_mul(8)?
+            .checked_sub(first.leading_zeros())?;
         return Some(KeyKind::Rsa { bits });
     }
     if oid == OID_ED25519 {
@@ -166,9 +195,15 @@ pub enum KeyRefusal {
 impl fmt::Display for KeyRefusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            KeyRefusal::RsaTooSmall { bits, min } => write!(f, "an RSA-{bits} key is below the {min}-bit minimum"),
-            KeyRefusal::CurveNotAllowed(c) => write!(f, "the {c} curve is not an allowed certificate key"),
-            KeyRefusal::AlgorithmNotAllowed(a) => write!(f, "{a} is not an allowed certificate key algorithm"),
+            KeyRefusal::RsaTooSmall { bits, min } => {
+                write!(f, "an RSA-{bits} key is below the {min}-bit minimum")
+            }
+            KeyRefusal::CurveNotAllowed(c) => {
+                write!(f, "the {c} curve is not an allowed certificate key")
+            }
+            KeyRefusal::AlgorithmNotAllowed(a) => {
+                write!(f, "{a} is not an allowed certificate key algorithm")
+            }
             KeyRefusal::NoKey => write!(f, "no PKCS#8 private key"),
             KeyRefusal::Unrecognised => write!(f, "the private key is not a recognised PKCS#8 key"),
         }
@@ -188,7 +223,10 @@ pub struct KeyPolicy {
 
 impl Default for KeyPolicy {
     fn default() -> Self {
-        KeyPolicy { allow_p384: true, min_rsa_bits: 3072 }
+        KeyPolicy {
+            allow_p384: true,
+            min_rsa_bits: 3072,
+        }
     }
 }
 
@@ -205,7 +243,10 @@ impl KeyPolicy {
             KeyKind::Ec(EcCurve::P521) => Err(KeyRefusal::CurveNotAllowed("P-521")),
             KeyKind::Ec(EcCurve::Other) => Err(KeyRefusal::CurveNotAllowed("an unrecognised")),
             KeyKind::Rsa { bits } if *bits >= self.min_rsa_bits => Ok(()),
-            KeyKind::Rsa { bits } => Err(KeyRefusal::RsaTooSmall { bits: *bits, min: self.min_rsa_bits }),
+            KeyKind::Rsa { bits } => Err(KeyRefusal::RsaTooSmall {
+                bits: *bits,
+                min: self.min_rsa_bits,
+            }),
             KeyKind::Ed25519 => Err(KeyRefusal::AlgorithmNotAllowed("Ed25519")),
             KeyKind::Unknown => Err(KeyRefusal::Unrecognised),
         }
@@ -228,7 +269,10 @@ impl KeyPolicy {
     /// # Errors
     /// No key block, an unrecognised key, or a key the policy refuses.
     pub fn check_pkcs8_pem(&self, key_pem: &str) -> Result<KeyKind, KeyRefusal> {
-        let der = crate::pem::blocks(key_pem, "PRIVATE KEY").into_iter().next().ok_or(KeyRefusal::NoKey)?;
+        let der = crate::pem::blocks(key_pem, "PRIVATE KEY")
+            .into_iter()
+            .next()
+            .ok_or(KeyRefusal::NoKey)?;
         let kind = inspect_pkcs8(&der);
         self.check(&kind)?;
         Ok(kind)
@@ -264,18 +308,25 @@ pub struct OsCertKeyGen;
 
 impl CertKeyGen for OsCertKeyGen {
     fn generate(&self, alg: KeyAlg) -> Result<EcdsaKeyPair, KeyGenError> {
-        EcdsaKeyPair::generate(alg.signing()).map_err(|_| KeyGenError("the system RNG or the crypto module failed".into()))
+        EcdsaKeyPair::generate(alg.signing())
+            .map_err(|_| KeyGenError("the system RNG or the crypto module failed".into()))
     }
 }
 
 /// The complete `SubjectPublicKeyInfo` DER for `pair`.
 #[must_use]
 pub fn spki_der(pair: &EcdsaKeyPair, alg: KeyAlg) -> Vec<u8> {
-    der::seq(&[ec_algorithm_identifier(alg), der::bit_string(pair.public_key().as_ref())])
+    der::seq(&[
+        ec_algorithm_identifier(alg),
+        der::bit_string(pair.public_key().as_ref()),
+    ])
 }
 
 pub(crate) fn ec_algorithm_identifier(alg: KeyAlg) -> Vec<u8> {
-    der::seq(&[der::tlv(0x06, OID_EC_PUBLIC_KEY), der::tlv(0x06, alg.curve_oid())])
+    der::seq(&[
+        der::tlv(0x06, OID_EC_PUBLIC_KEY),
+        der::tlv(0x06, alg.curve_oid()),
+    ])
 }
 
 /// Write `contents` to `path` as a secret: created exclusively next to `path` with mode 0600,
@@ -287,8 +338,14 @@ pub(crate) fn ec_algorithm_identifier(alg: KeyAlg) -> Vec<u8> {
 /// Any I/O failure. On error `path` still holds what it held before and the temporary file is
 /// removed.
 pub fn write_private_atomic(path: &Path, contents: &[u8]) -> std::io::Result<()> {
-    let dir = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
-    let name = path.file_name().and_then(|n| n.to_str()).ok_or_else(|| std::io::Error::other("secret path has no file name"))?;
+    let dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| std::io::Error::other("secret path has no file name"))?;
     let suffix = crate::entropy::random_hex(8).map_err(std::io::Error::other)?;
     let tmp = dir.join(format!(".{name}.{suffix}.tmp"));
     let result = (|| {
@@ -332,8 +389,8 @@ pub fn is_group_or_world_accessible(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aws_lc_rs::rsa::{KeyPair as RsaKeyPair, KeySize};
     use aws_lc_rs::encoding::AsDer;
+    use aws_lc_rs::rsa::{KeyPair as RsaKeyPair, KeySize};
     use aws_lc_rs::signature::{Ed25519KeyPair, ECDSA_P521_SHA512_FIXED_SIGNING};
 
     fn pem_of(der: &[u8]) -> String {
@@ -354,29 +411,77 @@ mod tests {
     #[test]
     fn the_policy_accepts_p256_and_p384_and_rsa_3072_and_refuses_everything_else() {
         let p = KeyPolicy::default();
-        assert_eq!(p.check_pkcs8_pem(&ec_pem(&ECDSA_P256_SHA256_FIXED_SIGNING)).unwrap(), KeyKind::Ec(EcCurve::P256));
-        assert_eq!(p.check_pkcs8_pem(&ec_pem(&ECDSA_P384_SHA384_FIXED_SIGNING)).unwrap(), KeyKind::Ec(EcCurve::P384));
-        assert_eq!(p.check_pkcs8_pem(&rsa_pem(KeySize::Rsa3072)).unwrap(), KeyKind::Rsa { bits: 3072 });
+        assert_eq!(
+            p.check_pkcs8_pem(&ec_pem(&ECDSA_P256_SHA256_FIXED_SIGNING))
+                .unwrap(),
+            KeyKind::Ec(EcCurve::P256)
+        );
+        assert_eq!(
+            p.check_pkcs8_pem(&ec_pem(&ECDSA_P384_SHA384_FIXED_SIGNING))
+                .unwrap(),
+            KeyKind::Ec(EcCurve::P384)
+        );
+        assert_eq!(
+            p.check_pkcs8_pem(&rsa_pem(KeySize::Rsa3072)).unwrap(),
+            KeyKind::Rsa { bits: 3072 }
+        );
 
         let short = p.check_pkcs8_pem(&rsa_pem(KeySize::Rsa2048)).unwrap_err();
-        assert_eq!(short, KeyRefusal::RsaTooSmall { bits: 2048, min: 3072 });
-        assert_eq!(p.check_pkcs8_pem(&ec_pem(&ECDSA_P521_SHA512_FIXED_SIGNING)).unwrap_err(), KeyRefusal::CurveNotAllowed("P-521"));
-        let ed = pem_of(Ed25519KeyPair::generate_pkcs8(&aws_lc_rs::rand::SystemRandom::new()).unwrap().as_ref());
-        assert_eq!(p.check_pkcs8_pem(&ed).unwrap_err(), KeyRefusal::AlgorithmNotAllowed("Ed25519"));
-        assert_eq!(p.check_pkcs8_pem("no key here").unwrap_err(), KeyRefusal::NoKey);
-        assert_eq!(p.check_pkcs8_pem(&pem_of(&[0x30, 0x03, 0x02, 0x01, 0x00])).unwrap_err(), KeyRefusal::Unrecognised);
+        assert_eq!(
+            short,
+            KeyRefusal::RsaTooSmall {
+                bits: 2048,
+                min: 3072
+            }
+        );
+        assert_eq!(
+            p.check_pkcs8_pem(&ec_pem(&ECDSA_P521_SHA512_FIXED_SIGNING))
+                .unwrap_err(),
+            KeyRefusal::CurveNotAllowed("P-521")
+        );
+        let ed = pem_of(
+            Ed25519KeyPair::generate_pkcs8(&aws_lc_rs::rand::SystemRandom::new())
+                .unwrap()
+                .as_ref(),
+        );
+        assert_eq!(
+            p.check_pkcs8_pem(&ed).unwrap_err(),
+            KeyRefusal::AlgorithmNotAllowed("Ed25519")
+        );
+        assert_eq!(
+            p.check_pkcs8_pem("no key here").unwrap_err(),
+            KeyRefusal::NoKey
+        );
+        assert_eq!(
+            p.check_pkcs8_pem(&pem_of(&[0x30, 0x03, 0x02, 0x01, 0x00]))
+                .unwrap_err(),
+            KeyRefusal::Unrecognised
+        );
         // A policy without P-384 refuses it, both as a key and as a generation request.
-        let strict = KeyPolicy { allow_p384: false, ..p };
-        assert!(strict.check_pkcs8_pem(&ec_pem(&ECDSA_P384_SHA384_FIXED_SIGNING)).is_err());
+        let strict = KeyPolicy {
+            allow_p384: false,
+            ..p
+        };
+        assert!(strict
+            .check_pkcs8_pem(&ec_pem(&ECDSA_P384_SHA384_FIXED_SIGNING))
+            .is_err());
         assert!(strict.check_alg(KeyAlg::P384).is_err() && strict.check_alg(KeyAlg::P256).is_ok());
         // The minimum is a knob, not a constant: a 4096 floor refuses 3072.
-        assert!(KeyPolicy { min_rsa_bits: 4096, ..p }.check_pkcs8_pem(&rsa_pem(KeySize::Rsa3072)).is_err());
+        assert!(KeyPolicy {
+            min_rsa_bits: 4096,
+            ..p
+        }
+        .check_pkcs8_pem(&rsa_pem(KeySize::Rsa3072))
+        .is_err());
     }
 
     #[test]
     fn generated_keys_are_distinct_and_the_spki_matches_the_key() {
         let g = OsCertKeyGen;
-        let (a, b) = (g.generate(KeyAlg::P256).unwrap(), g.generate(KeyAlg::P256).unwrap());
+        let (a, b) = (
+            g.generate(KeyAlg::P256).unwrap(),
+            g.generate(KeyAlg::P256).unwrap(),
+        );
         assert_ne!(a.public_key().as_ref(), b.public_key().as_ref());
         let p384 = g.generate(KeyAlg::P384).unwrap();
         assert_eq!(p384.public_key().as_ref().len(), 1 + 2 * 48);
@@ -395,10 +500,17 @@ mod tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
         write_private_atomic(&path, b"new secret").unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"new secret");
-        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
         assert!(!is_group_or_world_accessible(&path));
         // No temporary file is left behind.
-        let leftovers: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name()).filter(|n| n != "key.pem").collect();
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .filter(|n| n != "key.pem")
+            .collect();
         assert!(leftovers.is_empty(), "{leftovers:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -413,7 +525,11 @@ mod tests {
         std::fs::create_dir_all(blocked.join("inner")).unwrap();
         assert!(write_private_atomic(&blocked, b"x").is_err());
         assert_eq!(std::fs::read(&path).unwrap(), b"first");
-        let tmp_files: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).filter(|n| n.ends_with(".tmp")).collect();
+        let tmp_files: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect();
         assert!(tmp_files.is_empty(), "temporary file leaked: {tmp_files:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -444,7 +560,11 @@ mod tests {
                 let started = std::time::Instant::now();
                 while started.elapsed() < Duration::from_millis(400) {
                     let seen = std::fs::read(&path).unwrap();
-                    assert!(seen == old || seen == new, "torn read of {} bytes", seen.len());
+                    assert!(
+                        seen == old || seen == new,
+                        "torn read of {} bytes",
+                        seen.len()
+                    );
                 }
             })
         };
@@ -458,7 +578,10 @@ mod tests {
     use std::time::Duration;
 
     fn tempdir(tag: &str) -> std::path::PathBuf {
-        let p = std::env::temp_dir().join(format!("certkey-{tag}-{}", crate::entropy::random_hex(6).unwrap()));
+        let p = std::env::temp_dir().join(format!(
+            "certkey-{tag}-{}",
+            crate::entropy::random_hex(6).unwrap()
+        ));
         std::fs::create_dir_all(&p).unwrap();
         p
     }

@@ -1,46 +1,52 @@
-# meshd on its own:
+# meshd (pkarr relay + discovery DNS zone), hardened the way the running deployment is
+# (/opt/webfold-mesh/docker-compose.yml): read-only root, no capabilities, no privilege escalation,
+# memory and pid limits, logs rotated, publishing closed to a key list.
 #
-#   GH_TOKEN=... docker compose -f docker-compose.meshd.yml up -d --build
+#   nix build .#meshd-oci && docker load < result          # loads meshd:nix (no token needed)
+#   cp allowed-keys.example allowed-keys.txt               # one z-base-32 key per line, then:
+#   docker compose -f docker-compose.meshd.yml up -d
 #
-# Services that should use it set  PKARR_RELAYS=http://meshd:6881  (see transport::pkarr::RelayClient::from_env)
-# and resolve each other as DNS under MESHD_ZONE, e.g. _billing._tcp.<key>.mesh.internal.
+# or, on a builder without Nix:  docker build --secret id=gh_token,env=GH_TOKEN -t meshd:local .
+#   and run with MESHD_IMAGE=meshd:local.
 #
-# Ports are bound to loopback. Reads are open by design and RelayClient cannot send credentials, so
-# who may publish is decided by MESHD_ALLOW_KEYS_FILE and by where these ports are reachable: put
-# them on a private interface (change the host side below), never on a public one.
+# Reads are open by design (the records are public) and RelayClient cannot send credentials, so who may
+# publish is decided by MESHD_ALLOW_KEYS_FILE and by where these ports are reachable. MESHD_LAN_ADDR is
+# the host address the relay listens on: leave it on loopback or set it to a private interface, never a
+# public one. DNS stays on loopback. Services that use it set PKARR_RELAYS=http://<MESHD_LAN_ADDR>:6881.
 name: tas-mesh
 
 services:
   meshd:
-    build:
-      context: .
-      secrets: [gh_token]
-    image: meshd:local
+    image: ${MESHD_IMAGE:-meshd:nix}
+    container_name: wf-meshd
     restart: unless-stopped
     read_only: true
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
+    mem_limit: 256m
+    pids_limit: 128
     ports:
-      - "127.0.0.1:6881:6881"
+      - "${MESHD_LAN_ADDR:-127.0.0.1}:6881:6881"
       - "127.0.0.1:5353:5353/udp"
       - "127.0.0.1:5353:5353/tcp"
-    volumes:
-      - meshd-data:/var/lib/meshd
-      # To close publishing to a set of keys, mount a file of z-base-32 keys (one per line) and set
-      # MESHD_ALLOW_KEYS_FILE below:
-      # - ./allowed-keys.txt:/etc/meshd/allowed-keys.txt:ro
     environment:
       MESHD_ZONE: mesh.internal
-      # MESHD_ALLOW_KEYS_FILE: /etc/meshd/allowed-keys.txt
+      MESHD_ALLOW_KEYS_FILE: /etc/meshd/allowed-keys.txt
+      MESHD_MAX_KEYS: "10000"
       # MESHD_MAX_AGE_SECS: "86400"   # unset keeps a record until it is replaced
-      # MESHD_MAX_KEYS: "100000"
+    volumes:
+      - meshd-data:/var/lib/meshd
+      - ./allowed-keys.txt:/etc/meshd/allowed-keys.txt:ro
+    # No curl and no shell in the image: the binary probes itself (GET /health on the relay).
+    healthcheck:
+      test: ["CMD", "meshd", "--healthcheck"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
     logging:
       driver: json-file
-      options: { max-size: "20m", max-file: "5" }
-
-secrets:
-  gh_token:
-    environment: GH_TOKEN
+      options: { max-size: "10m", max-file: "3" }
 
 volumes:
   meshd-data:

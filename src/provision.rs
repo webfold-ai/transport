@@ -113,7 +113,7 @@ impl WorkloadPlanner {
             .filter(|c| affinity.is_healthy(c.peer_id))
             .filter(|c| {
                 if let Some(max_rtt) = constraints.max_rtt {
-                    latency.rtt(c.peer_id).map_or(true, |rtt| rtt <= max_rtt)
+                    latency.rtt(c.peer_id).is_none_or(|rtt| rtt <= max_rtt)
                 } else {
                     true
                 }
@@ -123,7 +123,9 @@ impl WorkloadPlanner {
 
         // Sort by ascending RTT (fastest first) — these go to later (sink) stages.
         candidates.sort_by_key(|c| {
-            latency.rtt(c.peer_id).map_or(u128::MAX, |rtt| rtt.as_micros())
+            latency
+                .rtt(c.peer_id)
+                .map_or(u128::MAX, |rtt| rtt.as_micros())
         });
 
         // Limit to max_peers, keeping the fastest
@@ -168,10 +170,16 @@ impl WorkloadPlanner {
         // Each PipelineStage has one node for GBM tree shards (each peer runs its range).
         let stages: Vec<PipelineStage> = assignments
             .iter()
-            .map(|a| PipelineStage { node_ids: vec![to_hex(&a.peer_id)] })
+            .map(|a| PipelineStage {
+                node_ids: vec![to_hex(&a.peer_id)],
+            })
             .collect();
 
-        Some(WorkloadPlan { stages, assignments, total_work: total_trees })
+        Some(WorkloadPlan {
+            stages,
+            assignments,
+            total_work: total_trees,
+        })
     }
 
     /// Plan CountLM byte-range shards across qualifying peers.
@@ -205,10 +213,16 @@ impl WorkloadPlanner {
 
         let stages: Vec<PipelineStage> = assignments
             .iter()
-            .map(|a| PipelineStage { node_ids: vec![to_hex(&a.peer_id)] })
+            .map(|a| PipelineStage {
+                node_ids: vec![to_hex(&a.peer_id)],
+            })
             .collect();
 
-        Some(WorkloadPlan { stages, assignments, total_work: total_bytes })
+        Some(WorkloadPlan {
+            stages,
+            assignments,
+            total_work: total_bytes,
+        })
     }
 
     /// Plan autofold replica placement — replicate the (guard + GBM) artifact across
@@ -226,8 +240,10 @@ impl WorkloadPlanner {
             .iter()
             .map(|cap| PeerAssignment {
                 peer_id: cap.peer_id,
-                tree_start: 0, tree_end: 0,
-                byte_start: 0, byte_end: 0,
+                tree_start: 0,
+                tree_end: 0,
+                byte_start: 0,
+                byte_end: 0,
             })
             .collect();
 
@@ -235,11 +251,16 @@ impl WorkloadPlanner {
         // Downstream (replica) stages run first — they load the model, then source becomes routable.
         let stages: Vec<PipelineStage> = assignments
             .iter()
-            .enumerate()
-            .map(|(_i, a)| PipelineStage { node_ids: vec![to_hex(&a.peer_id)] })
+            .map(|a| PipelineStage {
+                node_ids: vec![to_hex(&a.peer_id)],
+            })
             .collect();
 
-        Some(WorkloadPlan { stages, assignments, total_work: n })
+        Some(WorkloadPlan {
+            stages,
+            assignments,
+            total_work: n,
+        })
     }
 
     /// One-shot: qualify peers, plan GBM tree shards, return plan or None if insufficient peers.
@@ -295,7 +316,14 @@ impl WorkloadPlanner {
         };
         let max_per_peer_ram = peers.iter().map(|c| c.free_ram).max().unwrap_or(0);
         let max_per_peer_vram = peers.iter().map(|c| c.free_vram).max().unwrap_or(0);
-        AggregateCapacity { peer_count, total_free_ram, total_free_vram, avg_load, max_per_peer_ram, max_per_peer_vram }
+        AggregateCapacity {
+            peer_count,
+            total_free_ram,
+            total_free_vram,
+            avg_load,
+            max_per_peer_ram,
+            max_per_peer_vram,
+        }
     }
 
     /// Evaluate scaling by collapse to the floor: the minimum peer count that covers demand,
@@ -312,11 +340,7 @@ impl WorkloadPlanner {
     /// The fragmentation penalty is zero when P = min_P and grows as excess peers inject
     /// additional merge boundaries (CountLM) or fan-out hops (GBM ensemble) with no new
     /// work done — pure U, no B. No heuristic thresholds — the geometry decides.
-    pub fn evaluate_scale(
-        &self,
-        demand: &Demand,
-        capacity: &AggregateCapacity,
-    ) -> ScalingDecision {
+    pub fn evaluate_scale(&self, demand: &Demand, capacity: &AggregateCapacity) -> ScalingDecision {
         // No peers at all → must scale up to the full floor.
         if capacity.peer_count == 0 {
             let floor = demand.min_peers.max(1) as u32;
@@ -399,8 +423,12 @@ impl WorkloadPlanner {
         let count = if total > 0 && capacity.max_per_peer_ram > 0 {
             (total.div_ceil(capacity.max_per_peer_ram)).max(1) as u32
         } else {
-            let need = demand.min_peers.saturating_sub(capacity.peer_count as usize);
-            if need == 0 { return None; }
+            let need = demand
+                .min_peers
+                .saturating_sub(capacity.peer_count as usize);
+            if need == 0 {
+                return None;
+            }
             need as u32
         };
 
@@ -485,16 +513,20 @@ pub enum ScalingDecision {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::discovery::PeerDirectory;
     use super::super::latency::{LatencyTracker, PeerAffinity};
+    use super::*;
     use std::time::Duration;
 
-    fn test_cap(peer_id: PeerId, free_vram: u64, rtt: Duration) -> PeerCapability {
+    fn test_cap(peer_id: PeerId, free_vram: u64, _rtt: Duration) -> PeerCapability {
         PeerCapability {
-            peer_id, addr: None, label: format!("node-{}", peer_id[0]),
-            total_ram: 16_000_000_000, free_ram: 8_000_000_000,
-            total_vram: free_vram * 2, free_vram,
+            peer_id,
+            addr: None,
+            label: format!("node-{}", peer_id[0]),
+            total_ram: 16_000_000_000,
+            free_ram: 8_000_000_000,
+            total_vram: free_vram * 2,
+            free_vram,
             compute_kind: super::super::discovery::ComputeKind::Cpu,
             models_loaded: vec![],
             capabilities: vec!["GBM".to_string(), "CountLM".to_string()],
@@ -529,7 +561,10 @@ mod tests {
         let constraints = PlacementConstraints {
             capability: "GBM".into(),
             min_free_vram: 1_000_000_000,
-            min_peers: 1, max_peers: 10, max_rtt: None, max_errors: 3,
+            min_peers: 1,
+            max_peers: 10,
+            max_rtt: None,
+            max_errors: 3,
         };
         let peers = planner.qualify_peers(&dir, &lat, &aff, &constraints);
         assert_eq!(peers.len(), 1);
@@ -607,7 +642,9 @@ mod tests {
         let planner = WorkloadPlanner::new();
         let constraints = PlacementConstraints {
             capability: "GBM".into(),
-            min_free_vram: 1_000_000_000, min_peers: 1, max_peers: 10,
+            min_free_vram: 1_000_000_000,
+            min_peers: 1,
+            max_peers: 10,
             max_rtt: Some(Duration::from_millis(100)),
             max_errors: 3,
         };
@@ -630,8 +667,11 @@ mod tests {
         let planner = WorkloadPlanner::new();
         let constraints = PlacementConstraints {
             capability: "GBM".into(),
-            min_free_vram: 1_000_000_000, min_peers: 1, max_peers: 10,
-            max_rtt: None, max_errors: 3,
+            min_free_vram: 1_000_000_000,
+            min_peers: 1,
+            max_peers: 10,
+            max_rtt: None,
+            max_errors: 3,
         };
         let cap = planner.aggregate_capacity(&dir, &lat, &aff, &constraints);
         assert_eq!(cap.peer_count, 2);
@@ -644,15 +684,22 @@ mod tests {
         let planner = WorkloadPlanner::new();
         let demand = Demand {
             capability: "CountLM".into(),
-            min_peers: 5, max_peers: 10,
-            compute_kind: None, vcpus_per_worker: None,
-            ram_per_worker: Some(8_000_000_000), vram_per_worker: None,
+            min_peers: 5,
+            max_peers: 10,
+            compute_kind: None,
+            vcpus_per_worker: None,
+            ram_per_worker: Some(8_000_000_000),
+            vram_per_worker: None,
             provider_tag: None,
         };
         // Each peer has 2GB free — total work = 5×8=40GB. floor = 40/2 = 20 peers.
         let capacity = AggregateCapacity {
-            peer_count: 2, total_free_ram: 4_000_000_000, total_free_vram: 0,
-            avg_load: 0.5, max_per_peer_ram: 2_000_000_000, max_per_peer_vram: 0,
+            peer_count: 2,
+            total_free_ram: 4_000_000_000,
+            total_free_vram: 0,
+            avg_load: 0.5,
+            max_per_peer_ram: 2_000_000_000,
+            max_per_peer_vram: 0,
         };
         let decision = planner.evaluate_scale(&demand, &capacity);
         match decision {
@@ -669,15 +716,22 @@ mod tests {
         let planner = WorkloadPlanner::new();
         let demand = Demand {
             capability: "CountLM".into(),
-            min_peers: 5, max_peers: 10,
-            compute_kind: None, vcpus_per_worker: None,
-            ram_per_worker: Some(8_000_000_000), vram_per_worker: None,
+            min_peers: 5,
+            max_peers: 10,
+            compute_kind: None,
+            vcpus_per_worker: None,
+            ram_per_worker: Some(8_000_000_000),
+            vram_per_worker: None,
             provider_tag: None,
         };
         // Each peer has 8GB — floor = 40/8 = 5 peers. current = 5 → Noop.
         let capacity = AggregateCapacity {
-            peer_count: 5, total_free_ram: 40_000_000_000, total_free_vram: 0,
-            avg_load: 0.2, max_per_peer_ram: 8_000_000_000, max_per_peer_vram: 0,
+            peer_count: 5,
+            total_free_ram: 40_000_000_000,
+            total_free_vram: 0,
+            avg_load: 0.2,
+            max_per_peer_ram: 8_000_000_000,
+            max_per_peer_vram: 0,
         };
         let decision = planner.evaluate_scale(&demand, &capacity);
         assert!(matches!(decision, ScalingDecision::Noop));
@@ -688,15 +742,22 @@ mod tests {
         let planner = WorkloadPlanner::new();
         let demand = Demand {
             capability: "CountLM".into(),
-            min_peers: 2, max_peers: 5,
-            compute_kind: None, vcpus_per_worker: None,
-            ram_per_worker: Some(16_000_000_000), vram_per_worker: None,
+            min_peers: 2,
+            max_peers: 5,
+            compute_kind: None,
+            vcpus_per_worker: None,
+            ram_per_worker: Some(16_000_000_000),
+            vram_per_worker: None,
             provider_tag: None,
         };
         // One peer has 32GB free — floor = 1. current = 4 → excess 3 = pure drag.
         let capacity = AggregateCapacity {
-            peer_count: 4, total_free_ram: 40_000_000_000, total_free_vram: 0,
-            avg_load: 0.1, max_per_peer_ram: 32_000_000_000, max_per_peer_vram: 0,
+            peer_count: 4,
+            total_free_ram: 40_000_000_000,
+            total_free_vram: 0,
+            avg_load: 0.1,
+            max_per_peer_ram: 32_000_000_000,
+            max_per_peer_vram: 0,
         };
         let decision = planner.evaluate_scale(&demand, &capacity);
         match decision {
@@ -714,14 +775,21 @@ mod tests {
         let planner = WorkloadPlanner::new();
         let demand = Demand {
             capability: "CountLM".into(),
-            min_peers: 1, max_peers: 3,
-            compute_kind: None, vcpus_per_worker: None,
-            ram_per_worker: Some(8_000_000_000), vram_per_worker: None,
+            min_peers: 1,
+            max_peers: 3,
+            compute_kind: None,
+            vcpus_per_worker: None,
+            ram_per_worker: Some(8_000_000_000),
+            vram_per_worker: None,
             provider_tag: None,
         };
         let capacity = AggregateCapacity {
-            peer_count: 10, total_free_ram: 80_000_000_000, total_free_vram: 0,
-            avg_load: 0.05, max_per_peer_ram: 8_000_000_000, max_per_peer_vram: 0,
+            peer_count: 10,
+            total_free_ram: 80_000_000_000,
+            total_free_vram: 0,
+            avg_load: 0.05,
+            max_per_peer_ram: 8_000_000_000,
+            max_per_peer_vram: 0,
         };
         let decision = planner.evaluate_scale(&demand, &capacity);
         match decision {
@@ -738,14 +806,21 @@ mod tests {
         let planner = WorkloadPlanner::new();
         let demand = Demand {
             capability: "CountLM".into(),
-            min_peers: 2, max_peers: 5,
-            compute_kind: None, vcpus_per_worker: None,
-            ram_per_worker: Some(8_000_000_000), vram_per_worker: None,
+            min_peers: 2,
+            max_peers: 5,
+            compute_kind: None,
+            vcpus_per_worker: None,
+            ram_per_worker: Some(8_000_000_000),
+            vram_per_worker: None,
             provider_tag: None,
         };
         let capacity = AggregateCapacity {
-            peer_count: 2, total_free_ram: 16_000_000_000, total_free_vram: 0,
-            avg_load: 0.4, max_per_peer_ram: 8_000_000_000, max_per_peer_vram: 0,
+            peer_count: 2,
+            total_free_ram: 16_000_000_000,
+            total_free_vram: 0,
+            avg_load: 0.4,
+            max_per_peer_ram: 8_000_000_000,
+            max_per_peer_vram: 0,
         };
         let decision = planner.evaluate_scale(&demand, &capacity);
         assert!(matches!(decision, ScalingDecision::Noop));
@@ -756,20 +831,34 @@ mod tests {
         let planner = WorkloadPlanner::new();
         let demand = Demand {
             capability: "CountLM".into(),
-            min_peers: 3, max_peers: 5,
-            compute_kind: None, vcpus_per_worker: Some(2),
+            min_peers: 3,
+            max_peers: 5,
+            compute_kind: None,
+            vcpus_per_worker: Some(2),
             ram_per_worker: Some(4_000_000_000),
-            vram_per_worker: None, provider_tag: None,
+            vram_per_worker: None,
+            provider_tag: None,
         };
-        let capacity = AggregateCapacity { peer_count: 0, total_free_ram: 0,
-            total_free_vram: 0, avg_load: 0.0,
-            max_per_peer_ram: 0, max_per_peer_vram: 0 };
+        let capacity = AggregateCapacity {
+            peer_count: 0,
+            total_free_ram: 0,
+            total_free_vram: 0,
+            avg_load: 0.0,
+            max_per_peer_ram: 0,
+            max_per_peer_vram: 0,
+        };
         let target = planner.provisioning_target(&demand, &capacity).unwrap();
-        assert!(matches!(target.substrate, super::super::discovery::ProvisioningSubstrate::Lxc));
+        assert!(matches!(
+            target.substrate,
+            super::super::discovery::ProvisioningSubstrate::Lxc
+        ));
         assert_eq!(target.vcpus, 2);
         assert_eq!(target.ram_bytes, 4_000_000_000);
         assert_eq!(target.count, 3);
-        assert!(matches!(target.compute_kind, super::super::discovery::ComputeKind::Cpu));
+        assert!(matches!(
+            target.compute_kind,
+            super::super::discovery::ComputeKind::Cpu
+        ));
     }
 
     #[test]
@@ -777,15 +866,23 @@ mod tests {
         let planner = WorkloadPlanner::new();
         let demand = Demand {
             capability: "GBM".into(),
-            min_peers: 6, max_peers: 10,
-            compute_kind: None, vcpus_per_worker: Some(4),
+            min_peers: 6,
+            max_peers: 10,
+            compute_kind: None,
+            vcpus_per_worker: Some(4),
             ram_per_worker: Some(8_000_000_000),
-            vram_per_worker: Some(4_000_000_000), provider_tag: None,
+            vram_per_worker: Some(4_000_000_000),
+            provider_tag: None,
         };
         // Each peer holds 32GB → floor = (6×8)/32 = 2 peers
-        let capacity = AggregateCapacity { peer_count: 1, total_free_ram: 0,
-            total_free_vram: 0, avg_load: 0.0,
-            max_per_peer_ram: 32_000_000_000, max_per_peer_vram: 0 };
+        let capacity = AggregateCapacity {
+            peer_count: 1,
+            total_free_ram: 0,
+            total_free_vram: 0,
+            avg_load: 0.0,
+            max_per_peer_ram: 32_000_000_000,
+            max_per_peer_vram: 0,
+        };
         let target = planner.provisioning_target(&demand, &capacity).unwrap();
         assert_eq!(target.count, 2);
         assert_eq!(target.ram_bytes, 24_000_000_000); // 48GB total ÷ 2

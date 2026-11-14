@@ -120,8 +120,7 @@ impl FederationGroup {
     /// The S3 gateway service. `buckets` is the "what do you want mounted" list — each becomes
     /// a `bucket=` TXT entry a mounting client reads back via `Mount::buckets`.
     pub fn s3(self, port: u16, region: &str, buckets: &[&str]) -> Self {
-        let mut meta: Vec<(String, String)> =
-            vec![(meta::REGION.to_string(), region.to_string())];
+        let mut meta: Vec<(String, String)> = vec![(meta::REGION.to_string(), region.to_string())];
         for b in buckets {
             meta.push((meta::BUCKET.to_string(), b.to_string()));
         }

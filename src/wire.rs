@@ -5,12 +5,12 @@
 // Ported from bedrock's `native_lib::wire` (originally `include!`d into `native_lib.rs`,
 // sharing its flat scope); here it's a real module, paired with `crate::http_types`.
 
+use crate::http_types::*;
+use apeiron::map::hashtrinity::{Coord, CoordMap};
 use std::borrow::Cow;
 use std::io;
-use apeiron::map::hashtrinity::{Coord, CoordMap};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use crate::http_types::*;
 
 // -- Wire ----------------------------------------------------------------
 
@@ -195,7 +195,11 @@ fn tls_config() -> std::sync::Arc<rustls::ClientConfig> {
                 .expect("the provider supports the default TLS versions")
                 .with_root_certificates(roots)
                 .with_no_client_auth();
-            debug_assert_eq!(config.fips(), cfg!(feature = "fips"), "client TLS must be FIPS exactly when built for it");
+            debug_assert_eq!(
+                config.fips(),
+                cfg!(feature = "fips"),
+                "client TLS must be FIPS exactly when built for it"
+            );
             std::sync::Arc::new(config)
         })
         .clone()
@@ -231,7 +235,8 @@ const POOL_CAP_PER_IDENTITY: usize = 32;
 /// `Router`'s route keys and `Proxy`'s upstream keys already use), not the opaque-hash misuse
 /// `Extensions` had to move off of.
 fn pool() -> &'static std::sync::Mutex<CoordMap<u64, Vec<PooledConn>>> {
-    static POOL: std::sync::OnceLock<std::sync::Mutex<CoordMap<u64, Vec<PooledConn>>>> = std::sync::OnceLock::new();
+    static POOL: std::sync::OnceLock<std::sync::Mutex<CoordMap<u64, Vec<PooledConn>>>> =
+        std::sync::OnceLock::new();
     POOL.get_or_init(|| std::sync::Mutex::new(CoordMap::coordinate()))
 }
 
@@ -277,7 +282,10 @@ fn pool_put(identity: &str, conn: PooledConn) {
 /// registered with the specific runtime's I/O driver that was active when it was created. All
 /// three are the same class of problem a robust pool has to handle, not paper over: never trust
 /// an idle connection's first write to succeed).
-pub(crate) async fn connect(uri: &Uri, resolve: &std::collections::HashMap<String, std::net::SocketAddr>) -> Result<(Stream, bool)> {
+pub(crate) async fn connect(
+    uri: &Uri,
+    resolve: &std::collections::HashMap<String, std::net::SocketAddr>,
+) -> Result<(Stream, bool)> {
     let identity = identity_for(uri)?;
     if let Some(pooled) = pool_take(&identity) {
         tracing::debug!(target: "bedrock::client", %identity, "reusing pooled connection");
@@ -285,7 +293,10 @@ pub(crate) async fn connect(uri: &Uri, resolve: &std::collections::HashMap<Strin
         // pool-return step, which only pools a connection when there wasn't any) — there's no
         // plumbing here to hand leftover bytes into a fresh `send_request` call, so this
         // invariant is asserted rather than silently trusted.
-        debug_assert!(pooled.leftover.is_empty(), "pooled connections are only stored with no leftover bytes");
+        debug_assert!(
+            pooled.leftover.is_empty(),
+            "pooled connections are only stored with no leftover bytes"
+        );
         return Ok((pooled.stream, true));
     }
     Ok((connect_fresh(uri, resolve).await?, false))
@@ -338,7 +349,9 @@ fn effective_user_agent(headers: &HeaderMap) -> Option<Cow<'_, str>> {
     let Some(supplied) = headers.get(crate::http_types::header::USER_AGENT) else {
         return Some(Cow::Borrowed(DEFAULT_USER_AGENT));
     };
-    let text = std::str::from_utf8(supplied.as_bytes()).unwrap_or_default().trim();
+    let text = std::str::from_utf8(supplied.as_bytes())
+        .unwrap_or_default()
+        .trim();
     // An empty caller value falls back rather than serializing `User-Agent: `,
     // which some servers reject outright.
     if text.is_empty() {
@@ -447,7 +460,13 @@ async fn read_response_head(reader: &mut StreamReader) -> Result<ResponseHead> {
             headers.insert(name, value);
         }
     }
-    Ok(ResponseHead { version, status, headers, content_length, chunked })
+    Ok(ResponseHead {
+        version,
+        status,
+        headers,
+        content_length,
+        chunked,
+    })
 }
 
 pub(crate) async fn send_request(
@@ -479,7 +498,11 @@ pub(crate) async fn send_request(
     } else if head.chunked {
         (read_chunked(&mut reader).await?, true)
     } else if let Some(len) = head.content_length {
-        let b = if len > 0 { reader.read_exact(len).await? } else { Vec::new() };
+        let b = if len > 0 {
+            reader.read_exact(len).await?
+        } else {
+            Vec::new()
+        };
         (b, true)
     } else {
         let mut buf = Vec::new();
@@ -716,8 +739,8 @@ mod wire_head_tests {
     //! server received. No network, no fixture, no DNS.
 
     use crate::http_types::header::USER_AGENT;
-    use crate::http_types::{HeaderMap, Method};
     use crate::http_types::Uri;
+    use crate::http_types::{HeaderMap, Method};
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -753,15 +776,25 @@ mod wire_head_tests {
     }
 
     async fn head_over_loopback(headers: HeaderMap) -> Vec<u8> {
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind loopback");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
         let addr = listener.local_addr().expect("local addr");
         let server = tokio::spawn(async move { receive_once(listener).await });
         let uri: Uri = format!("http://{addr}/x").parse().expect("uri");
         let stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
-        crate::wire::send_request(crate::wire::Stream::Plain(stream), Method::GET, &uri, headers, None)
+        crate::wire::send_request(
+            crate::wire::Stream::Plain(stream),
+            Method::GET,
+            &uri,
+            headers,
+            None,
+        )
+        .await
+        .expect("send");
+        server
             .await
-            .expect("send");
-        server.await.expect("the loopback server task must not panic")
+            .expect("the loopback server task must not panic")
     }
 
     #[tokio::test]

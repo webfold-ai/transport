@@ -15,66 +15,6 @@
 //! - **B/U** = the stream accumulator (bytes read/written — the flow)
 //! - **self** = the gossip protocol (the medium turned on itself — broadcast)
 
-pub mod native;
-pub mod gossip;
-pub mod bastion;
-pub mod quic;
-/// The DNS wire format, native — RFC 1035 messages encoded and decoded here rather than by
-/// `hickory_proto` (`edge_dns`) or `simple-dns` (arriving through the `pkarr` crate). The naming
-/// twin of [`native`], which did the same for `iroh::Endpoint`.
-pub mod dns;
-/// Self-authenticating DNS records — an Ed25519 key signs a [`dns`] message and z-base32-encodes
-/// into the label it publishes under. The native replacement for the `pkarr` crate's format half.
-pub mod signed_dns;
-pub mod pkarr;
-pub mod pkarr_relay;
-pub mod mesh_dns;
-pub mod dialkey;
-#[cfg(feature = "federation")]
-pub mod federation;
-pub mod latency;
-pub mod discovery;
-/// The load-balancing algorithm set (`RoundRobin`/`Random`/`Weighted`/`Consistent`/`Healthiest`)
-/// shared between `biota-http-server`'s `kernel::Proxy` (HTTP upstreams) and this crate's own
-/// `edge_proxy::ConnectorPool` (tunnelled peer connections) — extracted out of `kernel::Backends`
-/// so the two proxies pick from one algorithm set, not two that could quietly drift apart.
-pub mod load_balance;
-/// tas-edge — the SaaS hostname layer (managed subdomains, BYO custom hostnames). Pure
-/// registry logic over hashtrinity, so it is always compiled; only the DNS halves need a dep.
-pub mod edge;
-/// RFC 4648 and z-base32 text encoding (an Ed25519 public key as a DNS label).
-pub mod base32;
-/// PEM / base64 plumbing for the certificate paths.
-pub mod pem;
-/// The primitives the secure channel and signed records use: aws-lc-rs (FIPS-capable), with a
-/// hashtrinity fallback for the dependency-free core.
-pub mod prim;
-/// ClientHello SNI peeking for TLS passthrough routing.
-pub mod tls_hello;
-pub mod edge_dns;
-/// Proof-of-control checks for BYO hostnames. The sweep and its `DnsProbe` seam are always
-/// compiled (and unit-tested against a static probe); only the real resolver is gated.
-pub mod edge_verify;
-/// The edge data plane: hostname -> authenticated peer. Supplies the one thing
-/// `native_lib::proxy` cannot express (an upstream that is a PeerId, not a host:port) and
-/// reuses that module for everything else.
-pub mod edge_proxy;
-#[cfg(feature = "bind-overlay")]
-pub mod control;
-pub mod provision;
-/// HTTP types (`Method`, `Uri`, `HeaderMap`, `Request`/`Response`) — lifted verbatim from
-/// bedrock's `native_lib::http_types`, paired with [`http_client`].
-pub mod http_types;
-/// The plain/TLS stream, connection pool, and request/response wire I/O underneath
-/// [`http_client`]. Lifted verbatim from bedrock's `native_lib::wire`.
-#[cfg(feature = "native")]
-pub(crate) mod wire;
-/// A minimal async HTTP client (GET/PUT + bytes), used by [`pkarr::RelayClient`] to talk to
-/// pkarr relays — "native", i.e. no `pkarr` [crate] dependency. It is real TLS (`rustls`) on
-/// `tokio` with `tracing` spans, so it is behind the on-by-default `native` feature: without it
-/// the crate is the wire-format-only zero-dep core.
-#[cfg(feature = "native")]
-pub mod http_client;
 /// ACME v2 (RFC 8555) automation for [`edge::CertSource`] — the issuance worker `edge.rs`'s own
 /// doc comment calls "eventually." Needs [`http_client`]'s real TLS+HTTP/1.1 client and JSON, so
 /// this is behind the `native` feature too, like `http_client` — matching `native.rs`/
@@ -84,14 +24,9 @@ pub mod acme;
 /// The certificate renewal engine: what to issue, when to renew, how to fail, how to persist.
 #[cfg(feature = "native")]
 pub mod acme_renew;
-/// Where certificate-related randomness comes from (the OS CSPRNG through aws-lc-rs), the startup
-/// self-check that refuses a broken RNG, and the weak-secret gate for operator-supplied secrets.
-#[cfg(feature = "native")]
-pub mod entropy;
-/// Certificate private keys: the key policy (P-256/P-384, RSA >= 3072, nothing else), the
-/// generator seam, and atomic 0600 writes.
-#[cfg(feature = "native")]
-pub mod certkey;
+/// RFC 4648 and z-base32 text encoding (an Ed25519 public key as a DNS label).
+pub mod base32;
+pub mod bastion;
 /// The CA allow-list: which CAs may issue, in what standing, and the CAA records that follow.
 #[cfg(feature = "native")]
 pub mod ca_policy;
@@ -101,29 +36,93 @@ pub mod ca_resilience;
 /// Root-program (Mozilla CCADB, Chrome Root Store) distrust signals for the CAs we issue from.
 #[cfg(feature = "native")]
 pub mod ca_trust;
+/// Certificate private keys: the key policy (P-256/P-384, RSA >= 3072, nothing else), the
+/// generator seam, and atomic 0600 writes.
+#[cfg(feature = "native")]
+pub mod certkey;
+#[cfg(feature = "bind-overlay")]
+pub mod control;
 /// Certificate Transparency monitoring: mis-issuance for our names, and SCTs in what we obtained.
 #[cfg(feature = "native")]
 pub mod ct_monitor;
-/// A small X.509 reader for the certificate lifecycle (issuer, SPKI, SANs, SCT presence,
-/// fingerprints). Not a path validator.
-#[cfg(feature = "native")]
-pub mod x509;
+pub mod dialkey;
+pub mod discovery;
+/// The DNS wire format, native — RFC 1035 messages encoded and decoded here rather than by
+/// `hickory_proto` (`edge_dns`) or `simple-dns` (arriving through the `pkarr` crate). The naming
+/// twin of [`native`], which did the same for `iroh::Endpoint`.
+pub mod dns;
 /// DNS health findings for the zones and names the edge depends on: DNSSEC chain health
 /// (DS vs DNSKEY, RRSIG lifetime), RFC 8659 CAA policy, NS/SOA sanity. Pure evaluators over
 /// injected lookups; the live resolver is `edge_verify`'s DNS client.
 #[cfg(feature = "native")]
 pub mod dns_health;
-/// Owner-signed object replication over the native transport (zone snapshots, ACME challenge state).
-pub mod zone_sync;
+/// tas-edge — the SaaS hostname layer (managed subdomains, BYO custom hostnames). Pure
+/// registry logic over hashtrinity, so it is always compiled; only the DNS halves need a dep.
+pub mod edge;
+pub mod edge_dns;
+/// The edge data plane: hostname -> authenticated peer. Supplies the one thing
+/// `native_lib::proxy` cannot express (an upstream that is a PeerId, not a host:port) and
+/// reuses that module for everything else.
+pub mod edge_proxy;
+/// Proof-of-control checks for BYO hostnames. The sweep and its `DnsProbe` seam are always
+/// compiled (and unit-tested against a static probe); only the real resolver is gated.
+pub mod edge_verify;
+/// Where certificate-related randomness comes from (the OS CSPRNG through aws-lc-rs), the startup
+/// self-check that refuses a broken RNG, and the weak-secret gate for operator-supplied secrets.
+#[cfg(feature = "native")]
+pub mod entropy;
+#[cfg(feature = "federation")]
+pub mod federation;
+pub mod gossip;
+/// A minimal async HTTP client (GET/PUT + bytes), used by [`pkarr::RelayClient`] to talk to
+/// pkarr relays — "native", i.e. no `pkarr` [crate] dependency. It is real TLS (`rustls`) on
+/// `tokio` with `tracing` spans, so it is behind the on-by-default `native` feature: without it
+/// the crate is the wire-format-only zero-dep core.
+#[cfg(feature = "native")]
+pub mod http_client;
+/// HTTP types (`Method`, `Uri`, `HeaderMap`, `Request`/`Response`) — lifted verbatim from
+/// bedrock's `native_lib::http_types`, paired with [`http_client`].
+pub mod http_types;
+pub mod latency;
+/// The load-balancing algorithm set (`RoundRobin`/`Random`/`Weighted`/`Consistent`/`Healthiest`)
+/// shared between `biota-http-server`'s `kernel::Proxy` (HTTP upstreams) and this crate's own
+/// `edge_proxy::ConnectorPool` (tunnelled peer connections) — extracted out of `kernel::Backends`
+/// so the two proxies pick from one algorithm set, not two that could quietly drift apart.
+pub mod load_balance;
+pub mod mesh_dns;
+pub mod native;
+/// PEM / base64 plumbing for the certificate paths.
+pub mod pem;
+pub mod pkarr;
+pub mod pkarr_relay;
+/// The primitives the secure channel and signed records use: aws-lc-rs (FIPS-capable), with a
+/// hashtrinity fallback for the dependency-free core.
+pub mod prim;
+pub mod provision;
+pub mod quic;
+/// Self-authenticating DNS records — an Ed25519 key signs a [`dns`] message and z-base32-encodes
+/// into the label it publishes under. The native replacement for the `pkarr` crate's format half.
+pub mod signed_dns;
 /// The set-difference file sync and the protocol pieces under it: S3 and SigV4, HTTP/1.1 and HTTP/2,
 /// gRPC and HPACK, TLS 1.3, bundles and block images. Moved here from `apeiron::map::hashtrinity::sync`.
 #[cfg(feature = "syncfold")]
 pub mod sync;
+/// ClientHello SNI peeking for TLS passthrough routing.
+pub mod tls_hello;
+/// The plain/TLS stream, connection pool, and request/response wire I/O underneath
+/// [`http_client`]. Lifted verbatim from bedrock's `native_lib::wire`.
+#[cfg(feature = "native")]
+pub(crate) mod wire;
+/// A small X.509 reader for the certificate lifecycle (issuer, SPKI, SANs, SCT presence,
+/// fingerprints). Not a path validator.
+#[cfg(feature = "native")]
+pub mod x509;
+/// Owner-signed object replication over the native transport (zone snapshots, ACME challenge state).
+pub mod zone_sync;
 
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
-use std::sync::Arc;
 
 /// A peer's identity — an Ed25519 public key (32 bytes). Same as iroh's `EndpointId`.
 pub type PeerId = [u8; 32];
@@ -174,11 +173,14 @@ pub trait BiStream: Send {
 /// A connection to a peer — can open and accept bi-directional stream pairs.
 ///
 /// A bi-directional stream pair is `(send: Box<dyn BiStream>, recv: Box<dyn BiStream>)`.
+/// The `(send, recv)` pair a bi-directional stream yields.
+pub type BiStreamPair = (Box<dyn BiStream>, Box<dyn BiStream>);
+
 pub trait Connection: Send + Sync {
     /// Open a new bi-directional stream pair. Returns (send, recv).
-    fn open_bi<'a>(&'a self) -> BoxFuture<'a, io::Result<(Box<dyn BiStream>, Box<dyn BiStream>)>>;
+    fn open_bi<'a>(&'a self) -> BoxFuture<'a, io::Result<BiStreamPair>>;
     /// Accept a bi-directional stream pair from the peer.
-    fn accept_bi<'a>(&'a self) -> BoxFuture<'a, io::Result<(Box<dyn BiStream>, Box<dyn BiStream>)>>;
+    fn accept_bi<'a>(&'a self) -> BoxFuture<'a, io::Result<BiStreamPair>>;
     /// The peer's identity (Ed25519 public key).
     fn peer_id(&self) -> PeerId;
     /// Close the connection.
@@ -196,7 +198,11 @@ pub trait Transport: Send + Sync {
     fn id(&self) -> PeerId;
 
     /// Connect to a peer at `addr` (host:port format for TCP, or an iroh ticket for QUIC).
-    fn connect<'a>(&'a self, addr: &'a str, alpn: &'a [u8]) -> BoxFuture<'a, io::Result<Self::Connection>>;
+    fn connect<'a>(
+        &'a self,
+        addr: &'a str,
+        alpn: &'a [u8],
+    ) -> BoxFuture<'a, io::Result<Self::Connection>>;
 
     /// Accept one incoming connection.
     fn accept<'a>(&'a self) -> BoxFuture<'a, Option<Self::Connection>>;
@@ -216,14 +222,24 @@ pub struct PeerAddr {
 
 impl PeerAddr {
     pub fn new(peer_id: PeerId, host: impl Into<String>, port: u16) -> Self {
-        PeerAddr { peer_id, host: host.into(), port }
+        PeerAddr {
+            peer_id,
+            host: host.into(),
+            port,
+        }
     }
 
+    // Kept as an inherent method: callers use it, and it is the wire form, not a `Display` impl.
+    #[allow(clippy::inherent_to_string_shadow_display)]
     pub fn to_string(&self) -> String {
         format!(
             "bedrock-transport://{}@{}:{}",
-            self.peer_id.iter().map(|b| format!("{b:02x}")).collect::<String>(),
-            self.host, self.port
+            self.peer_id
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>(),
+            self.host,
+            self.port
         )
     }
 
@@ -233,11 +249,17 @@ impl PeerAddr {
         let (host, port_str) = addr.rsplit_once(':')?;
         let port: u16 = port_str.parse().ok()?;
         let mut peer_id = [0u8; 32];
-        if id_hex.len() != 64 { return None; }
+        if id_hex.len() != 64 {
+            return None;
+        }
         for i in 0..32 {
             peer_id[i] = u8::from_str_radix(&id_hex[i * 2..i * 2 + 2], 16).ok()?;
         }
-        Some(PeerAddr { peer_id, host: host.to_string(), port })
+        Some(PeerAddr {
+            peer_id,
+            host: host.to_string(),
+            port,
+        })
     }
 }
 

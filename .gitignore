@@ -1,2 +1,6 @@
 /target
 /.cargo
+
+/vendor
+/.cargo/config.toml
+/allowed-keys.txt

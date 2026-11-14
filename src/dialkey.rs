@@ -24,8 +24,8 @@
 //! dependency at that point. The `federation` impl is the transition shim, not the destination —
 //! see `docs/rfcs/0019-native-p2p-pkarr-removal.md` for what is left to remove.
 
-use crate::{PeerAddr, PeerId};
 use crate::prim::sha256;
+use crate::{PeerAddr, PeerId};
 use std::collections::HashMap;
 use std::future::Future;
 use std::net::IpAddr;
@@ -159,12 +159,22 @@ fn service_records(
         out.push(Record::new(
             name.clone(),
             RECORD_TTL,
-            RData::Srv { priority: 0, weight: 0, port: svc.port, target: apex.clone() },
+            RData::Srv {
+                priority: 0,
+                weight: 0,
+                port: svc.port,
+                target: apex.clone(),
+            },
         ));
         out.push(Record::new(
             name,
             RECORD_TTL,
-            RData::Txt(sorted_entries(&svc.metadata).into_iter().map(String::into_bytes).collect()),
+            RData::Txt(
+                sorted_entries(&svc.metadata)
+                    .into_iter()
+                    .map(String::into_bytes)
+                    .collect(),
+            ),
         ));
     }
     out.push(match ip {
@@ -206,7 +216,11 @@ pub fn build_packet(
 /// system ties those two together. Checking here means a mismatch cannot produce a
 /// `DialkeyService` whose identity and address came from different keys.
 #[cfg_attr(not(feature = "native"), allow(dead_code))] // read back only by the relay-client resolver (and tests)
-fn service_from_packet(packet: &SignedPacket, dialkey: &str, service: &str) -> Option<DialkeyService> {
+fn service_from_packet(
+    packet: &SignedPacket,
+    dialkey: &str,
+    service: &str,
+) -> Option<DialkeyService> {
     let key_str = native_keypair(dialkey).to_z32();
     if packet.public_key().to_z32() != key_str {
         return None;
@@ -222,7 +236,9 @@ fn service_from_packet(packet: &SignedPacket, dialkey: &str, service: &str) -> O
             continue;
         }
         match &r.data {
-            RData::Srv { port: p, target: t, .. } => {
+            RData::Srv {
+                port: p, target: t, ..
+            } => {
                 port = Some(*p);
                 target = Some(t.clone());
             }
@@ -330,24 +346,42 @@ impl DialkeyTransport for pkarr::Client {
         ip: IpAddr,
         services: &[DialkeyServiceInfo],
     ) -> impl Future<Output = Result<(), Self::Error>> + Send {
-        use pkarr::dns::Name as PkName;
         use pkarr::dns::rdata::{RData as PkRData, SRV, TXT};
+        use pkarr::dns::Name as PkName;
 
         let kp = keypair(dialkey);
         let key_str = kp.public_key().to_string();
-        let apex = PkName::new(&key_str).expect("public key is a valid dns name").into_owned();
+        let apex = PkName::new(&key_str)
+            .expect("public key is a valid dns name")
+            .into_owned();
 
         let mut builder = pkarr::SignedPacket::builder();
         let prepared: Vec<(String, Vec<String>, u16)> = services
             .iter()
-            .map(|s| (service_name(&key_str, &s.service), sorted_entries(&s.metadata), s.port))
+            .map(|s| {
+                (
+                    service_name(&key_str, &s.service),
+                    sorted_entries(&s.metadata),
+                    s.port,
+                )
+            })
             .collect();
         for (svc_name, entries, port) in &prepared {
-            let name = PkName::new(svc_name).expect("service name is valid").into_owned();
-            let srv = SRV { priority: 0, weight: 0, port: *port, target: apex.clone() };
+            let name = PkName::new(svc_name)
+                .expect("service name is valid")
+                .into_owned();
+            let srv = SRV {
+                priority: 0,
+                weight: 0,
+                port: *port,
+                target: apex.clone(),
+            };
             let mut txt = TXT::new().into_owned();
             for entry in entries {
-                txt = txt.with_string(entry).expect("txt entry is valid").into_owned();
+                txt = txt
+                    .with_string(entry)
+                    .expect("txt entry is valid")
+                    .into_owned();
             }
             builder = builder
                 .rdata(name.clone(), PkRData::SRV(srv), RECORD_TTL)
@@ -471,7 +505,11 @@ pub fn opsfold_service_with_path(port: u16, region: &str, path: &str) -> Dialkey
     let mut metadata = HashMap::new();
     metadata.insert("region".to_string(), region.to_string());
     metadata.insert("path".to_string(), path.to_string());
-    DialkeyServiceInfo { service: OPSFOLD_SERVICE.to_string(), port, metadata }
+    DialkeyServiceInfo {
+        service: OPSFOLD_SERVICE.to_string(),
+        port,
+        metadata,
+    }
 }
 
 /// Build a billing service advertisement.
@@ -480,7 +518,11 @@ pub fn billing_service(port: u16, tenant: &str) -> DialkeyServiceInfo {
     let mut metadata = HashMap::new();
     metadata.insert("tenant".to_string(), tenant.to_string());
     metadata.insert("path".to_string(), BILLING_PATH.to_string());
-    DialkeyServiceInfo { service: BILLING_SERVICE.to_string(), port, metadata }
+    DialkeyServiceInfo {
+        service: BILLING_SERVICE.to_string(),
+        port,
+        metadata,
+    }
 }
 
 /// The Lyrium scenario-ingestion service — a Lyrium worker (or whatever runs
@@ -499,7 +541,11 @@ pub fn lyrium_sim_service(port: u16, region: &str) -> DialkeyServiceInfo {
     let mut metadata = HashMap::new();
     metadata.insert("region".to_string(), region.to_string());
     metadata.insert("path".to_string(), LYRIUM_SIM_PATH.to_string());
-    DialkeyServiceInfo { service: LYRIUM_SIM_SERVICE.to_string(), port, metadata }
+    DialkeyServiceInfo {
+        service: LYRIUM_SIM_SERVICE.to_string(),
+        port,
+        metadata,
+    }
 }
 
 // ── mesh-model service ────────────────────────────────────────────────────────────────────
@@ -549,8 +595,14 @@ mod tests {
         let svc = opsfold_service_with_path(8092, "default", "/metrics");
         assert_eq!(svc.service, OPSFOLD_SERVICE);
         assert_eq!(svc.port, 8092);
-        assert_eq!(svc.metadata.get("path").map(|s| s.as_str()), Some("/metrics"));
-        assert_eq!(svc.metadata.get("region").map(|s| s.as_str()), Some("default"));
+        assert_eq!(
+            svc.metadata.get("path").map(|s| s.as_str()),
+            Some("/metrics")
+        );
+        assert_eq!(
+            svc.metadata.get("region").map(|s| s.as_str()),
+            Some("default")
+        );
     }
 
     #[test]
@@ -558,8 +610,14 @@ mod tests {
         let svc = lyrium_sim_service(8093, "tas-cloud");
         assert_eq!(svc.service, LYRIUM_SIM_SERVICE);
         assert_eq!(svc.port, 8093);
-        assert_eq!(svc.metadata.get("path").map(|s| s.as_str()), Some(LYRIUM_SIM_PATH));
-        assert_eq!(svc.metadata.get("region").map(|s| s.as_str()), Some("tas-cloud"));
+        assert_eq!(
+            svc.metadata.get("path").map(|s| s.as_str()),
+            Some(LYRIUM_SIM_PATH)
+        );
+        assert_eq!(
+            svc.metadata.get("region").map(|s| s.as_str()),
+            Some("tas-cloud")
+        );
     }
 
     /// The identity must not move: `native_keypair` and the legacy `keypair` are the same seed,
@@ -588,8 +646,10 @@ mod tests {
     /// from it on main 30fdaf7 (captured before this change): the seed, its Ed25519 public key,
     /// and that key's z-base32 form, which is the label `build_packet` publishes under.
     const GOLDEN_DIALKEY: &str = "g17-test-dialkey";
-    const GOLDEN_SEED_HEX: &str = "f312899db1b911aad45adc946d31875a58e810242652eba4fac63966a3bad73e";
-    const GOLDEN_PUBLIC_HEX: &str = "30966ac5fa1bdd49aec9b9101bf63359704d01dc00597f934f7d7bca9bc5c47b";
+    const GOLDEN_SEED_HEX: &str =
+        "f312899db1b911aad45adc946d31875a58e810242652eba4fac63966a3bad73e";
+    const GOLDEN_PUBLIC_HEX: &str =
+        "30966ac5fa1bdd49aec9b9101bf63359704d01dc00597f934f7d7bca9bc5c47b";
     const GOLDEN_Z32: &str = "gnmgitx4dxqwumsjzrebz7tumfar4yqhybcz9r4xxi7hig6fat7o";
 
     fn hex(b: &[u8]) -> String {
@@ -629,7 +689,9 @@ mod tests {
             if id != ed25519_pubkey(&seed) {
                 bad.push("peer-id-is-not-the-public-key-of-the-seed");
             }
-            let label_of_id = super::super::signed_dns::PublicKey::from_bytes(&id).map(|p| p.to_z32()).ok();
+            let label_of_id = super::super::signed_dns::PublicKey::from_bytes(&id)
+                .map(|p| p.to_z32())
+                .ok();
             if label_of_id != Some((d.published_label)(k)) {
                 bad.push("peer-id-does-not-name-the-published-endpoint");
             }
@@ -643,13 +705,20 @@ mod tests {
 
         bad.sort_unstable();
         bad.dedup();
-        if bad.is_empty() { Ok(()) } else { Err(bad) }
+        if bad.is_empty() {
+            Ok(())
+        } else {
+            Err(bad)
+        }
     }
 
     /// The label `build_packet` really publishes under — not recomputed by the test.
     fn real_published_label(dialkey: &str) -> String {
         let ip: IpAddr = "10.0.0.1".parse().unwrap();
-        build_packet(dialkey, ip, &[opsfold_service(1, "r")], 1).unwrap().public_key().to_z32()
+        build_packet(dialkey, ip, &[opsfold_service(1, "r")], 1)
+            .unwrap()
+            .public_key()
+            .to_z32()
     }
 
     #[test]
@@ -666,33 +735,56 @@ mod tests {
     #[test]
     fn the_checker_rejects_mutants_of_the_real_module() {
         use apeiron::map::hashtrinity::crypto::{ed25519_pubkey, sha256};
-        let z32 = |id: PeerId| super::super::signed_dns::PublicKey::from_bytes(&id).unwrap().to_z32();
+        let z32 = |id: PeerId| {
+            super::super::signed_dns::PublicKey::from_bytes(&id)
+                .unwrap()
+                .to_z32()
+        };
         // Run one mutant: replace some of the real functions, keep the rest real.
         let run = |peer: &dyn Fn(&str) -> PeerId,
                    seed: &dyn Fn(&str) -> [u8; 32],
                    label: &dyn Fn(&str) -> String| {
-            check_peer_id_contract(&Derivation { peer_id: peer, seed, published_label: label })
+            check_peer_id_contract(&Derivation {
+                peer_id: peer,
+                seed,
+                published_label: label,
+            })
         };
         let rejected = |r: Result<(), Vec<&'static str>>, must_flag: &str| {
             let flagged = r.expect_err("mutant must be rejected");
-            assert!(flagged.iter().any(|f| *f == must_flag), "flagged {flagged:?}, expected {must_flag}");
+            assert!(
+                flagged.contains(&must_flag),
+                "flagged {flagged:?}, expected {must_flag}"
+            );
         };
 
         // 1. The original bug: peer_id hands back the secret seed.
         rejected(
-            run(&secret_seed_do_not_expose, &secret_seed_do_not_expose, &real_published_label),
+            run(
+                &secret_seed_do_not_expose,
+                &secret_seed_do_not_expose,
+                &real_published_label,
+            ),
             "peer-id-is-the-secret-seed",
         );
         // 2. The public key of a DIFFERENT derivation (another suffix).
         let other_suffix = |k: &str| ed25519_pubkey(&sha256(format!("{k}:other").as_bytes()));
         rejected(
-            run(&other_suffix, &secret_seed_do_not_expose, &real_published_label),
+            run(
+                &other_suffix,
+                &secret_seed_do_not_expose,
+                &real_published_label,
+            ),
             "peer-id-is-not-the-public-key-of-the-seed",
         );
         // 3. The `:pkarr` suffix dropped from peer_id only.
         let no_suffix_id = |k: &str| ed25519_pubkey(&sha256(k.as_bytes()));
         rejected(
-            run(&no_suffix_id, &secret_seed_do_not_expose, &real_published_label),
+            run(
+                &no_suffix_id,
+                &secret_seed_do_not_expose,
+                &real_published_label,
+            ),
             "golden-public-key",
         );
         // 4. The suffix dropped EVERYWHERE, consistently — internally coherent, so only the golden
@@ -700,7 +792,10 @@ mod tests {
         let no_suffix_seed = |k: &str| sha256(k.as_bytes());
         let no_suffix_label = |k: &str| z32(ed25519_pubkey(&sha256(k.as_bytes())));
         let flagged = run(&no_suffix_id, &no_suffix_seed, &no_suffix_label).unwrap_err();
-        assert!(flagged.contains(&"golden-seed") && flagged.contains(&"golden-published-name"), "{flagged:?}");
+        assert!(
+            flagged.contains(&"golden-seed") && flagged.contains(&"golden-published-name"),
+            "{flagged:?}"
+        );
         // 5. peer_id right, but the endpoint is published under a different name.
         rejected(
             run(&peer_id, &secret_seed_do_not_expose, &no_suffix_label),
@@ -728,7 +823,8 @@ mod tests {
     /// `SHA-256(dialkey ++ ":pkarr")` and its public key is `peer_id`.
     #[test]
     fn peer_id_is_the_public_key_not_the_secret_for_the_golden_dialkey() {
-        let seed = apeiron::map::hashtrinity::crypto::sha256(format!("{GOLDEN_DIALKEY}:pkarr").as_bytes());
+        let seed =
+            apeiron::map::hashtrinity::crypto::sha256(format!("{GOLDEN_DIALKEY}:pkarr").as_bytes());
         assert_eq!(hex(&seed), GOLDEN_SEED_HEX);
         let id = peer_id(GOLDEN_DIALKEY);
         assert_eq!(hex(&id), GOLDEN_PUBLIC_HEX);
@@ -744,12 +840,11 @@ mod tests {
         let ip: IpAddr = "10.0.0.1".parse().unwrap();
         let packet = build_packet(GOLDEN_DIALKEY, ip, &[opsfold_service(8081, "r")], 1).unwrap();
         assert_eq!(packet.public_key().to_z32(), GOLDEN_Z32);
-        let names: Vec<String> = packet
-            .records()
-            .iter()
-            .map(|r| r.name.to_ascii())
-            .collect();
-        assert!(names.contains(&format!("{OPSFOLD_SERVICE}.{GOLDEN_Z32}.")), "{names:?}");
+        let names: Vec<String> = packet.records().iter().map(|r| r.name.to_ascii()).collect();
+        assert!(
+            names.contains(&format!("{OPSFOLD_SERVICE}.{GOLDEN_Z32}.")),
+            "{names:?}"
+        );
         assert!(names.contains(&format!("{GOLDEN_Z32}.")), "{names:?}");
     }
 
@@ -762,8 +857,15 @@ mod tests {
         let packet = build_packet(GOLDEN_DIALKEY, ip, &[opsfold_service(8081, "r")], 1).unwrap();
         let svc = service_from_packet(&packet, GOLDEN_DIALKEY, OPSFOLD_SERVICE).unwrap();
         assert_eq!(hex(&svc.peer_addr.peer_id), GOLDEN_PUBLIC_HEX);
-        for rendered in [svc.peer_addr.to_string(), format!("{:?}", svc), format!("{:?}", svc.peer_addr)] {
-            assert!(!rendered.contains(GOLDEN_SEED_HEX), "seed leaked into {rendered}");
+        for rendered in [
+            svc.peer_addr.to_string(),
+            format!("{:?}", svc),
+            format!("{:?}", svc.peer_addr),
+        ] {
+            assert!(
+                !rendered.contains(GOLDEN_SEED_HEX),
+                "seed leaked into {rendered}"
+            );
         }
         assert!(svc.peer_addr.to_string().contains(GOLDEN_PUBLIC_HEX));
     }
@@ -772,7 +874,10 @@ mod tests {
     /// `DialkeyService` comes out, with host, port and metadata intact.
     #[test]
     fn a_dialkey_record_round_trips_through_the_signed_packet() {
-        let services = vec![opsfold_service(8081, "tas-cloud"), billing_service(8092, "acme")];
+        let services = vec![
+            opsfold_service(8081, "tas-cloud"),
+            billing_service(8092, "acme"),
+        ];
         let ip: IpAddr = "10.7.46.107".parse().unwrap();
         let packet = build_packet("meteroid", ip, &services, 1_700_000_000_000_000).unwrap();
 
@@ -780,12 +885,21 @@ mod tests {
         assert_eq!(ops.peer_addr.host, "10.7.46.107");
         assert_eq!(ops.peer_addr.port, 8081);
         assert_eq!(ops.peer_addr.peer_id, peer_id("meteroid"));
-        assert_eq!(ops.metadata.get("region").map(String::as_str), Some("tas-cloud"));
-        assert_eq!(ops.metadata.get("path").map(String::as_str), Some(OPSFOLD_PATH));
+        assert_eq!(
+            ops.metadata.get("region").map(String::as_str),
+            Some("tas-cloud")
+        );
+        assert_eq!(
+            ops.metadata.get("path").map(String::as_str),
+            Some(OPSFOLD_PATH)
+        );
 
         let bill = service_from_packet(&packet, "meteroid", BILLING_SERVICE).unwrap();
         assert_eq!(bill.peer_addr.port, 8092);
-        assert_eq!(bill.metadata.get("tenant").map(String::as_str), Some("acme"));
+        assert_eq!(
+            bill.metadata.get("tenant").map(String::as_str),
+            Some("acme")
+        );
     }
 
     /// Two services in one packet, one apex address. A second copy is wasted bytes against
@@ -826,7 +940,11 @@ mod tests {
             m.insert("z".to_string(), "1".to_string());
             m.insert("a".to_string(), "2".to_string());
             m.insert("m".to_string(), "3".to_string());
-            vec![DialkeyServiceInfo { service: "_x._tcp".to_string(), port: 1, metadata: m }]
+            vec![DialkeyServiceInfo {
+                service: "_x._tcp".to_string(),
+                port: 1,
+                metadata: m,
+            }]
         };
         let a = build_packet("k", ip, &svc(()), 7).unwrap();
         let b = build_packet("k", ip, &svc(()), 7).unwrap();
@@ -842,7 +960,11 @@ mod tests {
             .map(|i| {
                 let mut m = HashMap::new();
                 m.insert("path".to_string(), format!("/surface/{i}/with/a/long/tail"));
-                DialkeyServiceInfo { service: format!("_svc{i}._tcp"), port: 1000 + i, metadata: m }
+                DialkeyServiceInfo {
+                    service: format!("_svc{i}._tcp"),
+                    port: 1000 + i,
+                    metadata: m,
+                }
             })
             .collect();
         assert_eq!(
@@ -865,8 +987,16 @@ mod tests {
             );
             // Independent of this crate's own Ed25519: the real `pkarr` crate's public key bytes
             // are `peer_id`, and are not the seed.
-            assert_eq!(&peer_id(dk), keypair(dk).public_key().as_bytes(), "peer_id for {dk}");
-            assert_ne!(peer_id(dk), secret_seed_do_not_expose(dk), "peer_id must not be the seed");
+            assert_eq!(
+                &peer_id(dk),
+                keypair(dk).public_key().as_bytes(),
+                "peer_id for {dk}"
+            );
+            assert_ne!(
+                peer_id(dk),
+                secret_seed_do_not_expose(dk),
+                "peer_id must not be the seed"
+            );
         }
     }
 
@@ -877,8 +1007,8 @@ mod tests {
     fn a_native_signature_verifies_as_a_pkarr_signature() {
         use pkarr::SignedPacket as PkSignedPacket;
         let ip: IpAddr = "10.7.46.107".parse().unwrap();
-        let native = build_packet("meteroid", ip, &[opsfold_service(8081, "tas-cloud")], 42)
-            .unwrap();
+        let native =
+            build_packet("meteroid", ip, &[opsfold_service(8081, "tas-cloud")], 42).unwrap();
         let wire = native.to_relay_bytes();
 
         // The pkarr crate parses and verifies the native relay payload against the same key.
@@ -890,6 +1020,10 @@ mod tests {
             parsed.err()
         );
         let parsed = parsed.unwrap();
-        assert_eq!(parsed.timestamp().as_u64(), 42, "seq must survive the crossing");
+        assert_eq!(
+            parsed.timestamp().as_u64(),
+            42,
+            "seq must survive the crossing"
+        );
     }
 }
