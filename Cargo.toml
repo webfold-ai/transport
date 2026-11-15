@@ -57,7 +57,7 @@ serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
 # One apeiron for every crate in the graph: `apeiron::map::hashtrinity::Table<K, V>` crosses crate boundaries,
 # so two apeiron SourceIds would be two incompatible types (E0308). This URL at this rev, no branch, no `.git`.
-apeiron = { version = "0.1.0", git = "https://github.com/webfold-ai/apeiron", rev = "1c3d4a1da565cde409f6f3cb343086aa6853eb9c" }
+apeiron = { version = "0.1.0", git = "https://github.com/webfold-ai/apeiron", rev = "85b404b8dc89903c5c588a2cd1d10bfa5b9e64bc" }
 rustls-pki-types = "1"
 rustls-native-certs = "0.8"
 bytes = "1"
@@ -74,7 +74,7 @@ flate2 = { version = "1", optional = true }
 # is now a thin re-export.
 # Pinned by rev: an unpinned entry would resolve to relayfold's default branch, and a consumer that also names
 # relayfold must use this exact rev or the graph holds two relayfolds. b50b9e1 is relayfold on wirefold/apeiron.
-relayfold = { git = "https://github.com/Ptyktos/relayfold", rev = "afed0355a5b51777b085473a29720d35ecdf671d" }
+relayfold = { git = "https://github.com/Ptyktos/relayfold", rev = "ef73381b1133348a786c4713e68de075d526c769" }
 pkarr = { version = "8.0.1", optional = true }
 
 # The unit tests of modules that are always compiled (`edge_verify`, `edge_proxy`) drive async code with
