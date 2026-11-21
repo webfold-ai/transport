@@ -2,7 +2,7 @@
 //!
 //! Built from a measured need, like [`apeiron::map::hashtrinity::base64`] beside it: a 32-byte Ed25519 public key
 //! has to become a DNS label to be published or resolved, and z-base32 is the encoding the
-//! signed-record world agreed on (`bedrock::transport::pkarr`). The `base32` crate arrived here
+//! signed-record world agreed on (the pkarr record format). The `base32` crate arrived here
 //! only as a transitive dependency of that lift; the alphabet is 32 characters and the codec is
 //! a 5-bit window, so depending on a crate for it is the reimplementation pattern a masquerade
 //! exists to close.

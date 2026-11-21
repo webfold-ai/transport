@@ -3,7 +3,7 @@
 //!
 //! Replaces `iroh::Endpoint` with tokio TcpStream + a native handshake (Ed25519 static identity +
 //! X25519 ephemeral Diffie-Hellman + ChaCha20-Poly1305 session encryption), all via
-//! hashtrinity-crypto — not IETF TLS 1.3 wire format (bedrock's own peers don't need to
+//! hashtrinity-crypto — not IETF TLS 1.3 wire format (the peers on this path do not need to
 //! interoperate with external TLS clients, just to authenticate and encrypt with each other), but
 //! the same security properties: mutual authentication, forward secrecy via fresh ephemeral keys
 //! per connection, and AEAD-encrypted, tamper-evident streams.

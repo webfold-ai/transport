@@ -24,9 +24,8 @@ use super::PeerId;
 use apeiron::map::hashtrinity::crypto::to_hex;
 
 /// One stage of a pipelined plan — the nodes assigned to run it. Defined here (the producer
-/// side); bedrock's `runtime::cluster` consumes this same shape via `Cluster::pipelined_pmap`.
-/// Kept local rather than imported from bedrock to avoid a cycle (bedrock already depends on
-/// this crate for transport).
+/// side); a cluster runtime consumes this same shape via a pipelined map. Kept local rather
+/// than imported from elsewhere to avoid a dependency cycle.
 #[derive(Clone, Debug)]
 pub struct PipelineStage {
     pub node_ids: Vec<String>,

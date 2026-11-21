@@ -4,13 +4,9 @@
 //! part is exactly the pure selection logic: given N candidates (identified only by a
 //! `apeiron::map::hashtrinity::Coord` and a weight) plus per-candidate health state, pick one index.
 //!
-//! This module used to define `LoadBalance`/`HealthEstimator`/`splitmix64`/`consistent_ring_index`
-//! /`pick_index`/`coord_of` directly — its own independent extraction out of `kernel::Backends`,
-//! done without knowing `relayfold` (github.com/Ptyktos/relayfold) already existed as the same
-//! extraction out of `bedrock::native_lib`. Reconciled 2026-09-23: `relayfold` is the superset (it
-//! also carries `Tuple`/`Relationships`/`Upstream`/`Backends`, which this module's version
-//! didn't) and is already what `bedrock` itself re-exports on both remotes, so it's canonical —
-//! this module is now a thin re-export rather than a second fork of the same algorithm.
+//! The load-balancing set lives in `relayfold`, which is the canonical home for it: this module
+//! is a thin re-export rather than a second copy of the same algorithm, so a fix lands in one
+//! place and every consumer of it gets the fix.
 pub use relayfold::{
     consistent_ring_index, coord_of, pick_index, splitmix64, HealthEstimator, LoadBalance,
     CONSISTENT_HASH_VNODES,
