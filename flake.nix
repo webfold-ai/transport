@@ -22,15 +22,15 @@
     tas-nix.url = "git+https://github.com/Ptyktos/caretaker?dir=nix&rev=b8cda7e4590c8aa6576d834c6363a6266ae5b9d8&shallow=1";
 
     relayfold = {
-      url = "git+https://github.com/Ptyktos/relayfold?rev=afed0355a5b51777b085473a29720d35ecdf671d&shallow=1";
+      url = "git+https://github.com/Ptyktos/relayfold?rev=ef73381b1133348a786c4713e68de075d526c769&shallow=1";
       flake = false;
     };
     apeiron = {
-      url = "git+https://github.com/webfold-ai/apeiron?rev=1c3d4a1da565cde409f6f3cb343086aa6853eb9c&shallow=1";
+      url = "git+https://github.com/webfold-ai/apeiron?rev=85b404b8dc89903c5c588a2cd1d10bfa5b9e64bc&shallow=1";
       flake = false;
     };
     wirefold = {
-      url = "git+https://github.com/webfold-ai/wirefold?rev=98df8bfb8051fb24ca43ce3ddc446641684ef8f9&shallow=1";
+      url = "git+https://github.com/webfold-ai/wirefold?rev=28d875794d4541eb952d23984be411348dc3f1c0&shallow=1";
       flake = false;
     };
   };
