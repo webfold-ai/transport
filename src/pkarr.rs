@@ -10,8 +10,8 @@
 //! Ed25519-signed BEP44 record), on `apeiron::map::hashtrinity::crypto` and this crate's own HTTP client —
 //! the third module in the line [`super::native`] started when it replaced `iroh::Endpoint`.
 //!
-//! The measurement that motivated it: `pkarr` was one direct dependency reaching **82 of
-//! bedrock's 165 normal crates**, half the graph, through its `relays` feature — `reqwest` →
+//! The measurement that motivated it: `pkarr` was one direct dependency reaching **82 of the
+//! 165 normal crates in the graph**, half of it, through its `relays` feature — `reqwest` →
 //! `hyper` → `rustls` → `ring`, and `url` → `idna` → the whole ICU tree. For a signature over a
 //! DNS packet and an HTTP PUT.
 //!
@@ -62,7 +62,7 @@ pub const DEFAULT_RELAYS: [&str; 2] = ["https://relay.pkarr.org", "https://pkarr
 /// Discovered opsfold endpoint.
 #[derive(Clone, Debug)]
 pub struct OpsfoldEndpoint {
-    /// Sidecar region, e.g. `tas-cloud` or `ptyktos`.
+    /// Sidecar region, e.g. `prod` or `staging`.
     pub region: String,
     /// Base HTTP URL, e.g. `http://10.7.46.107:8081`.
     pub url: String,

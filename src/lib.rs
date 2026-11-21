@@ -80,8 +80,8 @@ pub mod gossip;
 /// the crate is the wire-format-only zero-dep core.
 #[cfg(feature = "native")]
 pub mod http_client;
-/// HTTP types (`Method`, `Uri`, `HeaderMap`, `Request`/`Response`) — lifted verbatim from
-/// bedrock's `native_lib::http_types`, paired with [`http_client`].
+/// HTTP types (`Method`, `Uri`, `HeaderMap`, `Request`/`Response`), paired with
+/// [`http_client`].
 pub mod http_types;
 pub mod latency;
 /// The load-balancing algorithm set (`RoundRobin`/`Random`/`Weighted`/`Consistent`/`Healthiest`)
@@ -110,7 +110,7 @@ pub mod sync;
 /// ClientHello SNI peeking for TLS passthrough routing.
 pub mod tls_hello;
 /// The plain/TLS stream, connection pool, and request/response wire I/O underneath
-/// [`http_client`]. Lifted verbatim from bedrock's `native_lib::wire`.
+/// [`http_client`].
 #[cfg(feature = "native")]
 pub(crate) mod wire;
 /// A small X.509 reader for the certificate lifecycle (issuer, SPKI, SANs, SCT presence,

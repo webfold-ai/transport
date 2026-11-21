@@ -52,9 +52,9 @@ pub mod svc {
     pub const LOGGING: &str = "logging";
     /// An OpenAI-compatible completion endpoint (`/v1/chat/completions`, `/v1/models`).
     ///
-    /// The same name whether the backend is `bedrock::serve::server` (native, the `Engine` over
-    /// `modelfold`) or a llama.cpp `llama-server` — a mounting client dials an endpoint, not an
-    /// implementation. `meta::BACKEND` says which, for a client that genuinely needs to know.
+    /// The same name whether the backend is an in-process engine or a llama.cpp `llama-server` —
+    /// a mounting client dials an endpoint, not an implementation. `meta::BACKEND` says which,
+    /// for a client that genuinely needs to know.
     pub const INFERENCE: &str = "inference";
 }
 

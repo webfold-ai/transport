@@ -2,8 +2,7 @@
 // TLS config (PEM -> DER by hand), `serve_tls`, the Pingora-style keepalive connection
 // pool, and request write / response read -- buffered, streaming, and chunked.
 //
-// Ported from bedrock's `native_lib::wire` (originally `include!`d into `native_lib.rs`,
-// sharing its flat scope); here it's a real module, paired with `crate::http_types`.
+// Here it is a real module, paired with `crate::http_types`.
 
 use crate::http_types::*;
 use apeiron::map::hashtrinity::{Coord, CoordMap};

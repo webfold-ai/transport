@@ -2,9 +2,6 @@
 // (`Method`/`Version`/`StatusCode`/`HeaderName`/`HeaderValue`/`HeaderMap`/`Uri`), the
 // `Extensions` type-map, and the `Request`/`Response` messages themselves. No I/O.
 //
-// Ported from bedrock's `native_lib::http_types` (originally `include!`d into `native_lib.rs`,
-// sharing its flat scope); here it's a real module with its own imports.
-
 use apeiron::map::hashtrinity::{CoordMap, PHI};
 use std::io;
 use std::str::FromStr;

@@ -2,9 +2,8 @@
 // `RequestBuilder`/`Client`/`ClientBuilder` chain, redirect following, and the free
 // `get`/`post` helpers. What a caller drives; the bytes go out through `wire.rs`.
 //
-// Ported from bedrock's `native_lib::client` (originally `include!`d into `native_lib.rs`,
-// sharing its flat scope); here it's a real module, paired with `crate::http_types` for the
-// `Method`/`HeaderMap`/`Uri`/`header` types it was written against.
+// Here it is a real module, paired with `crate::http_types` for the
+// `Method`/`HeaderMap`/`Uri`/`header` types it is written against.
 
 use crate::http_types::*;
 use crate::wire::{connect, connect_fresh, send_request, send_request_streaming};
@@ -16,8 +15,8 @@ use tracing::Instrument;
 /// the `wire` module's internals.
 pub use crate::wire::StreamingResponse;
 
-/// Small non-cryptographic PRNG step for the multipart boundary — same as bedrock's
-/// `native_lib::splitmix64`, kept local since it's five lines and not worth a shared dep.
+/// Small non-cryptographic PRNG step for the multipart boundary, kept local since it is five
+/// lines and not worth a shared dependency.
 fn splitmix64(x: u64) -> u64 {
     let x = x.wrapping_add(0x9E3779B97F4A7C15);
     let z = (x ^ (x >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
@@ -633,7 +632,7 @@ fn resolve_redirect_uri(base: &Uri, location: &str) -> Result<Uri> {
         return parse_uri(location);
     }
     // A relative Location (path-absolute, e.g. "/next") -- rebuild against the base's own
-    // scheme/host/port, since bedrock's Uri has no separate "resolve against base" op.
+    // scheme/host/port, since this crate's Uri has no separate "resolve against base" op.
     let scheme = base.scheme_str().unwrap_or("http");
     let host = base.host().unwrap_or_default();
     let authority = match base.port_u16() {
