@@ -1,0 +1,66 @@
+[package]
+name = "edge-lb"
+description = "The Tas Cloud edge load balancer — a custom reverse proxy on servelet (servelet-core/h1/router/tls/client; the request lifecycle is this crate's src/proxy.rs). Terminates TLS, routes by Host header, and resolves backends two ways: static http://host:port, or dialkey://<dialkey>#<service> resolved through transport::dialkey (the Notify plane's own discovery). The first route on the box is the ntfy surface; the connector/tunnel phase (transport::edge_proxy) is the follow-on."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[features]
+# FIPS-validated aws-lc for every key, signature and TLS handshake this edge performs (transport's
+# ACME client, certificate keys, SNI serving provider). Needs Go and CMake at build time.
+fips = ["transport/fips"]
+
+[dependencies]
+# The HTTP surface: Request/Response/Router (servelet-core, servelet-router), serve and
+# serve_tls (servelet-h1, servelet-tls), tls_server_config (servelet-tls). The upstream call
+# for the reverse-proxy lifecycle goes through servelet-client (src/proxy.rs).
+servelet-core = { workspace = true }
+servelet-h1 = { workspace = true }
+servelet-router = { workspace = true }
+servelet-tls = { workspace = true }
+servelet-client = { workspace = true }
+transport = { workspace = true }
+# The ServerConfig type in acme.rs's public signatures — it must be the same rustls
+# that servelet-tls::serve_tls takes, so the Arcs unify (0.23).
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+# Native signed-DNS discovery uses transport::pkarr::RelayClient; no pkarr crate.
+# The SNI front accepts TLS itself (src/front.rs); crypto provider is transport's aws-lc-rs one.
+tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "tls12"] }
+
+tokio = { workspace = true }
+# ct_eq for the control-secret check.
+apeiron = { workspace = true }
+# Not imported by any edge-lb source at present (servelet-core defines its own
+# StatusCode/Method); kept so this change stays a comment-only edit.
+http = { workspace = true }
+# Control-API bodies.
+serde_json = { workspace = true }
+# The release journal entries.
+serde = { workspace = true }
+chrono = { workspace = true }
+# The alias table (promote/rollback log) the rollout controller is built on.
+saga-pipeline = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+anyhow = { workspace = true }
+
+[dev-dependencies]
+# The edge smoke: boot edge-lb against the real notification-service binary.
+reqwest = { workspace = true }
+serde_json = { workspace = true }
+tempfile = "3"
+# Real certificates for the TLS front's end-to-end tests.
+rcgen = "0.13"
+# The fleet smoke drives the overlay-agent in-process (it dials the edge).
+overlay-agent = { git = "https://github.com/Tasmanian-Cloud/hosting-runtime", rev = "212736bdbe70e5aeffe8118a9c23c42e3ef1bbfa" }
+
+[[bin]]
+name = "edge-lb"
+path = "src/main.rs"
+
+[lints]
+workspace = true

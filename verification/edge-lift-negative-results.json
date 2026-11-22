@@ -1,0 +1,47 @@
+[
+  {
+    "crate": "tas-lb",
+    "test": "signed_config::tests::every_altered_byte_breaks_the_document",
+    "exit": 101,
+    "intended_test_failed": true,
+    "synthetic": true,
+    "restored_sha256": "7394dc9abe2626e7b9e1ceb0e55118f4117e7ed190fd0c7563396963cb242152",
+    "original_sha256": "7394dc9abe2626e7b9e1ceb0e55118f4117e7ed190fd0c7563396963cb242152"
+  },
+  {
+    "crate": "tas-dns",
+    "test": "names::tests::owners_resolve_inside_the_apex_only",
+    "exit": 101,
+    "intended_test_failed": true,
+    "synthetic": true,
+    "restored_sha256": "353afadf5e5d166d683e4e2546364334679dd366ff6da50095e563be01381119",
+    "original_sha256": "353afadf5e5d166d683e4e2546364334679dd366ff6da50095e563be01381119"
+  },
+  {
+    "crate": "edge-lb",
+    "test": "control::tests::every_route_demands_the_control_secret",
+    "exit": 101,
+    "intended_test_failed": true,
+    "synthetic": true,
+    "restored_sha256": "15a62d9cc41180820e63b1ada1893711eea5d315decae01578c627f82f07e2ba",
+    "original_sha256": "15a62d9cc41180820e63b1ada1893711eea5d315decae01578c627f82f07e2ba"
+  },
+  {
+    "crate": "mesh-acl-reconciler",
+    "test": "diff_tests::desired_and_actual_diff_adds_missing_revokes_stale_and_preserves_the_exact_pair",
+    "exit": 101,
+    "intended_test_failed": true,
+    "synthetic": true,
+    "restored_sha256": "a764ea36eb24819ab0cf43c90a82fc42baf911cb71b1487fdd55a48c4267afba",
+    "original_sha256": "a764ea36eb24819ab0cf43c90a82fc42baf911cb71b1487fdd55a48c4267afba"
+  },
+  {
+    "crate": "console-ws-proxy",
+    "test": "tests::signer_rejects_tampered_signature",
+    "exit": 101,
+    "intended_test_failed": true,
+    "synthetic": true,
+    "restored_sha256": "b6170acaa1daccf4e8b1076bd353168553dfc6ee39e12b2729d84ebf0e0e63a0",
+    "original_sha256": "b6170acaa1daccf4e8b1076bd353168553dfc6ee39e12b2729d84ebf0e0e63a0"
+  }
+]

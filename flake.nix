@@ -21,8 +21,32 @@
     # The build layer, by revision (flake.lock records the narHash too).
     tas-nix.url = "git+https://github.com/Ptyktos/caretaker?dir=nix&rev=b8cda7e4590c8aa6576d834c6363a6266ae5b9d8&shallow=1";
 
-    relayfold = {
-      url = "git+https://github.com/Ptyktos/relayfold?rev=ef73381b1133348a786c4713e68de075d526c769&shallow=1";
+    hosting-baseline = {
+      url = "git+https://github.com/Tasmanian-Cloud/hosting-runtime?rev=212736bdbe70e5aeffe8118a9c23c42e3ef1bbfa&shallow=1";
+      flake = false;
+    };
+    saga = {
+      url = "git+https://github.com/Tasmanian-Cloud/saga?rev=c82647b7094aba9e3fb673b1b1b5577a6af759cb&shallow=1";
+      flake = false;
+    };
+    servelet = {
+      url = "git+https://github.com/Ptyktos/servelet?rev=fbaaaadc2d64236f8f2f3079bd9fde2dbd4a52bb&shallow=1";
+      flake = false;
+    };
+    legacy-hashtrinity = {
+      url = "git+https://github.com/Ptyktos/hashtrinity?rev=f74bc22288faa08625637ee810977cd0064e11e5&shallow=1";
+      flake = false;
+    };
+    iotadb = {
+      url = "git+https://github.com/webfold-ai/iotadb?rev=208e6e94a2ad00c226c2030776045f8d465cdb93&shallow=1";
+      flake = false;
+    };
+    apeiron-legacy = {
+      url = "git+https://github.com/webfold-ai/apeiron?rev=1c3d4a1da565cde409f6f3cb343086aa6853eb9c&shallow=1";
+      flake = false;
+    };
+    apeiron-store = {
+      url = "git+https://github.com/webfold-ai/apeiron?rev=d0eda3226193542949306f767d7280404921546f&shallow=1";
       flake = false;
     };
     apeiron = {
@@ -30,7 +54,7 @@
       flake = false;
     };
     wirefold = {
-      url = "git+https://github.com/webfold-ai/wirefold?rev=28d875794d4541eb952d23984be411348dc3f1c0&shallow=1";
+      url = "git+https://github.com/webfold-ai/wirefold?rev=98df8bfb8051fb24ca43ce3ddc446641684ef8f9&shallow=1";
       flake = false;
     };
   };
@@ -41,13 +65,30 @@
       name = "transport";
       src = ./.;
       # No rust-toolchain.toml in this repository: the compiler is named here.
-      rustChannel = "1.97.0";
+      rustChannel = "1.99.0";
       bins = {
         meshd = { };
+        tas-lb = { };
+        tas-dns = { };
+        edge-lb = { };
+        mesh-acl-reconciler = { };
       };
+      cargoExtraArgs = "--locked --workspace";
+      # Same external-fixture exclusions as the former hosting edge slice.
+      # Real notification-service-backed tests are exercised through box-run.
+      testSkip = [
+        "edge_routes_ntfy_host_to_the_notification_service"
+        "zero_touch_tunnel_serves_requests_end_to_end"
+      ];
       gitInputs = {
-        "https://github.com/Ptyktos/relayfold" = inputs.relayfold;
+        "https://github.com/Tasmanian-Cloud/hosting-runtime" = inputs.hosting-baseline;
+        "https://github.com/Tasmanian-Cloud/saga" = inputs.saga;
+        "https://github.com/Ptyktos/servelet" = inputs.servelet;
+        "https://github.com/Ptyktos/hashtrinity" = inputs.legacy-hashtrinity;
+        "https://github.com/webfold-ai/iotadb" = inputs.iotadb;
         "https://github.com/webfold-ai/apeiron" = inputs.apeiron;
+        "https://github.com/webfold-ai/apeiron#1c3d4a1da565cde409f6f3cb343086aa6853eb9c" = inputs.apeiron-legacy;
+        "https://github.com/webfold-ai/apeiron#d0eda3226193542949306f767d7280404921546f" = inputs.apeiron-store;
         "https://github.com/webfold-ai/wirefold" = inputs.wirefold;
       };
       # The reviewed cargo-deny policy: the shared default plus two recorded exceptions (see deny.toml).

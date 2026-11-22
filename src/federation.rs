@@ -5,7 +5,9 @@
 //! pkarr packet, one SRV record per service with TXT metadata (region, buckets, endpoint) —
 //! and a client mounts that dialkey to get typed handles for exactly the services it needs.
 //!
-//! ```
+//! ```no_run
+//! # use transport::federation::{Federation, FederationGroup};
+//! # async fn example(pkarr: &pkarr::Client, my_ip: std::net::IpAddr) -> Option<()> {
 //! // publish side — one dialkey advertises the whole stack
 //! let group = FederationGroup::new("knee-cluster")
 //!     .s3(3905, "garage", &["rsna", "models", "submissions"])
@@ -14,13 +16,25 @@
 //!     .meili(7700)
 //!     .lorelake(4433, "/v1/lake")
 //!     .logging(4318);
-//! group.publish(&pkarr, my_ip).await?;
+//! group.publish(pkarr, my_ip).await.ok()?;
 //!
 //! // mount side — the same dialkey resolves typed handles on any other node
-//! let mount = Federation::mount(&pkarr, "knee-cluster", &["s3", "mqtt"]).await?;
+//! let mount = Federation::mount(pkarr, "knee-cluster", &["s3", "mqtt"]).await?;
 //! let s3_endpoint = mount.endpoint("s3")?;          // 192.0.2.12:3905
-//! let buckets = mount.buckets("s3")?;               // ["rsna", "models", "submissions"]
+//! let buckets = mount.buckets("s3");                // ["rsna", "models", "submissions"]
 //! let queue = mount.get("mqtt");                    // DialkeyService -> MqttClient::connect
+//! # Some(())
+//! # }
+//! ```
+//!
+//! Publishing/mounting needs a real pkarr client and network. The builder itself
+//! is executable offline (not an ignored test):
+//!
+//! ```
+//! use transport::federation::{FederationGroup, svc};
+//! let group = FederationGroup::new("SYNTHETIC-doctest").s3(3905, "test", &["data"]).mqtt(1883);
+//! assert_eq!(group.services().len(), 2);
+//! assert!(group.services().iter().any(|s| s.service == svc::S3 && s.port == 3905));
 //! ```
 //!
 //! Service names follow the dialkey convention (`<service>.<dialkey-peer-key>`): `s3`, `mqtt`,

@@ -79,7 +79,7 @@ pub fn decide(
     host: &str,
     have_cert: bool,
 ) -> Decision {
-    let host = normalize(strip_port(host));
+    let host = normalize(strip_host_port(host));
     // SNI/Host agreement first: it gates everything, and checking it after a registry hit
     // would mean a hostname's existence leaked through the mismatch case.
     if let Some(sni) = sni {
@@ -164,7 +164,9 @@ fn state_gate(record: &HostnameRecord) -> Option<Decision> {
 }
 
 /// Strip a `:port` suffix from a `Host` header value, leaving IPv6 literals alone.
-fn strip_port(host: &str) -> &str {
+/// Remove a numeric Host port without treating a bracketed IPv6 literal as
+/// hostname:port. Shared by kernel admission and the edge forwarding service.
+pub fn strip_host_port(host: &str) -> &str {
     if host.starts_with('[') {
         return host;
     }
