@@ -5,7 +5,10 @@
 //! pkarr packet, one SRV record per service with TXT metadata (region, buckets, endpoint) —
 //! and a client mounts that dialkey to get typed handles for exactly the services it needs.
 //!
-//! ```
+//! A sketch of the two sides, not a compiled example (`pkarr` and `my_ip` stand for the caller's
+//! relay client and address):
+//!
+//! ```ignore
 //! // publish side — one dialkey advertises the whole stack
 //! let group = FederationGroup::new("knee-cluster")
 //!     .s3(3905, "garage", &["rsna", "models", "submissions"])
