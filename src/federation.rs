@@ -18,7 +18,7 @@
 //!
 //! // mount side — the same dialkey resolves typed handles on any other node
 //! let mount = Federation::mount(&pkarr, "knee-cluster", &["s3", "mqtt"]).await?;
-//! let s3_endpoint = mount.endpoint("s3")?;          // 10.0.63.12:3905
+//! let s3_endpoint = mount.endpoint("s3")?;          // 192.0.2.12:3905
 //! let buckets = mount.buckets("s3")?;               // ["rsna", "models", "submissions"]
 //! let queue = mount.get("mqtt");                    // DialkeyService -> MqttClient::connect
 //! ```

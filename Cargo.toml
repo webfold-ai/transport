@@ -65,16 +65,6 @@ bytes = "1"
 # pulled in by `native` with the module it serves: `http_client` is gated on `native` (it needs
 # tokio + rustls + tracing), so the wire-format-only zero-dep core does not build flate2.
 flate2 = { version = "1", optional = true }
-# `Tuple`/`Relationships`/`Upstream`/`LoadBalance`/`HealthEstimator`/`Backends`/`pick_index`/
-# `coord_of`: `load_balance.rs` used to define these directly (its own independent extraction out
-# of `biota-http-server`'s `kernel::Proxy`, done without knowing `relayfold` already existed as
-# the same extraction out of `bedrock`). Reconciled 2026-09-23: `relayfold` is the superset (also
-# carries `Tuple`/`Relationships`/`Upstream`/`Backends`, which this crate's version didn't) and is
-# already what `bedrock` itself re-exports on both remotes, so it's canonical; `load_balance.rs`
-# is now a thin re-export.
-# Pinned by rev: an unpinned entry would resolve to relayfold's default branch, and a consumer that also names
-# relayfold must use this exact rev or the graph holds two relayfolds. b50b9e1 is relayfold on wirefold/apeiron.
-relayfold = { git = "https://github.com/Ptyktos/relayfold", rev = "ef73381b1133348a786c4713e68de075d526c769" }
 pkarr = { version = "8.0.1", optional = true }
 
 # The unit tests of modules that are always compiled (`edge_verify`, `edge_proxy`) drive async code with
