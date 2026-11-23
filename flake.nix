@@ -21,10 +21,6 @@
     # The build layer, by revision (flake.lock records the narHash too).
     tas-nix.url = "git+https://github.com/Ptyktos/caretaker?dir=nix&rev=b8cda7e4590c8aa6576d834c6363a6266ae5b9d8&shallow=1";
 
-    hosting-baseline = {
-      url = "git+https://github.com/Tasmanian-Cloud/hosting-runtime?rev=212736bdbe70e5aeffe8118a9c23c42e3ef1bbfa&shallow=1";
-      flake = false;
-    };
     saga = {
       url = "git+https://github.com/Tasmanian-Cloud/saga?rev=c82647b7094aba9e3fb673b1b1b5577a6af759cb&shallow=1";
       flake = false;
@@ -74,14 +70,8 @@
         mesh-acl-reconciler = { };
       };
       cargoExtraArgs = "--locked --workspace";
-      # Same external-fixture exclusions as the former hosting edge slice.
-      # Real notification-service-backed tests are exercised through box-run.
-      testSkip = [
-        "edge_routes_ntfy_host_to_the_notification_service"
-        "zero_touch_tunnel_serves_requests_end_to_end"
-      ];
+      # Consumer-specific integration runs downstream, not as a dependency here.
       gitInputs = {
-        "https://github.com/Tasmanian-Cloud/hosting-runtime" = inputs.hosting-baseline;
         "https://github.com/Tasmanian-Cloud/saga" = inputs.saga;
         "https://github.com/Ptyktos/servelet" = inputs.servelet;
         "https://github.com/Ptyktos/hashtrinity" = inputs.legacy-hashtrinity;

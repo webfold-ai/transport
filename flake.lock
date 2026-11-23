@@ -87,24 +87,6 @@
         "url": "https://github.com/ipetkov/crane"
       }
     },
-    "hosting-baseline": {
-      "flake": false,
-      "locked": {
-        "lastModified": 1795350638,
-        "narHash": "sha256-NA5vDxvIKPtLHJuikIXxOqJZpqdcXmc0T9YEJJPnlD4=",
-        "ref": "refs/heads/main",
-        "rev": "212736bdbe70e5aeffe8118a9c23c42e3ef1bbfa",
-        "shallow": true,
-        "type": "git",
-        "url": "https://github.com/Tasmanian-Cloud/hosting-runtime"
-      },
-      "original": {
-        "rev": "212736bdbe70e5aeffe8118a9c23c42e3ef1bbfa",
-        "shallow": true,
-        "type": "git",
-        "url": "https://github.com/Tasmanian-Cloud/hosting-runtime"
-      }
-    },
     "iotadb": {
       "flake": false,
       "locked": {
@@ -159,7 +141,6 @@
         "apeiron": "apeiron",
         "apeiron-legacy": "apeiron-legacy",
         "apeiron-store": "apeiron-store",
-        "hosting-baseline": "hosting-baseline",
         "iotadb": "iotadb",
         "legacy-hashtrinity": "legacy-hashtrinity",
         "saga": "saga",

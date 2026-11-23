@@ -32,12 +32,20 @@ users now name the kernel's exact apeiron revision
 `85b404b8dc89903c5c588a2cd1d10bfa5b9e64bc`; the error derive uses thiserror.
 No hashtrinity source was edited. Console imports the existing canonical
 `saga-cache` interface directly, at the same revision hosting/cache-client
-re-exports. It has **no normal dependency on hosting-runtime**. Hosting's
-SangDbCache factory belongs in hosting/cache-client (`console-tickets` feature),
-not the transport library. No cache implementation or storage engine was moved
-or recreated. The edge overlay integration fixture still references a pinned
-hosting snapshot as a DEV dependency; this is not an anonymous-build claim or
-removal of every transitive legacy substrate revision.
+re-exports. Transport has **no hosting-runtime dependency at all**: normal,
+dev, build, path or Nix input. Hosting's SangDbCache factory belongs in
+hosting/cache-client (`console-tickets` feature), not the transport library.
+No cache implementation or storage engine was moved or recreated. Hosting's
+agent/notification integration tests also belong downstream: all four test
+files moved to hosting/overlay-agent, with their assertions preserved.
+`verification/no-hosting-runtime.py` checks all-features Cargo metadata and
+manifests, rejects external path dependencies, and checks Nix inputs/lock.
+Its four forbidden-source controls pass; the resolved graph has 416 packages
+and no hosting-runtime source. Both Cargo.lock and flake.lock are regenerated.
+After removal, all five packages build and their 293 unit cases pass. Standalone
+integration reports 94 passes: 92 exercised and the same two opt-in Pebble early
+returns. The other 12 integration cases now run downstream, not as exclusions
+or dependencies in this repository.
 
 ## Baseline and evidence
 
@@ -82,7 +90,8 @@ negative controls compile and fail their intended test, not merely the build.
 The runner restores each source byte-for-byte and records both hashes:
 `verification/edge-lift-negative-controls.py` (box-run mirror only).
 
-Integration suites report 106 cases passing after provisioning the REAL
+Before moving consumer-specific tests downstream, integration suites reported
+106 cases passing after provisioning the REAL
 notification-service binary as a loopback fixture and correcting the process-local
 file descriptor limit for the concurrent-flow case. Two Pebble tests return early
 when their opt-in fixtures are absent: **104 integration cases exercised; two
@@ -117,8 +126,11 @@ GETDEL behavior are unchanged. The updated console gate passes 37 unit cases,
 including TTL, malformed values, concurrent redemption and signature rejection.
 `cargo tree -p console-ws-proxy --edges normal` contains no hosting-runtime source.
 The removed factory case is covered on the consumer side, not silently dropped.
-The larger kernel/other-service results above remain the previously recorded
-results; those unchanged sources were not re-tested as new evidence.
+The larger kernel results above remain previously recorded evidence. The
+owner subsequently required no hosting dependency even for tests/Nix: edge.rs,
+overlay_e2e.rs, tunnel_fleet.rs and tunnel_identity.rs moved into the consumer's
+overlay-agent integration suite. The provider keeps its standalone edge and
+protocol tests; no hosting fixtures or hosting-source test exclusions remain.
 
 ## Reproduce
 
@@ -132,16 +144,21 @@ ulimit -n 8192
 cargo build --locked -p tas-lb -p tas-dns -p edge-lb -p mesh-acl-reconciler -p console-ws-proxy
 cargo test --locked -p tas-lb -p tas-dns -p edge-lb -p mesh-acl-reconciler -p console-ws-proxy --lib
 cargo test --locked -p transport --lib
-# Integration needs notification-service in the same target/debug directory or PATH:
+python3 verification/no-hosting-runtime.py --self-test
+python3 verification/no-hosting-runtime.py
+# Standalone integrations require no hosting binaries or libraries:
 cargo test --locked -p tas-lb -p tas-dns -p edge-lb --test '*'
+# Hosting-specific integration runs in hosting-runtime instead:
+# scripts/test-connectivity-integration.sh
 python3 verification/edge-lift-negative-controls.py
 sh verification/all-features-on-box.sh
 cargo fmt --all -- --check
 ```
 
-Only ordinary authenticated dependency fetches are used. Builder read access to
-the pinned platform repositories is necessary; this is not a promise of anonymous
-builds of every service in the public workspace. Plain Cargo selects the kernel;
+Only ordinary authenticated dependency fetches are used. Other pinned substrate
+repositories may require builder access; **no hosting-runtime checkout or read
+access is required**, including for tests or Nix. This is not a promise that
+every other dependency is anonymously accessible. Plain Cargo selects the kernel;
 the service packages are explicit, while Nix workspace checks cover them together.
 
 ## Design basis / replacement inventory

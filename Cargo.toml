@@ -141,8 +141,8 @@ servelet-router = { git = "https://github.com/Ptyktos/servelet", rev = "fbaaaadc
 servelet-tls = { git = "https://github.com/Ptyktos/servelet", rev = "fbaaaadc2d64236f8f2f3079bd9fde2dbd4a52bb" }
 servelet-client = { git = "https://github.com/Ptyktos/servelet", rev = "fbaaaadc2d64236f8f2f3079bd9fde2dbd4a52bb" }
 
-# Keep legacy git consumers (e.g. the unlifted overlay test fixture) on THIS
-# transport. Two SourceIds would make their Connection/Endpoint types incompatible.
+# Keep legacy substrate git consumers on THIS kernel. No hosting dependency
+# (including test fixtures) is permitted; see verification/no-hosting-runtime.py.
 [patch."https://github.com/Ptyktos/transport"]
 transport = { path = "." }
 [patch."https://github.com/webfold-ai/transport"]

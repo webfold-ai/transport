@@ -88,6 +88,10 @@ plain `cargo build` still selects the kernel. Nix exports the four service
 binaries as packages. Maglev and the existing consistent-ring selector live in
 `transport::load_balance`; edge admission and Host parsing stay in
 `transport::edge_proxy`. There are no copied implementations in hosting-runtime.
+The dependency direction is strictly hosting → transport: **no hosting-runtime
+normal, dev/test, build or Nix dependency is allowed here**. Hosting-specific
+integration tests live downstream. `verification/no-hosting-runtime.py` enforces
+the boundary against the full Cargo graph and Nix inputs.
 
 See [the lift record](docs/hosting-edge-lift.md) for before/after test counts,
 five negative controls, design sources, consumer pins and deployment limits.

@@ -55,14 +55,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "apeiron"
-version = "0.1.0"
-source = "git+https://github.com/webfold-ai/apeiron?rev=d0eda3226193542949306f767d7280404921546f#d0eda3226193542949306f767d7280404921546f"
-dependencies = [
- "libc",
-]
-
-[[package]]
 name = "arc-swap"
 version = "1.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -675,7 +667,6 @@ dependencies = [
  "apeiron 0.1.0 (git+https://github.com/webfold-ai/apeiron?rev=85b404b8dc89903c5c588a2cd1d10bfa5b9e64bc)",
  "chrono",
  "http",
- "overlay-agent",
  "rcgen",
  "reqwest 0.12.28",
  "rustls",
@@ -1078,20 +1069,6 @@ checksum = "7382cf6263419f2d8df38c55d7da83da5c18aef87fc7a7fc1fb1e344edfe14c1"
 dependencies = [
  "hashbrown 0.15.5",
 ]
-
-[[package]]
-name = "hashtrinity"
-version = "0.1.0"
-source = "git+https://github.com/Ptyktos/hashtrinity?rev=f74bc22288faa08625637ee810977cd0064e11e5#f74bc22288faa08625637ee810977cd0064e11e5"
-dependencies = [
- "apeiron 0.1.0 (git+https://github.com/webfold-ai/apeiron?rev=d0eda3226193542949306f767d7280404921546f)",
- "hashtrinity_derive",
-]
-
-[[package]]
-name = "hashtrinity_derive"
-version = "0.1.0"
-source = "git+https://github.com/Ptyktos/hashtrinity?rev=f74bc22288faa08625637ee810977cd0064e11e5#f74bc22288faa08625637ee810977cd0064e11e5"
 
 [[package]]
 name = "heck"
@@ -1963,22 +1940,6 @@ name = "openssl-probe"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
-
-[[package]]
-name = "overlay-agent"
-version = "0.1.0"
-source = "git+https://github.com/Tasmanian-Cloud/hosting-runtime?rev=212736bdbe70e5aeffe8118a9c23c42e3ef1bbfa#212736bdbe70e5aeffe8118a9c23c42e3ef1bbfa"
-dependencies = [
- "anyhow",
- "hashtrinity",
- "reqwest 0.12.28",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "transport",
-]
 
 [[package]]
 name = "parking"

@@ -49,14 +49,12 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 anyhow = { workspace = true }
 
 [dev-dependencies]
-# The edge smoke: boot edge-lb against the real notification-service binary.
+# Standalone edge protocol tests; hosting integration lives with its consumer.
 reqwest = { workspace = true }
 serde_json = { workspace = true }
 tempfile = "3"
 # Real certificates for the TLS front's end-to-end tests.
 rcgen = "0.13"
-# The fleet smoke drives the overlay-agent in-process (it dials the edge).
-overlay-agent = { git = "https://github.com/Tasmanian-Cloud/hosting-runtime", rev = "212736bdbe70e5aeffe8118a9c23c42e3ef1bbfa" }
 
 [[bin]]
 name = "edge-lb"
