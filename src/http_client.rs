@@ -951,7 +951,7 @@ mod timing_tests {
     use super::*;
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::{TcpListener, TcpStream};
+    use tokio::net::TcpListener;
 
     const PAUSE: Duration = Duration::from_millis(80);
 
