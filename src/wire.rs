@@ -8,6 +8,7 @@ use crate::http_types::*;
 use apeiron::map::hashtrinity::{Coord, CoordMap};
 use std::borrow::Cow;
 use std::io;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -476,6 +477,9 @@ async fn read_response_head(reader: &mut StreamReader) -> Result<ResponseHead> {
     })
 }
 
+/// Send one request on an open stream and read the whole response. The returned `timing` has
+/// `head` and `total` set; the caller owns `connect` and `reused_connection`, since only it knows
+/// how the stream was obtained.
 pub(crate) async fn send_request(
     mut stream: Stream,
     method: Method,
@@ -483,9 +487,11 @@ pub(crate) async fn send_request(
     headers: HeaderMap,
     body: Option<Vec<u8>>,
 ) -> Result<Response> {
+    let started = Instant::now();
     write_request(&mut stream, &method, uri, &headers, &body).await?;
     let mut reader = stream.into_reader();
     let head = read_response_head(&mut reader).await?;
+    let head_elapsed = started.elapsed();
 
     // Only a DEFINITE-length body (no body at all, Content-Length, or a chunked terminator) means
     // the connection is genuinely still usable afterward — the "read to end" fallback below means
@@ -516,6 +522,7 @@ pub(crate) async fn send_request(
         reader.read_to_end(&mut buf).await?;
         (buf, false)
     };
+    let total = started.elapsed();
 
     // Return the connection to the pool if the response as a whole allows reuse: a definite-
     // length body (above), HTTP/1.1 (matches this crate's own server-side keep-alive default,
@@ -541,7 +548,24 @@ pub(crate) async fn send_request(
         body,
         url: uri.clone(),
         extensions: Extensions::new(),
+        timing: Timing {
+            connect: None,
+            head: Some(head_elapsed),
+            total,
+            reused_connection: false,
+        },
     })
+}
+
+/// [`connect`] with its duration. `connect` is `None` when a pooled connection was reused, which
+/// is also what `reused_connection` means on the response.
+pub(crate) async fn connect_timed(
+    uri: &Uri,
+    resolve: &std::collections::HashMap<String, std::net::SocketAddr>,
+) -> Result<(Stream, Option<Duration>)> {
+    let started = Instant::now();
+    let (stream, was_pooled) = connect(uri, resolve).await?;
+    Ok((stream, (!was_pooled).then(|| started.elapsed())))
 }
 
 /// How the still-open body is framed — decided once from the response head, then consumed
@@ -564,9 +588,16 @@ pub struct StreamingResponse {
     url: Uri,
     reader: StreamReader,
     framing: BodyFraming,
+    pub(crate) timing: Timing,
 }
 
 impl StreamingResponse {
+    /// Timing of the response head; `total` equals `head` because the body is not read yet.
+    /// See [`Timing`].
+    pub fn timing(&self) -> Timing {
+        self.timing
+    }
+
     pub fn status(&self) -> StatusCode {
         self.status
     }
@@ -658,9 +689,11 @@ pub(crate) async fn send_request_streaming(
     headers: HeaderMap,
     body: Option<Vec<u8>>,
 ) -> Result<StreamingResponse> {
+    let started = Instant::now();
     write_request(&mut stream, &method, uri, &headers, &body).await?;
     let mut reader = stream.into_reader();
     let head = read_response_head(&mut reader).await?;
+    let head_elapsed = started.elapsed();
 
     let framing = if method == Method::HEAD
         || head.status == StatusCode::NO_CONTENT
@@ -683,6 +716,12 @@ pub(crate) async fn send_request_streaming(
         url: uri.clone(),
         reader,
         framing,
+        timing: Timing {
+            connect: None,
+            head: Some(head_elapsed),
+            total: head_elapsed,
+            reused_connection: false,
+        },
     })
 }
 
