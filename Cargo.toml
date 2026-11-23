@@ -130,9 +130,9 @@ anyhow = "1"
 thiserror = "2"
 zeroize = "1"
 tempfile = "3"
-# Existing substrate/service contracts remain in their original homes. The pinned
-# hosting baseline repairs kleis to its iotaDB home; no support crate is copied.
-cache-client = { git = "https://github.com/Tasmanian-Cloud/hosting-runtime", rev = "212736bdbe70e5aeffe8118a9c23c42e3ef1bbfa" }
+# Reuse the existing canonical Cache trait and implementations directly.
+# hosting-runtime/cache-client re-exports this SAME trait; no new cache/store.
+saga-cache = { git = "https://github.com/Tasmanian-Cloud/saga", rev = "c82647b7094aba9e3fb673b1b1b5577a6af759cb" }
 kleis = { git = "https://github.com/webfold-ai/iotadb", rev = "208e6e94a2ad00c226c2030776045f8d465cdb93", package = "kleis" }
 saga-pipeline = { git = "https://github.com/Tasmanian-Cloud/saga", rev = "c82647b7094aba9e3fb673b1b1b5577a6af759cb" }
 servelet-core = { git = "https://github.com/Ptyktos/servelet", rev = "fbaaaadc2d64236f8f2f3079bd9fde2dbd4a52bb" }

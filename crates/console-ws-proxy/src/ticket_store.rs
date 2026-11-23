@@ -1,4 +1,4 @@
-//! Production [`TicketStore`] backed by `cache-client` (Valkey/Redis).
+//! Production [`TicketStore`] backed by canonical `saga-cache` (Valkey/Redis).
 //!
 //! The in-memory [`crate::InMemoryTicketStore`] keeps state per-process, so a
 //! multi-replica deployment would let a ticket minted (and `put`) on replica A
@@ -8,7 +8,7 @@
 //! refused. With many replicas the store has to be shared.
 //!
 //! [`ValkeyTicketStore`] puts the JSON-serialised [`ConsoleTicket`] under a
-//! TTL'd key and redeems it with [`cache_client::Cache::get_del`] — Redis
+//! TTL'd key and redeems it with [`saga_cache::Cache::get_del`] — Redis
 //! `GETDEL`, a single atomic op. That's the load-bearing property: two
 //! concurrent `take`s for the same `ticket_id` (across replicas, racing) can't
 //! both get `Some` — exactly one wins the value, the other gets `None`, so
@@ -50,8 +50,8 @@ use crate::{ConsoleTicket, ProxyError, TicketStore};
 /// Default key namespace for stored tickets — `console:ticket:{ticket_id}`.
 const DEFAULT_KEY_PREFIX: &str = "console:ticket:";
 
-/// Floor for the per-ticket TTL. [`cache_client::Cache::set_ex`] rejects a
-/// zero TTL ([`cache_client::CacheError::InvalidTtl`]), and Redis `PX` is a
+/// Floor for the per-ticket TTL. [`saga_cache::Cache::set_ex`] rejects a
+/// zero TTL ([`saga_cache::CacheError::InvalidTtl`]), and Redis `PX` is a
 /// positive integer of milliseconds — so an already-expired (or about-to-
 /// expire-this-instant) ticket still goes in under a 1-second lease. That's
 /// harmless: [`crate::validate_request`] checks `now < expires_at`
@@ -64,10 +64,11 @@ const MIN_TTL: Duration = Duration::from_secs(1);
 ///
 /// Construct with [`ValkeyTicketStore::new`] (default `console:ticket:`
 /// prefix) or [`ValkeyTicketStore::with_prefix`]. Holds an
-/// `Arc<dyn cache_client::Cache>` — the same trait every shared-state crate in
-/// the runtime depends on, so the Valkey ↔ `KeyDB` swap is wiring-only.
+/// `Arc<dyn saga_cache::Cache>` — also re-exported by hosting's `cache-client`.
+/// Existing hosting cache implementations remain type-compatible without a
+/// dependency from transport back into hosting-runtime.
 pub struct ValkeyTicketStore {
-    cache: Arc<dyn cache_client::Cache>,
+    cache: Arc<dyn saga_cache::Cache>,
     key_prefix: String,
 }
 
@@ -75,7 +76,7 @@ impl ValkeyTicketStore {
     /// Build a store over the given cache with the default
     /// `console:ticket:` key prefix.
     #[must_use]
-    pub fn new(cache: Arc<dyn cache_client::Cache>) -> Self {
+    pub fn new(cache: Arc<dyn saga_cache::Cache>) -> Self {
         Self {
             cache,
             key_prefix: DEFAULT_KEY_PREFIX.to_string(),
@@ -84,7 +85,7 @@ impl ValkeyTicketStore {
 
     /// Build a store with a custom key prefix (e.g. an environment
     /// namespace layered on top of the `cache-client`'s own prefix).
-    pub fn with_prefix(cache: Arc<dyn cache_client::Cache>, prefix: impl Into<String>) -> Self {
+    pub fn with_prefix(cache: Arc<dyn saga_cache::Cache>, prefix: impl Into<String>) -> Self {
         Self {
             cache,
             key_prefix: prefix.into(),
@@ -100,7 +101,7 @@ impl ValkeyTicketStore {
 /// the proxy's transport error variant — reusing `Transport` keeps the error
 /// surface minimal and matches how `TicketSigner` already maps incidental
 /// failures.
-fn map_cache_err(e: &cache_client::CacheError) -> ProxyError {
+fn map_cache_err(e: &saga_cache::CacheError) -> ProxyError {
     ProxyError::Transport(format!("ticket store: {e}"))
 }
 
@@ -163,7 +164,7 @@ mod tests {
 
     use super::*;
     use crate::{ConsoleKind, DEFAULT_TICKET_TTL};
-    use cache_client::{Cache, InMemoryCache};
+    use saga_cache::{Cache, InMemoryCache};
 
     fn store() -> ValkeyTicketStore {
         ValkeyTicketStore::new(Arc::new(InMemoryCache::new()))
@@ -267,7 +268,7 @@ mod tests {
     #[cfg(feature = "integration-valkey")]
     #[tokio::test]
     async fn integration_valkey_ticket_round_trip() {
-        use cache_client::{ValkeyCache, ValkeyConfig};
+        use saga_cache::{ValkeyCache, ValkeyConfig};
 
         let cache = Arc::new(ValkeyCache::new(ValkeyConfig {
             url: std::env::var("VALKEY_URL").expect("VALKEY_URL"),

@@ -9,13 +9,10 @@ authors.workspace = true
 repository.workspace = true
 publish.workspace = true
 [dependencies]
-cache-client.workspace = true
-# The credential + ticket-signing-key plane (see `kleis_wiring.rs`) — replaces the
-# OpenBao dependency this crate's own module doc named: `cache_client::Cache` is the
-# same trait `SangDbCache` implements (the `ValkeyTicketStore`'s `Arc<dyn Cache>` field
-# doesn't care which backend), and a plain `api_token: String` / raw HMAC key are all
-# `ProxmoxConsoleTarget`/`TicketSigner::new` ever needed — both fit `kleis::get_secret`
-# directly, matching `deploy-api`'s own `KleisLookup` pattern exactly.
+# Canonical shared Cache interface; hosting/cache-client re-exports this trait.
+# Hosting-specific filesystem adapters stay in the hosting layer.
+saga-cache.workspace = true
+# Credential + ticket-signing-key plane, already in iotaDB.
 kleis.workspace = true
 tokio.workspace = true
 tracing.workspace = true
@@ -39,7 +36,7 @@ governor.workspace = true
 default = []
 # Real-Valkey integration test for `ValkeyTicketStore`. Off by default; CI
 # sets it when a Valkey fixture is wired via `VALKEY_URL`. Same gating as
-# `cache-client`'s `integration-valkey`.
+# `saga-cache`'s `integration-valkey`.
 integration-valkey = []
 
 [lints]

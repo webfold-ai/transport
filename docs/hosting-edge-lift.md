@@ -30,9 +30,14 @@ request/response lifecycle is not a second copy of that transport policy.
 All lifted direct legacy hashtrinity dependencies were removed. Table/crypto
 users now name the kernel's exact apeiron revision
 `85b404b8dc89903c5c588a2cd1d10bfa5b9e64bc`; the error derive uses thiserror.
-No hashtrinity source was edited. Existing hosting cache/support dependencies
-remain pinned in their original repository; their transitive legacy substrate
-pins are not falsely described as removed from the entire graph.
+No hashtrinity source was edited. Console imports the existing canonical
+`saga-cache` interface directly, at the same revision hosting/cache-client
+re-exports. It has **no normal dependency on hosting-runtime**. Hosting's
+SangDbCache factory belongs in hosting/cache-client (`console-tickets` feature),
+not the transport library. No cache implementation or storage engine was moved
+or recreated. The edge overlay integration fixture still references a pinned
+hosting snapshot as a DEV dependency; this is not an anonymous-build claim or
+removal of every transitive legacy substrate revision.
 
 ## Baseline and evidence
 
@@ -59,7 +64,7 @@ service, public DNS/firewall change or mesh enrollment was performed.
 
 | Crate | Before: unit cases passed / harness seconds | After: unit cases passed / harness seconds | Planted control |
 |---|---|---|---|
-| console-ws-proxy | 38 / 0.05 | 38 / 0.05 | inverted ticket signature check fails tamper regression |
+| console-ws-proxy | 38 / 0.05 | 37 / 0.05; hosting factory regression moved to consumer | inverted ticket signature check fails tamper regression |
 | edge-lb | 115 / 3.03 | 115 / 3.01 | inverted control-secret check fails authorization regression |
 | mesh-acl-reconciler | 7 / 0.00 | 8 / 0.00 | inverted revocation membership fails new exact-pair diff regression |
 | tas-dns | 36 / 0.09 | 36 / 0.07 | bypassing apex containment fails owner-scope regression |
@@ -99,6 +104,21 @@ Nix inputs match every git source/revision in Cargo.lock, including distinct
 existing support-substrate revisions. The edge binary derivation evaluates on
 the box. Full Nix derivations/OCI images, non-Linux targets, and live DNSSEC/ACME
 Pebble/FIPS deployment certification are **not claimed tested**.
+
+## Post-review cache boundary fix
+
+The owner-requested planner review identified the reverse production dependency
+on hosting/cache-client. Inspection found its Cache interface and Valkey/test
+implementations already live in saga-cache at
+`c82647b7094aba9e3fb673b1b1b5577a6af759cb`; reuse beats introducing another trait.
+The filesystem factory moves back to the hosting layer, while kleis remains
+pinned to its actual iotaDB home. TTL calculation, JSON encoding and atomic
+GETDEL behavior are unchanged. The updated console gate passes 37 unit cases,
+including TTL, malformed values, concurrent redemption and signature rejection.
+`cargo tree -p console-ws-proxy --edges normal` contains no hosting-runtime source.
+The removed factory case is covered on the consumer side, not silently dropped.
+The larger kernel/other-service results above remain the previously recorded
+results; those unchanged sources were not re-tested as new evidence.
 
 ## Reproduce
 
