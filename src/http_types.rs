@@ -934,6 +934,25 @@ impl Request {
     }
 }
 
+/// Timing of one HTTP exchange, as observed on the wire by [`http_client`].
+///
+/// Every value describes the final hop of a request (after redirects) and the attempt that
+/// produced the response (after any retry). `Timing::default()` marks a response that did not
+/// come off a socket, such as one built with [`Response::new`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Timing {
+    /// DNS, TCP and TLS for a new connection; `None` when a pooled connection was reused.
+    pub connect: Option<std::time::Duration>,
+    /// From the first byte of the request being written to the response head being fully read
+    /// (status line and headers). `None` for responses that never came off a socket.
+    pub head: Option<std::time::Duration>,
+    /// From the first byte of the request being written to the last byte of the body, as read
+    /// off the wire. It excludes connect and any gzip decoding.
+    pub total: std::time::Duration,
+    /// Whether the request went out on a connection taken from the keep-alive pool.
+    pub reused_connection: bool,
+}
+
 #[derive(Clone, Debug)]
 pub struct Response {
     pub(crate) status: StatusCode,
@@ -942,6 +961,7 @@ pub struct Response {
     pub(crate) body: Vec<u8>,
     pub(crate) url: Uri,
     pub(crate) extensions: Extensions,
+    pub(crate) timing: Timing,
 }
 
 impl Response {
@@ -953,7 +973,13 @@ impl Response {
             body: body.into(),
             url: "/".parse().expect("static URI parses"),
             extensions: Extensions::new(),
+            timing: Timing::default(),
         }
+    }
+
+    /// The timing of the exchange that produced this response; see [`Timing`].
+    pub fn timing(&self) -> Timing {
+        self.timing
     }
 
     pub fn extensions(&self) -> &Extensions {
