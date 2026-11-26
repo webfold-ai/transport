@@ -1,0 +1,43 @@
+[package]
+name = "console-ws-proxy"
+description = "WebSocket forwarder for VNC / term consoles. Port of recovered Tainer src/server.mjs upgrade handler. Validates session + step-up + console-ticket; never accepts client-driven Origin missing."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish.workspace = true
+[dependencies]
+# Canonical shared Cache interface; hosting/cache-client re-exports this trait.
+# Hosting-specific filesystem adapters stay in the hosting layer.
+saga-cache.workspace = true
+# Credential + ticket-signing-key plane, already in iotaDB.
+kleis.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+async-trait.workspace = true
+tokio-tungstenite.workspace = true
+http.workspace = true
+url.workspace = true
+apeiron = { workspace = true }
+thiserror = { workspace = true }
+base64.workspace = true
+bytes.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+futures.workspace = true
+reqwest.workspace = true
+governor.workspace = true
+
+[features]
+default = []
+# Real-Valkey integration test for `ValkeyTicketStore`. Off by default; CI
+# sets it when a Valkey fixture is wired via `VALKEY_URL`. Same gating as
+# `saga-cache`'s `integration-valkey`.
+integration-valkey = []
+
+[lints]
+workspace = true

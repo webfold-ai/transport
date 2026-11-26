@@ -1,0 +1,42 @@
+[package]
+name = "tas-dns"
+description = "Tas Cloud managed authoritative DNS: hickory-server engine over a mesh-replicated, owner-signed zone store, with online DNSSEC and a permanently-bound ACME challenge zone."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[features]
+default = []
+# FIPS-validated aws-lc (needs Go + CMake at build time). hickory's DNSSEC backend and transport's
+# handshake/ACME crypto both run on the same aws-lc-rs, so one switch moves the whole process.
+fips = ["aws-lc-rs/fips", "transport/fips"]
+
+[dependencies]
+# DNS engine. `dnssec-aws-lc-rs` is hickory's aws-lc backend (the alternative is `ring`; not used).
+hickory-proto = { version = "=0.26.3", default-features = false, features = ["std", "dnssec-aws-lc-rs"] }
+hickory-server = { version = "=0.26.3", default-features = false, features = ["dnssec-aws-lc-rs"] }
+async-trait = { workspace = true }
+aws-lc-rs = "1"
+time = "0.3"
+transport = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+zeroize = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+hickory-net = { version = "=0.26.3", default-features = false, features = ["tokio", "dnssec-aws-lc-rs"] }
+
+[[bin]]
+name = "tas-dns"
+path = "src/main.rs"
+
+[lints]
+workspace = true

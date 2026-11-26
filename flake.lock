@@ -20,6 +20,24 @@
     "apeiron": {
       "flake": false,
       "locked": {
+        "lastModified": 1794553434,
+        "narHash": "sha256-y/yZcnI+zGw2ZYgiyrLYb8mP/IroD1w9gmjHjuyDbNU=",
+        "ref": "refs/heads/main",
+        "rev": "85b404b8dc89903c5c588a2cd1d10bfa5b9e64bc",
+        "shallow": true,
+        "type": "git",
+        "url": "https://github.com/webfold-ai/apeiron"
+      },
+      "original": {
+        "rev": "85b404b8dc89903c5c588a2cd1d10bfa5b9e64bc",
+        "shallow": true,
+        "type": "git",
+        "url": "https://github.com/webfold-ai/apeiron"
+      }
+    },
+    "apeiron-legacy": {
+      "flake": false,
+      "locked": {
         "lastModified": 1794472249,
         "narHash": "sha256-WRmj3EWhJ91yIIpd91Xr/x2ScsG+tbEh0H4nnsg6viE=",
         "ref": "refs/heads/main",
@@ -30,6 +48,24 @@
       },
       "original": {
         "rev": "1c3d4a1da565cde409f6f3cb343086aa6853eb9c",
+        "shallow": true,
+        "type": "git",
+        "url": "https://github.com/webfold-ai/apeiron"
+      }
+    },
+    "apeiron-store": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1794031231,
+        "narHash": "sha256-+tTOZJtLYjS+EFp4cD9EDjhw+w9plIB5mqSmT7VG+sA=",
+        "ref": "refs/heads/main",
+        "rev": "d0eda3226193542949306f767d7280404921546f",
+        "shallow": true,
+        "type": "git",
+        "url": "https://github.com/webfold-ai/apeiron"
+      },
+      "original": {
+        "rev": "d0eda3226193542949306f767d7280404921546f",
         "shallow": true,
         "type": "git",
         "url": "https://github.com/webfold-ai/apeiron"
@@ -51,6 +87,42 @@
         "url": "https://github.com/ipetkov/crane"
       }
     },
+    "iotadb": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1795309936,
+        "narHash": "sha256-p506t+IO8vsA6WXmI7Eby4pOMiplgPkzAMBPLRw4S/4=",
+        "ref": "refs/heads/main",
+        "rev": "208e6e94a2ad00c226c2030776045f8d465cdb93",
+        "shallow": true,
+        "type": "git",
+        "url": "https://github.com/webfold-ai/iotadb"
+      },
+      "original": {
+        "rev": "208e6e94a2ad00c226c2030776045f8d465cdb93",
+        "shallow": true,
+        "type": "git",
+        "url": "https://github.com/webfold-ai/iotadb"
+      }
+    },
+    "legacy-hashtrinity": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1794105137,
+        "narHash": "sha256-b3vFlZqzhT0CkN7oMVUx855Vp3UYes3M/YWW4DN2yMQ=",
+        "ref": "refs/heads/main",
+        "rev": "f74bc22288faa08625637ee810977cd0064e11e5",
+        "shallow": true,
+        "type": "git",
+        "url": "https://github.com/Ptyktos/hashtrinity"
+      },
+      "original": {
+        "rev": "f74bc22288faa08625637ee810977cd0064e11e5",
+        "shallow": true,
+        "type": "git",
+        "url": "https://github.com/Ptyktos/hashtrinity"
+      }
+    },
     "nixpkgs": {
       "locked": {
         "lastModified": 1793865203,
@@ -64,28 +136,15 @@
         "url": "https://channels.nixos.org/nixos-26.05/nixexprs.tar.xz"
       }
     },
-    "relayfold": {
-      "flake": false,
-      "locked": {
-        "lastModified": 1794546536,
-        "narHash": "sha256-Q2dnAoFJQcfBxsC9fwTQYJlYtQW+p2oFWmuDkSL988c=",
-        "ref": "refs/heads/main",
-        "rev": "afed0355a5b51777b085473a29720d35ecdf671d",
-        "shallow": true,
-        "type": "git",
-        "url": "https://github.com/Ptyktos/relayfold"
-      },
-      "original": {
-        "rev": "afed0355a5b51777b085473a29720d35ecdf671d",
-        "shallow": true,
-        "type": "git",
-        "url": "https://github.com/Ptyktos/relayfold"
-      }
-    },
     "root": {
       "inputs": {
         "apeiron": "apeiron",
-        "relayfold": "relayfold",
+        "apeiron-legacy": "apeiron-legacy",
+        "apeiron-store": "apeiron-store",
+        "iotadb": "iotadb",
+        "legacy-hashtrinity": "legacy-hashtrinity",
+        "saga": "saga",
+        "servelet": "servelet",
         "tas-nix": "tas-nix",
         "wirefold": "wirefold"
       }
@@ -110,6 +169,42 @@
         "shallow": true,
         "type": "git",
         "url": "https://github.com/oxalica/rust-overlay"
+      }
+    },
+    "saga": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1794730159,
+        "narHash": "sha256-Dl0JbwMA1wqpB6xGhIJYpX3BIHK9IVdc8jKTqtJhnYM=",
+        "ref": "refs/heads/main",
+        "rev": "c82647b7094aba9e3fb673b1b1b5577a6af759cb",
+        "shallow": true,
+        "type": "git",
+        "url": "https://github.com/Tasmanian-Cloud/saga"
+      },
+      "original": {
+        "rev": "c82647b7094aba9e3fb673b1b1b5577a6af759cb",
+        "shallow": true,
+        "type": "git",
+        "url": "https://github.com/Tasmanian-Cloud/saga"
+      }
+    },
+    "servelet": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1794546427,
+        "narHash": "sha256-b6O7dEDUl7BLRHrzmWS53ibHanmITDC0k5APbokKaKc=",
+        "ref": "refs/heads/main",
+        "rev": "fbaaaadc2d64236f8f2f3079bd9fde2dbd4a52bb",
+        "shallow": true,
+        "type": "git",
+        "url": "https://github.com/Ptyktos/servelet"
+      },
+      "original": {
+        "rev": "fbaaaadc2d64236f8f2f3079bd9fde2dbd4a52bb",
+        "shallow": true,
+        "type": "git",
+        "url": "https://github.com/Ptyktos/servelet"
       }
     },
     "tas-nix": {

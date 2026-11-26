@@ -11,5 +11,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Reject hosting dependencies (including dev/build and Nix)
+        run: |
+          python3 verification/no-hosting-runtime.py --self-test
+          python3 verification/no-hosting-runtime.py
       - run: cargo test --locked
       - run: cargo test --locked --all-features

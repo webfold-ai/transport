@@ -8,6 +8,11 @@
 //! instead of carrying a second copy, so the dependency runs one way: relayfold depends on
 //! transport, never the reverse.
 
+/// Weighted Maglev selection for new L4 flows. One canonical implementation;
+/// flow pinning stays in tas-lb and relayfold keeps using this module's existing
+/// consistent-ring selector for its different request-selection contract.
+pub mod maglev;
+
 use apeiron::map::hashtrinity::Coord;
 use std::sync::Arc;
 

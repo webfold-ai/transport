@@ -1,0 +1,43 @@
+[package]
+name = "tas-lb"
+description = "The Tas Cloud front L4 load balancer (RFC 0031): a userspace TCP/UDP forwarder with per-flow connection tracking, Maglev hashing for new flows only, health checking, draining, PROXY protocol v2 and a signed, rollback-refusing backend-set config. The data plane sits behind a `Forwarder` trait so an XDP plane can replace it later."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+# Ed25519 keys (signed_dns::{Keypair, PublicKey}, z-base32 names), dialkey-derived control-plane
+# identities, and the sealed NativeEndpoint the control plane pushes configs over.
+transport = { workspace = true }
+tokio = { workspace = true }
+# keyed flow hash (HMAC-SHA256), SHA-256 for the Maglev permutations, ct_eq.
+apeiron = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+# Safe wrappers for the socket options tokio does not expose (half-close shutdown on a shared
+# stream, SO_LINGER=0 for resets, TCP keepalive). Already in the tree via tokio.
+socket2 = { version = "0.6", features = ["all"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lib]
+name = "tas_lb"
+path = "src/lib.rs"
+
+[[bin]]
+name = "tas-lb"
+path = "src/main.rs"
+
+[[example]]
+name = "throughput"
+path = "examples/throughput.rs"
+
+[lints]
+workspace = true

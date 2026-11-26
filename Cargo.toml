@@ -94,6 +94,88 @@ name = "sync_hardening"
 required-features = ["syncfold"]
 
 [workspace]
+resolver = "2"
+members = ["crates/tas-lb", "crates/tas-dns", "crates/edge-lb", "crates/mesh-acl-reconciler", "crates/console-ws-proxy"]
+default-members = ["."]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "Apache-2.0"
+authors = ["TasCloud Platform Team"]
+repository = "https://github.com/webfold-ai/transport"
+publish = false
+
+[workspace.dependencies]
+transport = { path = "." }
+apeiron = { git = "https://github.com/webfold-ai/apeiron", rev = "85b404b8dc89903c5c588a2cd1d10bfa5b9e64bc" }
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "v7", "serde"] }
+http = "1"
+url = { version = "2", features = ["serde"] }
+bytes = "1"
+base64 = "0.21"
+tokio-tungstenite = { version = "0.23", features = ["rustls-tls-webpki-roots"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream", "http2"] }
+governor = "0.6"
+anyhow = "1"
+thiserror = "2"
+zeroize = "1"
+tempfile = "3"
+# Reuse the existing canonical Cache trait and implementations directly.
+# hosting-runtime/cache-client re-exports this SAME trait; no new cache/store.
+saga-cache = { git = "https://github.com/Tasmanian-Cloud/saga", rev = "c82647b7094aba9e3fb673b1b1b5577a6af759cb" }
+kleis = { git = "https://github.com/webfold-ai/iotadb", rev = "208e6e94a2ad00c226c2030776045f8d465cdb93", package = "kleis" }
+saga-pipeline = { git = "https://github.com/Tasmanian-Cloud/saga", rev = "c82647b7094aba9e3fb673b1b1b5577a6af759cb" }
+servelet-core = { git = "https://github.com/Ptyktos/servelet", rev = "fbaaaadc2d64236f8f2f3079bd9fde2dbd4a52bb" }
+servelet-h1 = { git = "https://github.com/Ptyktos/servelet", rev = "fbaaaadc2d64236f8f2f3079bd9fde2dbd4a52bb" }
+servelet-router = { git = "https://github.com/Ptyktos/servelet", rev = "fbaaaadc2d64236f8f2f3079bd9fde2dbd4a52bb" }
+servelet-tls = { git = "https://github.com/Ptyktos/servelet", rev = "fbaaaadc2d64236f8f2f3079bd9fde2dbd4a52bb" }
+servelet-client = { git = "https://github.com/Ptyktos/servelet", rev = "fbaaaadc2d64236f8f2f3079bd9fde2dbd4a52bb" }
+
+# Keep legacy substrate git consumers on THIS kernel. No hosting dependency
+# (including test fixtures) is permitted; see verification/no-hosting-runtime.py.
+[patch."https://github.com/Ptyktos/transport"]
+transport = { path = "." }
+[patch."https://github.com/webfold-ai/transport"]
+transport = { path = "." }
+
+[workspace.lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(mutant_scope_removed)", "cfg(mutant_wrong_namespace)", "cfg(mutant_edge_old_form)", "cfg(mutant_agent_old_form)"] }
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "warn"
+panic = "deny"
+panic_in_result_fn = "deny"
+unimplemented = "deny"
+allow_attributes = "deny"
+dbg_macro = "deny"
+todo = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
+await_holding_lock = "deny"
+large_futures = "deny"
+exit = "deny"
+mem_forget = "deny"
+module_name_repetitions = "allow"
+similar_names = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
+
+# Preserve the lifted crates' existing test/dev optimisation level.
+[profile.dev]
+opt-level = 1
 
 # `bind-overlay` names code written against the old bedrock `bind` crate; the feature has no
 # dependency behind it here, so it is not declared (declaring it would enable code that cannot

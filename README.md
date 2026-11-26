@@ -30,11 +30,10 @@ Three things this crate does that a hand-rolled stack usually does not:
    the connection is made, so a peer cannot present the key you did not ask for.
    `peer_id(dialkey)` is the **public** key (0.2.0; before that it returned the secret seed —
    see `CHANGELOG.md`).
-2. **The core needs no runtime.** The kernel primitives — the resolver, the dialkey derivation,
-   the packet builders — build with **no async runtime and no TLS stack**:
-   `cargo build --no-default-features` pulls in nothing. The tokio + rustls adapters sit
-   behind the `native` feature, which is on by default. So the wire formats are usable in a
-   CLI, a build script, or a target that will never see a socket.
+2. **The kernel adapters are opt-in.** `cargo build --no-default-features` disables
+   the kernel's tokio + rustls adapters; shared substrate and wire-format dependencies
+   remain. The adapters sit behind `native`, which is on by default. The packet and
+   identity primitives can be used without enabling the service packages.
 3. **Unix-composable.** Every module is small and focused. Take `dialkey` without the mesh, or
    `dns` without the gossip.
 
@@ -81,26 +80,47 @@ sequence numbers only go up (an older record is `409`); bodies, key count and �
 record age are bounded; publishing can be restricted to a list of keys; records persist across
 restarts and are re-verified on load.
 
+## Connectivity services (one canonical home)
+
+The workspace also owns `tas-lb`, `tas-dns`, `edge-lb`, `mesh-acl-reconciler`
+and `console-ws-proxy`, lifted from hosting-runtime. They are separate packages;
+plain `cargo build` still selects the kernel. Nix exports the four service
+binaries as packages. Maglev and the existing consistent-ring selector live in
+`transport::load_balance`; edge admission and Host parsing stay in
+`transport::edge_proxy`. There are no copied implementations in hosting-runtime.
+The dependency direction is strictly hosting → transport: **no hosting-runtime
+normal, dev/test, build or Nix dependency is allowed here**. Hosting-specific
+integration tests live downstream. `verification/no-hosting-runtime.py` enforces
+the boundary against the full Cargo graph and Nix inputs.
+
+See [the lift record](docs/hosting-edge-lift.md) for before/after test counts,
+five negative controls, design sources, consumer pins and deployment limits.
+
 ## What it does not do — disclosed, not hidden
 
 - **No authentication on reads or on `PUT` beyond the signature and the allowlist.** The relay
   client cannot send credentials, so keep the port on a private interface.
 - **No Mainline DHT**, the same stated gap as `pkarr`.
-- **No DNSSEC.** Records are signed by their author, which is not a chain a validating resolver
-  can check.
+- **The kernel/meshd signed-record protocol is not DNSSEC.** The separate `tas-dns`
+  service provides authoritative DNSSEC, delegated zones and ACME challenge zones;
+  its DNSSEC tests are not proof that meshd's records have a validating DNSSEC chain.
 - **Not a QUIC relay, a bastion or a VPN.** `quic` is a packet and frame codec; its connection
   state machine (loss recovery, congestion control) is not built, and the native transport that
   does exist is TCP with its own authenticated handshake. `meshd` does discovery only — it does
-  not forward traffic between peers.
-- **The container image was not built where this was written** (no Docker daemon). The release
-  binary was built with `--locked`, checked to need only libc, libm and libgcc, and run as uid
-  65532 with a clean environment; `docker build` itself has not been run.
+  not forward traffic between peers. `tas-lb` now forwards TCP/UDP and `edge-lb`
+  implements HTTP/tunnel/SNI forwarding, but lifting them does not supply the missing
+  QUIC state machine, NAT traversal or a complete NetBird replacement.
+- **OCI images were not built for this lift.** Nix package derivation evaluation is
+  metadata validation, not a container runtime test. The default-feature binaries
+  and the documented test suites were built/run on the build box; no production
+  DNS, firewall, mesh enrollment or service was changed.
 
 ## Build
 
 ```sh
 cargo build                          # default = `native`: tokio + rustls adapters, http_client, pkarr relay client
-cargo build --no-default-features    # wire-format-only zero-dep kernel
+cargo build --no-default-features    # kernel without tokio/TLS adapters; shared substrate deps remain
+cargo build -p tas-lb -p tas-dns -p edge-lb -p mesh-acl-reconciler -p console-ws-proxy
 ```
 
 ## Features
@@ -110,7 +130,7 @@ cargo build --no-default-features    # wire-format-only zero-dep kernel
 | `native` (default) | tokio + rustls adapters, the HTTP client, the pkarr relay client |
 | `runtime-tokio` | the tokio-gated modules (`native`, `gossip`, `quic`) |
 | `federation` | the pkarr client |
-| `fips` | FIPS 140-3 validated cryptography for everything this crate signs or terminates with (needs Go + CMake at build time) |
+| `fips` | selects the aws-lc/rustls FIPS build (needs Go + CMake); this feature alone is not end-to-end application certification |
 
 ## Integration
 
