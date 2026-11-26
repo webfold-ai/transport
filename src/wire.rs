@@ -8,6 +8,7 @@ use crate::http_types::*;
 use apeiron::map::hashtrinity::{Coord, CoordMap};
 use std::borrow::Cow;
 use std::io;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -313,10 +314,10 @@ pub(crate) async fn connect_fresh(
     let dial_target = resolve.get(&host).copied();
     match uri.scheme_str() {
         Some("https") => {
-            let tcp = match dial_target {
+            let tcp = nodelay(match dial_target {
                 Some(addr) => TcpStream::connect(addr).await?,
                 None => TcpStream::connect(format!("{}:{}", host, port)).await?,
-            };
+            });
             let server_name = rustls_pki_types::ServerName::try_from(host.clone())
                 .map_err(|e| Error::Tls(format!("invalid hostname {host:?}: {e}")))?
                 .to_owned();
@@ -327,11 +328,18 @@ pub(crate) async fn connect_fresh(
                 .map_err(|e| Error::Tls(format!("handshake with {host} failed: {e}")))?;
             Ok(Stream::Tls(Box::new(tls)))
         }
-        _ => Ok(Stream::Plain(match dial_target {
+        _ => Ok(Stream::Plain(nodelay(match dial_target {
             Some(addr) => TcpStream::connect(addr).await?,
             None => TcpStream::connect(format!("{}:{}", host, port)).await?,
-        })),
+        }))),
     }
+}
+
+/// HTTP requests are small writes that want to leave at once: turn Nagle's algorithm off.
+/// A socket that refuses the option still works, so the error is not propagated.
+fn nodelay(stream: TcpStream) -> TcpStream {
+    let _ = stream.set_nodelay(true);
+    stream
 }
 
 /// Write the request line, headers, and body — shared by the buffered (`send_request`) and
@@ -376,9 +384,13 @@ async fn write_request(
         None => host.to_string(),
     };
 
-    stream
-        .write_all(format!("{} {} HTTP/1.1\r\nHost: {}\r\n", method, path, authority).as_bytes())
-        .await?;
+    // One request, one write. A write per header line leaves the peer with dozens of small
+    // segments, and Nagle's algorithm plus the peer's delayed ACK then hold the tail of the
+    // request back for about 40 ms.
+    let mut out: Vec<u8> = Vec::with_capacity(256 + body.as_ref().map_or(0, Vec::len));
+    out.extend_from_slice(
+        format!("{} {} HTTP/1.1\r\nHost: {}\r\n", method, path, authority).as_bytes(),
+    );
     // A caller-supplied User-Agent wins.
     //
     // This used to be unconditional, so `RequestBuilder::header(USER_AGENT, …)` sent
@@ -390,9 +402,7 @@ async fn write_request(
     // making it, and origins that gate on the agent string (Google's asset CDN
     // among them) served a sign-in page instead of the file.
     if let Some(agent) = effective_user_agent(headers) {
-        stream
-            .write_all(format!("User-Agent: {agent}\r\n").as_bytes())
-            .await?;
+        out.extend_from_slice(format!("User-Agent: {agent}\r\n").as_bytes());
     }
 
     for (name, value) in headers.iter() {
@@ -403,21 +413,20 @@ async fn write_request(
         if name.eq_ignore_ascii_case(crate::http_types::header::USER_AGENT) {
             continue;
         }
-        stream.write_all(name.as_bytes()).await?;
-        stream.write_all(b": ").await?;
-        stream.write_all(value.as_bytes()).await?;
-        stream.write_all(b"\r\n").await?;
+        out.extend_from_slice(name.as_bytes());
+        out.extend_from_slice(b": ");
+        out.extend_from_slice(value.as_bytes());
+        out.extend_from_slice(b"\r\n");
     }
 
     if let Some(ref body) = body {
-        stream
-            .write_all(format!("Content-Length: {}\r\n", body.len()).as_bytes())
-            .await?;
+        out.extend_from_slice(format!("Content-Length: {}\r\n", body.len()).as_bytes());
     }
-    stream.write_all(b"\r\n").await?;
+    out.extend_from_slice(b"\r\n");
     if let Some(body) = body {
-        stream.write_all(body).await?;
+        out.extend_from_slice(body);
     }
+    stream.write_all(&out).await?;
     Ok(())
 }
 
@@ -468,6 +477,9 @@ async fn read_response_head(reader: &mut StreamReader) -> Result<ResponseHead> {
     })
 }
 
+/// Send one request on an open stream and read the whole response. The returned `timing` has
+/// `head` and `total` set; the caller owns `connect` and `reused_connection`, since only it knows
+/// how the stream was obtained.
 pub(crate) async fn send_request(
     mut stream: Stream,
     method: Method,
@@ -475,9 +487,11 @@ pub(crate) async fn send_request(
     headers: HeaderMap,
     body: Option<Vec<u8>>,
 ) -> Result<Response> {
+    let started = Instant::now();
     write_request(&mut stream, &method, uri, &headers, &body).await?;
     let mut reader = stream.into_reader();
     let head = read_response_head(&mut reader).await?;
+    let head_elapsed = started.elapsed();
 
     // Only a DEFINITE-length body (no body at all, Content-Length, or a chunked terminator) means
     // the connection is genuinely still usable afterward — the "read to end" fallback below means
@@ -508,6 +522,7 @@ pub(crate) async fn send_request(
         reader.read_to_end(&mut buf).await?;
         (buf, false)
     };
+    let total = started.elapsed();
 
     // Return the connection to the pool if the response as a whole allows reuse: a definite-
     // length body (above), HTTP/1.1 (matches this crate's own server-side keep-alive default,
@@ -533,7 +548,24 @@ pub(crate) async fn send_request(
         body,
         url: uri.clone(),
         extensions: Extensions::new(),
+        timing: Timing {
+            connect: None,
+            head: Some(head_elapsed),
+            total,
+            reused_connection: false,
+        },
     })
+}
+
+/// [`connect`] with its duration. `connect` is `None` when a pooled connection was reused, which
+/// is also what `reused_connection` means on the response.
+pub(crate) async fn connect_timed(
+    uri: &Uri,
+    resolve: &std::collections::HashMap<String, std::net::SocketAddr>,
+) -> Result<(Stream, Option<Duration>)> {
+    let started = Instant::now();
+    let (stream, was_pooled) = connect(uri, resolve).await?;
+    Ok((stream, (!was_pooled).then(|| started.elapsed())))
 }
 
 /// How the still-open body is framed — decided once from the response head, then consumed
@@ -556,9 +588,16 @@ pub struct StreamingResponse {
     url: Uri,
     reader: StreamReader,
     framing: BodyFraming,
+    pub(crate) timing: Timing,
 }
 
 impl StreamingResponse {
+    /// Timing of the response head; `total` equals `head` because the body is not read yet.
+    /// See [`Timing`].
+    pub fn timing(&self) -> Timing {
+        self.timing
+    }
+
     pub fn status(&self) -> StatusCode {
         self.status
     }
@@ -650,9 +689,11 @@ pub(crate) async fn send_request_streaming(
     headers: HeaderMap,
     body: Option<Vec<u8>>,
 ) -> Result<StreamingResponse> {
+    let started = Instant::now();
     write_request(&mut stream, &method, uri, &headers, &body).await?;
     let mut reader = stream.into_reader();
     let head = read_response_head(&mut reader).await?;
+    let head_elapsed = started.elapsed();
 
     let framing = if method == Method::HEAD
         || head.status == StatusCode::NO_CONTENT
@@ -675,6 +716,12 @@ pub(crate) async fn send_request_streaming(
         url: uri.clone(),
         reader,
         framing,
+        timing: Timing {
+            connect: None,
+            head: Some(head_elapsed),
+            total: head_elapsed,
+            reused_connection: false,
+        },
     })
 }
 
@@ -842,6 +889,31 @@ mod wire_head_tests {
         let raw = head_over_loopback(headers).await;
         let text = String::from_utf8_lossy(&raw);
         assert!(text.contains("x-webfold-test: present"), "{text}");
+    }
+
+    /// The whole head leaves in one write, so the server's first read holds all of it. Written
+    /// a header at a time, the first read returns only the request line, and the rest waits on
+    /// Nagle's algorithm and the peer's delayed ACK.
+    #[tokio::test]
+    async fn the_head_arrives_in_one_read() {
+        let mut headers = HeaderMap::new();
+        headers.insert("accept", "*/*");
+        headers.insert("x-first", "1");
+        headers.insert("x-second", "2");
+        headers.insert("x-third", "3");
+        let raw = head_over_loopback(headers).await;
+        let text = String::from_utf8_lossy(&raw);
+        assert!(text.starts_with("GET /x HTTP/1.1\r\n"), "{text}");
+        assert!(
+            text.ends_with("\r\n\r\n"),
+            "head is incomplete in the first read: {text:?}"
+        );
+        for name in ["x-first: 1", "x-second: 2", "x-third: 3"] {
+            assert!(
+                text.contains(name),
+                "{name} missing from the first read: {text:?}"
+            );
+        }
     }
 }
 

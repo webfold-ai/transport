@@ -6,7 +6,7 @@
 // `Method`/`HeaderMap`/`Uri`/`header` types it is written against.
 
 use crate::http_types::*;
-use crate::wire::{connect, connect_fresh, send_request, send_request_streaming};
+use crate::wire::{connect_fresh, connect_timed, send_request, send_request_streaming};
 use std::sync::Arc;
 use tracing::Instrument;
 
@@ -524,8 +524,13 @@ impl RequestBuilder {
     /// the caller gets the connection directly instead, no in-between logic).
     pub async fn send_streaming(self) -> Result<StreamingResponse> {
         let uri = self.uri?;
-        let (stream, _was_pooled) = connect(&uri, &self.client.inner.resolve_overrides).await?;
-        send_request_streaming(stream, self.method, &uri, self.headers, self.body).await
+        let (stream, connect_time) =
+            connect_timed(&uri, &self.client.inner.resolve_overrides).await?;
+        let mut resp =
+            send_request_streaming(stream, self.method, &uri, self.headers, self.body).await?;
+        resp.timing.connect = connect_time;
+        resp.timing.reused_connection = connect_time.is_none();
+        Ok(resp)
     }
 }
 
@@ -553,18 +558,25 @@ async fn send_with_redirects(
             }
         }
 
-        let (stream, was_pooled) = connect(&uri, &client.inner.resolve_overrides).await?;
+        let (stream, mut connect_time) =
+            connect_timed(&uri, &client.inner.resolve_overrides).await?;
+        let was_pooled = connect_time.is_none();
         let mut result =
             send_request(stream, method.clone(), &uri, headers.clone(), body.clone()).await;
         if was_pooled && result.is_err() {
             // A pooled connection's first write/read failing is expected, not exceptional —
             // see `connect`'s own doc for the three real ways this happens. Retry exactly once
-            // on a guaranteed-fresh connection before giving up.
+            // on a guaranteed-fresh connection before giving up. The fresh connect is what this
+            // hop's `connect` timing reports, since that is the connection the response came on.
             tracing::debug!(target: "bedrock::client", "pooled connection failed on first use, retrying fresh");
+            let started = std::time::Instant::now();
             let fresh = connect_fresh(&uri, &client.inner.resolve_overrides).await?;
+            connect_time = Some(started.elapsed());
             result = send_request(fresh, method.clone(), &uri, headers.clone(), body.clone()).await;
         }
-        let resp = result?;
+        let mut resp = result?;
+        resp.timing.connect = connect_time;
+        resp.timing.reused_connection = connect_time.is_none();
 
         if let Some(domain) = uri.host() {
             let mut jar = client.inner.cookies.lock().unwrap();
@@ -929,5 +941,144 @@ mod gzip_tests {
             &[0x1f, 0x8b],
             "still gzip-magic-prefixed, i.e. undecoded"
         );
+    }
+}
+
+#[cfg(test)]
+mod timing_tests {
+    //! The per-response timing record. Loopback server, real sockets: the head and body are
+    //! written in separate writes after deliberate pauses, so the measured split is the pause.
+    use super::*;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    const PAUSE: Duration = Duration::from_millis(80);
+
+    /// Serve `requests` requests on one accepted socket (keep-alive), pausing `head_pause`
+    /// before the status line and `body_pause` between the head and the body.
+    async fn serve_keep_alive(
+        listener: TcpListener,
+        head_pause: Duration,
+        body_pause: Duration,
+        requests: usize,
+    ) {
+        let Ok((mut sock, _)) = listener.accept().await else {
+            return;
+        };
+        for _ in 0..requests {
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 1024];
+            while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                match sock.read(&mut chunk).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                }
+            }
+            tokio::time::sleep(head_pause).await;
+            if sock
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n")
+                .await
+                .is_err()
+            {
+                return;
+            }
+            let _ = sock.flush().await;
+            tokio::time::sleep(body_pause).await;
+            if sock.write_all(b"hello").await.is_err() {
+                return;
+            }
+            let _ = sock.flush().await;
+        }
+    }
+
+    async fn loopback() -> (TcpListener, String) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+        (listener, format!("http://{addr}/"))
+    }
+
+    #[tokio::test]
+    async fn head_and_total_split_at_the_head_on_a_fresh_connection() {
+        let (listener, url) = loopback().await;
+        tokio::spawn(serve_keep_alive(listener, PAUSE, PAUSE, 1));
+
+        let resp = tokio::time::timeout(Duration::from_secs(10), Client::new().get(&url).send())
+            .await
+            .expect("the response must arrive")
+            .expect("request succeeds");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let timing = resp.timing();
+        let head = timing.head.expect("a socket response has a head time");
+        assert!(
+            head >= PAUSE,
+            "head {head:?} must include the pause before it"
+        );
+        assert!(
+            head < timing.total,
+            "head {head:?} must come before the body, total {:?}",
+            timing.total
+        );
+        assert!(
+            timing.total >= PAUSE * 2,
+            "total {:?} must include both pauses",
+            timing.total
+        );
+        assert!(!timing.reused_connection);
+        assert!(
+            timing.connect.is_some(),
+            "a fresh connection reports its connect time"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_second_request_reuses_the_keep_alive_connection() {
+        let (listener, url) = loopback().await;
+        tokio::spawn(serve_keep_alive(
+            listener,
+            Duration::ZERO,
+            Duration::ZERO,
+            2,
+        ));
+        let client = Client::new();
+
+        let first = tokio::time::timeout(Duration::from_secs(10), client.get(&url).send())
+            .await
+            .expect("first response must arrive")
+            .expect("first request succeeds");
+        assert!(first.timing().connect.is_some());
+        assert!(!first.timing().reused_connection);
+
+        let second = tokio::time::timeout(Duration::from_secs(10), client.get(&url).send())
+            .await
+            .expect("second response must arrive")
+            .expect("second request succeeds");
+        assert!(
+            second.timing().reused_connection,
+            "keep-alive connection must be reused"
+        );
+        assert_eq!(second.timing().connect, None);
+        assert!(second.timing().head.is_some());
+    }
+
+    #[tokio::test]
+    async fn streaming_timing_has_total_equal_to_head() {
+        let (listener, url) = loopback().await;
+        tokio::spawn(serve_keep_alive(listener, PAUSE, PAUSE, 1));
+
+        let resp = tokio::time::timeout(
+            Duration::from_secs(10),
+            Client::new().get(&url).send_streaming(),
+        )
+        .await
+        .expect("the head must arrive")
+        .expect("request succeeds");
+        let timing = resp.timing();
+        assert!(timing.head.expect("head is set") >= PAUSE);
+        assert_eq!(Some(timing.total), timing.head);
+        assert!(timing.connect.is_some());
+        assert!(!timing.reused_connection);
     }
 }
