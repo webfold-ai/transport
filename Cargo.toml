@@ -135,11 +135,11 @@ tempfile = "3"
 saga-cache = { git = "https://github.com/Tasmanian-Cloud/saga", rev = "c82647b7094aba9e3fb673b1b1b5577a6af759cb" }
 kleis = { git = "https://github.com/webfold-ai/iotadb", rev = "208e6e94a2ad00c226c2030776045f8d465cdb93", package = "kleis" }
 saga-pipeline = { git = "https://github.com/Tasmanian-Cloud/saga", rev = "c82647b7094aba9e3fb673b1b1b5577a6af759cb" }
-servelet-core = { git = "https://github.com/Ptyktos/servelet", rev = "fbaaaadc2d64236f8f2f3079bd9fde2dbd4a52bb" }
-servelet-h1 = { git = "https://github.com/Ptyktos/servelet", rev = "fbaaaadc2d64236f8f2f3079bd9fde2dbd4a52bb" }
-servelet-router = { git = "https://github.com/Ptyktos/servelet", rev = "fbaaaadc2d64236f8f2f3079bd9fde2dbd4a52bb" }
-servelet-tls = { git = "https://github.com/Ptyktos/servelet", rev = "fbaaaadc2d64236f8f2f3079bd9fde2dbd4a52bb" }
-servelet-client = { git = "https://github.com/Ptyktos/servelet", rev = "fbaaaadc2d64236f8f2f3079bd9fde2dbd4a52bb" }
+servelet-core = { git = "https://github.com/webfold-ai/servelet", rev = "fbaaaadc2d64236f8f2f3079bd9fde2dbd4a52bb" }
+servelet-h1 = { git = "https://github.com/webfold-ai/servelet", rev = "fbaaaadc2d64236f8f2f3079bd9fde2dbd4a52bb" }
+servelet-router = { git = "https://github.com/webfold-ai/servelet", rev = "fbaaaadc2d64236f8f2f3079bd9fde2dbd4a52bb" }
+servelet-tls = { git = "https://github.com/webfold-ai/servelet", rev = "fbaaaadc2d64236f8f2f3079bd9fde2dbd4a52bb" }
+servelet-client = { git = "https://github.com/webfold-ai/servelet", rev = "fbaaaadc2d64236f8f2f3079bd9fde2dbd4a52bb" }
 
 # Keep legacy substrate git consumers on THIS kernel. No hosting dependency
 # (including test fixtures) is permitted; see verification/no-hosting-runtime.py.
